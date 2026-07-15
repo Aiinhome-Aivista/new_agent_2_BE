@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables
+.env
+.env.local
+
+# Application Data (Uploads, ChromaDB, etc.)
+data/
+
+# IDEs / OS files
+.vscode/
+.idea/
+.DS_Store
+*.swp
