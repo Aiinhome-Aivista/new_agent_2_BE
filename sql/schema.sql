@@ -215,11 +215,12 @@ delivery_status ENUM(
 'AT_RISK',
 'UNKNOWN'
 ) NOT NULL DEFAULT 'NOT_STARTED',
-progress_percentage DECIMAL(5,2) NULL,
-last_update_at DATETIME NULL,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-ON UPDATE CURRENT_TIMESTAMP,
+    progress_percentage DECIMAL(5,2) NULL,
+    last_update_at DATETIME NULL,
+    source_document_id BIGINT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ON UPDATE CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_deliverable_baseline
         FOREIGN KEY (baseline_id)
@@ -229,6 +230,11 @@ ON UPDATE CURRENT_TIMESTAMP,
     CONSTRAINT fk_deliverable_project
         FOREIGN KEY (project_id)
         REFERENCES projects(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_deliverable_document
+        FOREIGN KEY (source_document_id)
+        REFERENCES documents(id)
         ON DELETE CASCADE
 );
 

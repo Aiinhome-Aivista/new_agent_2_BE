@@ -78,3 +78,22 @@ class BM25Service:
                     
         results.sort(key=lambda x: x[0], reverse=True)
         return results[:top_k]
+
+    @classmethod
+    def delete_document_chunks(cls, project_id: int, document_id: int):
+        cls.load_index(project_id)
+        if project_id in cls._corpora:
+            # Filter out chunks matching document_id
+            cls._corpora[project_id] = [
+                doc for doc in cls._corpora[project_id] 
+                if doc["metadata"]["document_id"] != document_id
+            ]
+            
+            # Rebuild index
+            if cls._corpora[project_id]:
+                tokenized_corpus = [doc["text"].lower().split() for doc in cls._corpora[project_id]]
+                cls._indexes[project_id] = BM25Okapi(tokenized_corpus)
+            else:
+                cls._indexes[project_id] = None
+                
+            cls.save_index(project_id)

@@ -22,3 +22,8 @@ class RAGService:
     @staticmethod
     def retrieve_evidence(project_id: int, query: str, document_types: list[str] = None):
         return HybridRetrievalService.retrieve(project_id, query, document_types)
+
+    @staticmethod
+    def delete_document(project_id: int, document_id: int):
+        ChromaService.delete_document_chunks(document_id)
+        BM25Service.delete_document_chunks(project_id, document_id)

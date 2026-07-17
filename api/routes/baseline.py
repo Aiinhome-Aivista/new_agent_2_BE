@@ -27,9 +27,18 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             
         extracted_data = ScopeExtractionAgent.extract_scope(text)
         
-        # Create draft baseline
-        cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
-        baseline_id = cursor.lastrowid
+        # Check if there is an existing DRAFT baseline for the project
+        cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'DRAFT' ORDER BY id DESC LIMIT 1", (project_id,))
+        existing_draft = cursor.fetchone()
+        if existing_draft:
+            baseline_id = existing_draft["id"]
+            # Clear previous items from this specific file under this draft
+            cursor.execute("DELETE FROM scope_items WHERE baseline_id = %s AND source_document_id = %s", (baseline_id, document_id))
+            cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s AND source_document_id = %s", (baseline_id, document_id))
+        else:
+            # Create draft baseline
+            cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
+            baseline_id = cursor.lastrowid
         
         # Insert scope items
         for item in extracted_data.get("scope_items", []):
@@ -45,11 +54,11 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         # Insert deliverables
         for item in extracted_data.get("deliverables", []):
             sql = """INSERT INTO deliverables
-                     (baseline_id, project_id, name, description, deadline, owner)
-                     VALUES (%s, %s, %s, %s, %s, %s)"""
+                     (baseline_id, project_id, name, description, deadline, owner, source_document_id)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s)"""
             cursor.execute(sql, (
                 baseline_id, project_id, item.get("name", "Unknown"), item.get("description", ""),
-                item.get("deadline") if item.get("deadline") else None, item.get("owner")
+                item.get("deadline") if item.get("deadline") else None, item.get("owner"), document_id
             ))
             
         # Update project status

@@ -42,29 +42,9 @@ def upload_document(
     cursor.execute(sql, (project_id, file.filename, document_type, storage_key, "UPLOADED", current_user["id"]))
     db.commit()
     document_id = cursor.lastrowid
-    
-    # Trigger processing right away for POC simplicity
-    try:
-        cursor.execute("UPDATE documents SET processing_status = 'PARSING' WHERE id = %s", (document_id,))
-        db.commit()
-        
-        chunks = DocumentService.parse_document(storage_key, ext)
-        
-        # Index document in ChromaDB and BM25
-        from services.rag_service import RAGService
-        RAGService.index_document(project_id, document_id, file.filename, document_type, chunks)
-        
-        cursor.execute("UPDATE documents SET processing_status = 'COMPLETED' WHERE id = %s", (document_id,))
-        db.commit()
-        
-    except Exception as e:
-        cursor.execute("UPDATE documents SET processing_status = 'FAILED', processing_error = %s WHERE id = %s", (str(e), document_id))
-        db.commit()
-        raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
-    finally:
-        cursor.close()
+    cursor.close()
 
-    return {"success": True, "message": "Document uploaded and parsed", "data": {"id": document_id}}
+    return {"success": True, "message": "Document uploaded successfully", "data": {"id": document_id}}
 
 @router.get("/")
 def get_documents(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
@@ -113,3 +93,79 @@ def create_document_type(
         
     cursor.close()
     return {"success": True, "message": "Document type created successfully"}
+
+@router.post("/{document_id}/process")
+def process_document(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
+    doc = cursor.fetchone()
+    if not doc:
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+        
+    try:
+        cursor.execute("UPDATE documents SET processing_status = 'PROCESSING' WHERE id = %s", (document_id,))
+        db.commit()
+        
+        ext = os.path.splitext(doc["storage_key"])[1].lower()
+        chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        
+        # Index document in ChromaDB and BM25
+        from services.rag_service import RAGService
+        RAGService.index_document(project_id, document_id, doc["document_name"], doc["document_type"], chunks)
+        
+        cursor.execute("UPDATE documents SET processing_status = 'COMPLETED' WHERE id = %s", (document_id,))
+        db.commit()
+        
+    except Exception as e:
+        cursor.execute("UPDATE documents SET processing_status = 'FAILED', processing_error = %s WHERE id = %s", (str(e), document_id))
+        db.commit()
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"Failed to process document: {e}")
+        
+    cursor.close()
+    return {"success": True, "message": "Document processed successfully"}
+
+@router.delete("/{document_id}")
+def delete_document(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
+    doc = cursor.fetchone()
+    if not doc:
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Document not found")
+        
+    try:
+        # 1. Clean up RAG resources if it was completed
+        if doc["processing_status"] == "COMPLETED":
+            from services.rag_service import RAGService
+            RAGService.delete_document(project_id, document_id)
+            
+        # 2. Clean up scope items (since there's no ON DELETE CASCADE on source_document_id constraint)
+        cursor.execute("DELETE FROM scope_items WHERE source_document_id = %s", (document_id,))
+        db.commit()
+        
+        # 3. Delete document record (cascades automatically to project_activities/new_requests)
+        cursor.execute("DELETE FROM documents WHERE id = %s", (document_id,))
+        db.commit()
+        
+        # 4. Remove physical file
+        if os.path.exists(doc["storage_key"]):
+            os.remove(doc["storage_key"])
+            
+    except Exception as e:
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
+        
+    cursor.close()
+    return {"success": True, "message": "Document deleted successfully"}

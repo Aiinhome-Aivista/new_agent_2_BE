@@ -69,3 +69,8 @@ class ChromaService:
             include=["documents", "metadatas", "distances"]
         )
         return results
+
+    @classmethod
+    def delete_document_chunks(cls, document_id: int):
+        collection = cls.get_collection()
+        collection.delete(where={"document_id": document_id})
