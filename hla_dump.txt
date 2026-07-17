@@ -1,0 +1,97 @@
+High-Level Techno-Functional Specification
+Autonomous Contract Scope Evaluator — An Agentic AI Solution
+
+Executive Summary
+The Autonomous Contract Scope Evaluator (ACSE) is an Agentic AI solution designed to autonomously understand the scope of work defined within an Engagement Letter (EL) or Inter-Firm Approval (IFA) document, continuously monitor delivery against committed in-scope and out-of-scope items, and proactively alert stakeholders to deviations, scope creep, and delivery risks via Microsoft Teams or email.
+This specification follows PwC's Agentic Design Philosophy, treating the agent not as a simple LLM wrapper but as a distributed software system engineered for reliability, observability, and governance. The architecture prioritizes open-source, cloud-agnostic components, minimizes proprietary dependencies, and is structured to enable vendor execution, client demonstrations, and architecture review validation.
+Functional Design
+Business Objectives
+Scope Assurance: Ensure all delivery activity aligns with the signed engagement letter, preventing unbilled out-of-scope work (revenue leakage) and unmet commitments (delivery risk).
+Continuous Monitoring: Replace manual, periodic scope reviews with autonomous, ongoing tracking.
+Proactive Alerting: Surface deviations early through native communication channels.
+Auditability: Maintain a transparent tracker of progress and scope decisions.
+User Personas
+Inputs and Outputs
+Inputs:
+Signed Engagement Letters (EL) / Inter-Firm Approval (IFA) documents.
+Project stakeholder details (names, roles, responsibilities).
+Project status reporting documents.
+Steering committee Minutes of Meeting (MoM).
+Outputs:
+A structured Scope Tracker (in-scope vs. out-of-scope items with delivery status).
+Alerts and notifications (Teams / email) on deviations, delays, or scope creep.
+Periodic scope-evaluation summaries with evidence references.
+Step-by-Step Functional Flow
+Scope Extraction — Ingest the EL/IFA and extract a canonical list of in-scope items, out-of-scope items, deliverables, milestones, and responsible stakeholders.
+Baseline Construction — Build a structured "Scope Baseline" record in the tracker.
+Continuous Ingestion — Periodically ingest status reports and steering committee MoMs.
+Reconciliation & Reasoning — Compare reported activity/progress against the scope baseline; classify each activity as in-scope (delivered/in-progress/at-risk) or out-of-scope (potential scope creep).
+Risk & Deviation Detection — Flag delays, missing deliverables, and out-of-scope activities.
+Alerting — Route alerts to relevant stakeholders via Teams/email based on severity and role.
+Tracker Update & Audit — Persist updated status with evidence lineage to the tracker.
+Agent Design
+Single vs. Multi-Agent Justification
+A multi-agent architecture with a hierarchical orchestrator is recommended. The workload decomposes naturally into specialized, separable concerns (document understanding, scope reconciliation, alerting) each benefiting from distinct prompts, tools, and reasoning patterns. Per the design philosophy, this enables context isolation (least-privilege) and model tiering (smaller models for routine extraction, stronger models for reasoning).
+Agent Roles and Responsibilities
+Orchestration Logic
+The Orchestrator runs the control loop: Observe → Reason → Plan → Act → Evaluate → Update Memory. It uses a scheduled trigger (new document upload or periodic poll) to initiate cycles, delegates sub-tasks sequentially with parallel fan-out where independent, and enforces explicit termination conditions to prevent infinite loops.
+Autonomy Boundaries (Progressive Autonomy)
+Human-in-the-loop (initial): Scope baseline extraction is reviewed/approved by the Engagement Manager before activation.
+Semi-autonomous: Alerts are auto-generated but high-severity scope-creep flags may require confirmation.
+Autonomous (mature): Routine status reconciliation and low-severity alerts run unattended once evaluation metrics justify trust.
+Architectural Design
+High-Level Architecture
+ 
+Core Component Responsibilities
+Presentation Layer: Upload of EL/IFA & status documents, scope tracker dashboard, alert console.
+API Gateway & Orchestration: Secure entry point, authentication, routing, and the scheduler/event trigger that initiates agent cycles.
+Agentic Core: Hierarchical orchestrator and specialist sub-agents executing the control loop.
+RAG & Knowledge Systems: Retrieval of scope clauses and historical context to ground reasoning.
+Tool Ecosystem: Deterministic, schema-driven, idempotent tools exposed via MCP.
+Memory & Persistence: Three-tier memory plus the durable scope tracker.
+Cross-Cutting: Guardrails, observability, and governance applied across all layers.
+Data & Control Flow
+Document uploaded → API Gateway authenticates → triggers Orchestrator.
+Orchestrator plans the cycle → invokes Scope Extraction / Status Ingestion Agents (tools parse documents, embeddings written to vector store).
+Reconciliation & Risk Agent retrieves scope baseline via RAG → reasons over deviations.
+Findings written to the Scope Tracker (Tracker/Audit Agent) → Alerting Agent dispatches notifications via Teams/Email connectors.
+Memory updated; observability logs and evaluation traces captured.
+Agent Lifecycle
+Trigger → Plan → Retrieve Context → Execute Tools → Reason/Reconcile → Evaluate (self-check via Reflexion) → Persist & Alert → Update Memory → Terminate. Explicit termination conditions, retries, fallbacks, and human-handoff paths are enforced at each stage.
+AI & LLM Design
+LLM Selection (Open-Source Preference)
+Primary reasoning model: An open-source LLM (e.g., Llama 3.x / Mistral-class) for reconciliation and risk reasoning.
+Lightweight tier: A smaller open-source model for routine extraction and classification tasks (model tiering for cost/latency optimization).
+Cloud-agnostic deployment: Models served via a standard inference layer (e.g., vLLM/Ollama-compatible) so the solution is portable across environments.
+Call Patterns
+Prompting: System prompts treated as behavioral specifications (role definition, capability boundaries, domain knowledge, output schemas).
+Tools: Structured tool-calling for document parsing, DB writes, and notification dispatch.
+Memory: Three-tier (episodic / semantic / procedural) with context compaction (summarization, sliding windows) to prevent "context rot."
+RAG Requirements & Rationale
+RAG is required to ground scope reasoning in the authoritative source documents and historical project context.
+Data sources: EL/IFA clauses, status reports, steering MoMs.
+Pipeline: Query analysis → hybrid (dense + sparse) retrieval → re-ranking → grounded generation.
+Rationale: Ensures every scope decision is evidence-backed and auditable, reducing hallucination risk in a high-stakes commercial context.
+Data & Integration
+Databases: Relational DB for the tracker; vector DB for embeddings; document/object store for raw artifacts.
+External APIs: Microsoft Teams and email for alerting; optional ingestion connectors for status reporting tools.
+Frameworks & Tooling
+Dependencies & Constraints
+External Dependencies
+Microsoft Teams / Email infrastructure (for alert delivery).
+Access to source documents (EL/IFA, status reports, MoMs) in machine-readable form.
+Open-source LLM inference capacity.
+Assumptions
+Engagement letters are available in parseable digital formats.
+Status reports and MoMs follow reasonably consistent structures.
+Initial scope baselines are validated by a human reviewer.
+Limitations
+Extraction accuracy depends on document quality; ambiguous scope language may require human adjudication.
+The agent flags, but does not unilaterally approve, commercial change requests.
+Security & Compliance (High-Level)
+Guardrails: Input, retrieval, execution, and output rails ("load-bearing," not optional).
+Access Control: OAuth2/JWT, role-based authorization, least-privilege tool access.
+Data Protection: Encryption in transit/at rest; PII and confidential engagement data handled per applicable regulations (e.g., SOC 2 alignment).
+Auditability: Full data lineage and decision traceability in the tracker and logs.
+Conclusion
+The Autonomous Contract Scope Evaluator is architected as a governed, observable, multi-agent system grounded in PwC's Agentic Design Philosophy. By combining a hierarchical orchestrator, evidence-grounded RAG, deterministic tooling via MCP, and progressive autonomy with human-in-the-loop safeguards, the solution delivers reliable, auditable scope monitoring while remaining open-source-first and cloud-agnostic — ready for vendor build-out, client demonstration, and architecture review.

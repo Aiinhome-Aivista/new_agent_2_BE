@@ -28,6 +28,16 @@ def create_project(project: ProjectCreate, current_user: dict = Depends(require_
     
     # Auto assign creator to project
     cursor.execute("INSERT INTO project_users (project_id, user_id) VALUES (%s, %s)", (project_id, current_user["id"]))
+    
+    # Auto assign all other users to the project so that all personas (Manager, Lead, etc.) can see it
+    cursor.execute("SELECT id FROM users WHERE id != %s", (current_user["id"],))
+    all_users = cursor.fetchall()
+    for user_row in all_users:
+        try:
+            cursor.execute("INSERT INTO project_users (project_id, user_id) VALUES (%s, %s)", (project_id, user_row["id"]))
+        except Exception:
+            pass
+            
     db.commit()
     cursor.close()
     

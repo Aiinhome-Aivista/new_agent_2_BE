@@ -22,3 +22,5 @@ data/
 .idea/
 .DS_Store
 *.swp
+
+requirements.txt
