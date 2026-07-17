@@ -18,8 +18,8 @@ def upload_document(
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
-    if document_type not in ["EL", "IFA", "STATUS_REPORT", "MOM"]:
-        raise HTTPException(status_code=400, detail="Invalid document type")
+    if not document_type:
+        raise HTTPException(status_code=400, detail="Document type is required")
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in [".pdf", ".docx", ".txt"]:
@@ -73,3 +73,43 @@ def get_documents(project_id: int, current_user: dict = Depends(get_current_user
     docs = cursor.fetchall()
     cursor.close()
     return {"success": True, "data": docs}
+
+from pydantic import BaseModel
+
+class DocumentTypeCreate(BaseModel):
+    name: str
+    label: str
+    description: str = ""
+
+@router.get("/types")
+def get_document_types(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    cursor = db.cursor(dictionary=True)
+    # Master standard types from DB
+    cursor.execute("SELECT name, label, description FROM master_document_types")
+    types = cursor.fetchall()
+    
+    # Custom types from DB
+    cursor.execute("SELECT name, label, description FROM document_types WHERE project_id = %s", (project_id,))
+    custom_types = cursor.fetchall()
+    cursor.close()
+    
+    return {"success": True, "data": types + custom_types}
+
+@router.post("/types")
+def create_document_type(
+    project_id: int, 
+    data: DocumentTypeCreate, 
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), 
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    cursor = db.cursor(dictionary=True)
+    try:
+        sql = "INSERT INTO document_types (project_id, name, label, description, added_by) VALUES (%s, %s, %s, %s, %s)"
+        cursor.execute(sql, (project_id, data.name, data.label, data.description, current_user["id"]))
+        db.commit()
+    except Exception as e:
+        cursor.close()
+        raise HTTPException(status_code=400, detail="Failed to create document type")
+        
+    cursor.close()
+    return {"success": True, "message": "Document type created successfully"}

@@ -82,12 +82,7 @@ CREATE TABLE documents (
 id BIGINT PRIMARY KEY AUTO_INCREMENT,
 project_id BIGINT NOT NULL,
 document_name VARCHAR(255) NOT NULL,
-document_type ENUM(
-'EL',
-'IFA',
-'STATUS_REPORT',
-'MOM'
-) NOT NULL,
+document_type VARCHAR(255) NOT NULL,
 storage_key VARCHAR(500) NOT NULL,
 processing_status ENUM(
 'UPLOADED',
@@ -108,6 +103,39 @@ uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_documents_user
         FOREIGN KEY (uploaded_by)
+        REFERENCES users(id)
+);
+
+CREATE TABLE master_document_types (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL UNIQUE,
+    label VARCHAR(255) NOT NULL,
+    description TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO master_document_types (name, label, description) VALUES
+('EL', 'Engagement Letter (EL)', 'Official contract or engagement letter'),
+('IFA', 'Inter-Firm Approval (IFA)', 'Internal financial approval document'),
+('STATUS_REPORT', 'Status Report', 'Weekly or monthly project status report'),
+('MOM', 'Minutes of Meeting (MOM)', 'Meeting minutes and decisions');
+
+CREATE TABLE document_types (
+id BIGINT PRIMARY KEY AUTO_INCREMENT,
+project_id BIGINT NOT NULL,
+name VARCHAR(100) NOT NULL,
+label VARCHAR(255) NOT NULL,
+description TEXT,
+added_by BIGINT NOT NULL,
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT fk_doctype_project
+        FOREIGN KEY (project_id)
+        REFERENCES projects(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_doctype_user
+        FOREIGN KEY (added_by)
         REFERENCES users(id)
 );
 
