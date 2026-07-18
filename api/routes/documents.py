@@ -4,7 +4,7 @@ import os
 import uuid
 from core.config import settings
 from core.database import get_db
-from api.dependencies.auth import get_current_user, require_roles
+from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 from services.document_service import DocumentService
 import mysql.connector
 
@@ -18,6 +18,7 @@ def upload_document(
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
+    verify_project_access(project_id, current_user, db)
     if not document_type:
         raise HTTPException(status_code=400, detail="Document type is required")
 
@@ -48,6 +49,7 @@ def upload_document(
 
 @router.get("/")
 def get_documents(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT id, document_name, document_type, processing_status, uploaded_at FROM documents WHERE project_id = %s", (project_id,))
     docs = cursor.fetchall()
@@ -63,6 +65,7 @@ class DocumentTypeCreate(BaseModel):
 
 @router.get("/types")
 def get_document_types(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     # Master standard types from DB
     cursor.execute("SELECT name, label, description FROM master_document_types")
@@ -82,6 +85,7 @@ def create_document_type(
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), 
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     try:
         sql = "INSERT INTO document_types (project_id, name, label, description, added_by) VALUES (%s, %s, %s, %s, %s)"
@@ -101,6 +105,7 @@ def process_document(
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
     doc = cursor.fetchone()
@@ -138,6 +143,7 @@ def delete_document(
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
     doc = cursor.fetchone()

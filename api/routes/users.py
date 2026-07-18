@@ -22,10 +22,13 @@ class UserUpdate(BaseModel):
 class UserStatusUpdate(BaseModel):
     is_active: bool
 
-@router.get("/", dependencies=[Depends(require_roles(["ADMIN"]))])
-def get_users(db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+@router.get("/")
+def get_users(role: Optional[str] = None, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id, name, email, role, is_active, created_at FROM users")
+    if role:
+        cursor.execute("SELECT id, name, email, role, is_active, created_at FROM users WHERE role = %s", (role,))
+    else:
+        cursor.execute("SELECT id, name, email, role, is_active, created_at FROM users")
     users = cursor.fetchall()
     cursor.close()
     return {"success": True, "data": users}

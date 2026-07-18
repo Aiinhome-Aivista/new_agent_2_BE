@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
 from core.database import get_db
-from api.dependencies.auth import get_current_user, require_roles
+from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 from agents.scope_extraction_agent import ScopeExtractionAgent
 import mysql.connector
 
@@ -10,6 +10,7 @@ router = APIRouter()
 
 @router.post("/extract")
 def extract_baseline(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     
     cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
@@ -75,6 +76,7 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
 
 @router.get("/")
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     cursor.execute("SELECT * FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
     baseline = cursor.fetchone()
@@ -96,6 +98,7 @@ def get_baseline(project_id: int, current_user: dict = Depends(get_current_user)
 
 @router.post("/approve")
 def approve_baseline(project_id: int, current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "ADMIN"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     
     cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'DRAFT' ORDER BY id DESC LIMIT 1", (project_id,))

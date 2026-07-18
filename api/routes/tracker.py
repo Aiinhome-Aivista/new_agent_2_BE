@@ -2,13 +2,14 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
 from core.database import get_db
-from api.dependencies.auth import get_current_user, require_roles
+from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 import mysql.connector
 
 router = APIRouter()
 
 @router.get("/")
 def get_tracker_items(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     cursor.execute("""
         SELECT ti.*, 
@@ -31,6 +32,7 @@ class ResolutionUpdate(BaseModel):
 
 @router.post("/{item_id}/resolve")
 def resolve_tracker_item(project_id: int, item_id: int, update: ResolutionUpdate, current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "PROJECT_LEAD", "PMO_REVIEWER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
     
     cursor.execute("SELECT * FROM tracker_items WHERE id = %s AND project_id = %s", (item_id, project_id))
