@@ -1,4 +1,6 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, status
+from pydantic import BaseModel
 from typing import List
 import os
 import uuid
@@ -10,8 +12,13 @@ import mysql.connector
 
 router = APIRouter()
 
-@router.post("/")
-def upload_document(
+class ConfirmUploadRequest(BaseModel):
+    temp_key: str
+    document_type: str
+    original_name: str
+
+@router.post("/check-relevance")
+def check_document_relevance(
     project_id: int,
     document_type: str = Form(...),
     file: UploadFile = File(...),
@@ -22,25 +29,134 @@ def upload_document(
     if not document_type:
         raise HTTPException(status_code=400, detail="Document type is required")
 
+    cursor = db.cursor(dictionary=True)
+    
+    # 1. Duplicate check (strict check for EL and IFA types)
+    if document_type in ["EL", "IFA"]:
+        cursor.execute("SELECT id FROM documents WHERE project_id = %s AND document_type = %s", (project_id, document_type))
+        existing_doc = cursor.fetchone()
+        if existing_doc:
+            cursor.close()
+            raise HTTPException(
+                status_code=400, 
+                detail=f"An active document of type '{document_type}' has already been uploaded for this project. Please delete the existing document before uploading a new one."
+            )
+
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in [".pdf", ".docx", ".txt"]:
+        cursor.close()
         raise HTTPException(status_code=400, detail="Unsupported file format")
 
-    storage_dir = os.path.join(settings.UPLOAD_PATH, str(project_id))
-    os.makedirs(storage_dir, exist_ok=True)
+    # Create a temp storage directory
+    temp_dir = os.path.join(settings.UPLOAD_PATH, "temp")
+    os.makedirs(temp_dir, exist_ok=True)
     
     unique_filename = f"{uuid.uuid4()}{ext}"
-    storage_key = os.path.join(storage_dir, unique_filename)
+    storage_key = os.path.join(temp_dir, unique_filename)
     
+    # Write temp file for analysis
     with open(storage_key, "wb") as f:
         f.write(file.file.read())
         
+    # AI Relevance Check
+    try:
+        chunks = DocumentService.parse_document(storage_key, ext)
+        sample_text = "\n".join([chunk["text"] for chunk in chunks[:8]])
+        if len(sample_text) > 8000:
+            sample_text = sample_text[:8000]
+    except Exception as e:
+        if os.path.exists(storage_key):
+            os.remove(storage_key)
+        cursor.close()
+        raise HTTPException(status_code=400, detail=f"Failed to parse document text: {e}")
+
+    if not sample_text.strip():
+        if os.path.exists(storage_key):
+            os.remove(storage_key)
+        cursor.close()
+        raise HTTPException(status_code=400, detail="Uploaded file appears to contain no readable text.")
+
+    from services.llm_service import LLMService
+    prompt = (
+        f"You are a professional auditor assistant.\n"
+        f"Analyze the following document content excerpt and determine its relevance to the document type '{document_type}'.\n\n"
+        f"Document Excerpt:\n"
+        f"\"\"\"\n{sample_text}\n\"\"\"\n\n"
+        f"Instructions:\n"
+        f"Evaluate if this document matches the characteristics of a '{document_type}' (e.g., an Engagement Letter/EL is a contract outlining scope, fees, and client/firm roles; a Status Report lists updates, accomplishments, and milestones; a MOM holds meeting minutes/decisions).\n"
+        f"Provide a relevance score between 0 and 100 representing how confident you are that this document actually matches the declared type '{document_type}'.\n"
+        f"Respond ONLY with a valid JSON object matching this schema:\n"
+        f"{{\n"
+        f"  \"score\": <integer between 0 and 100>,\n"
+        f"  \"reasoning\": \"<brief 1-sentence reasoning>\"\n"
+        f"}}"
+    )
+    
+    try:
+        res_json = LLMService.generate_json(prompt)
+        score = float(res_json.get("score", 0))
+        reasoning = res_json.get("reasoning", "")
+    except Exception as e:
+        if os.path.exists(storage_key):
+            os.remove(storage_key)
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"AI Relevance check failed: {e}")
+
+    cursor.close()
+    return {
+        "success": True,
+        "score": int(score),
+        "reasoning": reasoning,
+        "temp_key": unique_filename,
+        "original_name": file.filename
+    }
+
+@router.post("/confirm-upload")
+def confirm_upload_document(
+    project_id: int,
+    payload: ConfirmUploadRequest,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    temp_dir = os.path.join(settings.UPLOAD_PATH, "temp")
+    temp_file_path = os.path.join(temp_dir, payload.temp_key)
+    
+    if not os.path.exists(temp_file_path):
+        raise HTTPException(status_code=400, detail="Temporary file session not found or expired")
+
     cursor = db.cursor(dictionary=True)
+    
+    # Duplicate check again for safety
+    if payload.document_type in ["EL", "IFA"]:
+        cursor.execute("SELECT id FROM documents WHERE project_id = %s AND document_type = %s", (project_id, payload.document_type))
+        existing_doc = cursor.fetchone()
+        if existing_doc:
+            cursor.close()
+            # Clean up temp file
+            if os.path.exists(temp_file_path):
+                os.remove(temp_file_path)
+            raise HTTPException(
+                status_code=400, 
+                detail=f"An active document of type '{payload.document_type}' has already been uploaded for this project."
+            )
+
+    # Move file to permanent project folder
+    storage_dir = os.path.join(settings.UPLOAD_PATH, str(project_id))
+    os.makedirs(storage_dir, exist_ok=True)
+    storage_key = os.path.join(storage_dir, payload.temp_key)
+    
+    try:
+        os.rename(temp_file_path, storage_key)
+    except Exception as e:
+        cursor.close()
+        raise HTTPException(status_code=500, detail=f"Failed to finalize file storage: {e}")
+        
     sql = """
         INSERT INTO documents (project_id, document_name, document_type, storage_key, processing_status, uploaded_by)
         VALUES (%s, %s, %s, %s, %s, %s)
     """
-    cursor.execute(sql, (project_id, file.filename, document_type, storage_key, "UPLOADED", current_user["id"]))
+    cursor.execute(sql, (project_id, payload.original_name, payload.document_type, storage_key, "UPLOADED", current_user["id"]))
     db.commit()
     document_id = cursor.lastrowid
     cursor.close()
@@ -55,8 +171,6 @@ def get_documents(project_id: int, current_user: dict = Depends(get_current_user
     docs = cursor.fetchall()
     cursor.close()
     return {"success": True, "data": docs}
-
-from pydantic import BaseModel
 
 class DocumentTypeCreate(BaseModel):
     name: str
@@ -140,6 +254,7 @@ def process_document(
 def delete_document(
     project_id: int,
     document_id: int,
+    reason: str,
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
@@ -161,11 +276,24 @@ def delete_document(
         cursor.execute("DELETE FROM scope_items WHERE source_document_id = %s", (document_id,))
         db.commit()
         
-        # 3. Delete document record (cascades automatically to project_activities/new_requests)
+        # 3. Log the deletion details and reason in audit_logs
+        import json
+        audit_sql = """INSERT INTO audit_logs (project_id, agent_name, action, entity_type, entity_id, details_json) 
+                       VALUES (%s, %s, %s, %s, %s, %s)"""
+        details = json.dumps({
+            "document_name": doc["document_name"],
+            "document_type": doc["document_type"],
+            "reason": reason,
+            "deleted_by_user_id": current_user["id"]
+        })
+        cursor.execute(audit_sql, (project_id, "SYSTEM", "DELETE_DOCUMENT", "DOCUMENT", document_id, details))
+        db.commit()
+        
+        # 4. Delete document record (cascades automatically to project_activities/new_requests)
         cursor.execute("DELETE FROM documents WHERE id = %s", (document_id,))
         db.commit()
         
-        # 4. Remove physical file
+        # 5. Remove physical file
         if os.path.exists(doc["storage_key"]):
             os.remove(doc["storage_key"])
             

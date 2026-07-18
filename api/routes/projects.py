@@ -101,3 +101,28 @@ def get_project_users(project_id: int, current_user: dict = Depends(get_current_
     users = cursor.fetchall()
     cursor.close()
     return {"success": True, "data": users}
+
+class DescriptionGenerateRequest(BaseModel):
+    project_name: str
+    client_name: str
+
+@router.post("/generate-description")
+def generate_project_description(
+    payload: DescriptionGenerateRequest,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    from services.llm_service import LLMService
+    prompt = (
+        f"You are a professional project management assistant. "
+        f"Generate a concise, professional 2-3 sentence project description for a project named '{payload.project_name}' "
+        f"for the client '{payload.client_name}'. The description should outline the key objectives and audit goals. "
+        f"Do not output markdown format or quotes, just output the raw description text."
+    )
+    try:
+        description = LLMService.generate(prompt).strip()
+        if description.startswith('"') and description.endswith('"'):
+            description = description[1:-1]
+        return {"success": True, "description": description}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate description: {e}")
