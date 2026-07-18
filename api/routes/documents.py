@@ -58,7 +58,7 @@ def check_document_relevance(
     with open(storage_key, "wb") as f:
         f.write(file.file.read())
         
-    # AI Relevance Check
+    # Extract text from the uploaded document for relevance scoring
     try:
         chunks = DocumentService.parse_document(storage_key, ext)
         sample_text = "\n".join([chunk["text"] for chunk in chunks[:8]])
@@ -76,36 +76,24 @@ def check_document_relevance(
         cursor.close()
         raise HTTPException(status_code=400, detail="Uploaded file appears to contain no readable text.")
 
-    from services.llm_service import LLMService
-    prompt = (
-        f"You are a professional auditor assistant.\n"
-        f"Analyze the following document content excerpt and determine its relevance to the document type '{document_type}'.\n\n"
-        f"Document Excerpt:\n"
-        f"\"\"\"\n{sample_text}\n\"\"\"\n\n"
-        f"Instructions:\n"
-        f"Evaluate if this document matches the characteristics of a '{document_type}' (e.g., an Engagement Letter/EL is a contract outlining scope, fees, and client/firm roles; a Status Report lists updates, accomplishments, and milestones; a MOM holds meeting minutes/decisions).\n"
-        f"Provide a relevance score between 0 and 100 representing how confident you are that this document actually matches the declared type '{document_type}'.\n"
-        f"Respond ONLY with a valid JSON object matching this schema:\n"
-        f"{{\n"
-        f"  \"score\": <integer between 0 and 100>,\n"
-        f"  \"reasoning\": \"<brief 1-sentence reasoning>\"\n"
-        f"}}"
-    )
-    
+    # Vector Embedding Relevance Check (replaces LLM-based scoring)
+    # Uses cosine similarity between document embedding and reference profile embedding.
+    # Benefits: zero LLM tokens, sub-second speed, deterministic scores.
+    from services.relevance_service import RelevanceService
     try:
-        res_json = LLMService.generate_json(prompt)
-        score = float(res_json.get("score", 0))
-        reasoning = res_json.get("reasoning", "")
+        result = RelevanceService.score_relevance(sample_text, document_type, db)
+        score = result["score"]
+        reasoning = result["reasoning"]
     except Exception as e:
         if os.path.exists(storage_key):
             os.remove(storage_key)
         cursor.close()
-        raise HTTPException(status_code=500, detail=f"AI Relevance check failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Relevance check failed: {e}")
 
     cursor.close()
     return {
         "success": True,
-        "score": int(score),
+        "score": score,
         "reasoning": reasoning,
         "temp_key": unique_filename,
         "original_name": file.filename
@@ -201,9 +189,15 @@ def create_document_type(
 ):
     verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
+    
+    # Auto-expand the short description into a rich reference profile
+    # This ensures embedding-based relevance scoring works accurately for custom types
+    from services.relevance_service import RelevanceService
+    expanded_description = RelevanceService.expand_description(data.name, data.description or data.label)
+    
     try:
         sql = "INSERT INTO document_types (project_id, name, label, description, added_by) VALUES (%s, %s, %s, %s, %s)"
-        cursor.execute(sql, (project_id, data.name, data.label, data.description, current_user["id"]))
+        cursor.execute(sql, (project_id, data.name, data.label, expanded_description, current_user["id"]))
         db.commit()
     except Exception as e:
         cursor.close()
