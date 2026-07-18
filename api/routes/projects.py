@@ -46,7 +46,7 @@ def create_project(project: ProjectCreate, current_user: dict = Depends(require_
 @router.get("/")
 def get_projects(current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     cursor = db.cursor(dictionary=True)
-    if current_user["role"] == "ADMIN":
+    if current_user["role"] in ["ADMIN", "PROJECT_LEAD"]:
         cursor.execute("SELECT * FROM projects")
     else:
         cursor.execute("""
@@ -61,7 +61,7 @@ def get_projects(current_user: dict = Depends(get_current_user), db: mysql.conne
 @router.get("/{project_id}")
 def get_project(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     cursor = db.cursor(dictionary=True)
-    if current_user["role"] != "ADMIN":
+    if current_user["role"] not in ["ADMIN", "PROJECT_LEAD"]:
         cursor.execute("SELECT 1 FROM project_users WHERE project_id = %s AND user_id = %s", (project_id, current_user["id"]))
         if not cursor.fetchone():
             raise HTTPException(status_code=403, detail="Not assigned to this project")

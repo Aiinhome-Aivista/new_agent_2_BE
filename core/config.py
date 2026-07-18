@@ -58,3 +58,6 @@ class Settings(BaseSettings):
         extra = "ignore"
 
 settings = Settings()
+
+if settings.JWT_SECRET_KEY == "replace_with_secure_secret":
+    raise ValueError("CRITICAL SECURITY ERROR: JWT_SECRET_KEY is using the default value. Please set a secure secret in your environment.")
