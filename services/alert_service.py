@@ -17,16 +17,16 @@ class AlertService:
             
         try:
             msg = MIMEMultipart()
-            msg['From'] = settings.SMTP_USERNAME or "acse@example.com"
+            msg['From'] = settings.SMTP_EMAIL or "acse@example.com"
             msg['To'] = to_email
             msg['Subject'] = subject
             
             msg.attach(MIMEText(body, 'plain'))
             
             server = smtplib.SMTP(settings.SMTP_SERVER, settings.SMTP_PORT)
-            if settings.SMTP_USERNAME and settings.SMTP_PASSWORD:
+            if settings.SMTP_EMAIL and settings.SMTP_PASSWORD:
                 server.starttls()
-                server.login(settings.SMTP_USERNAME, settings.SMTP_PASSWORD)
+                server.login(settings.SMTP_EMAIL, settings.SMTP_PASSWORD)
                 
             server.send_message(msg)
             server.quit()

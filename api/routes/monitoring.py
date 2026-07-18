@@ -22,9 +22,14 @@ def process_monitoring(project_id: int, document_id: int, current_user: dict = D
         raise HTTPException(status_code=400, detail="Only STATUS_REPORT and MOM can be used for monitoring")
         
     try:
-        # For POC, read the document file and get first 8k chars
-        with open(doc["storage_key"], "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read(8000)
+        from services.document_service import DocumentService
+        import os
+        
+        ext = os.path.splitext(doc["storage_key"])[1].lower()
+        chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        text = "\n".join([chunk["text"] for chunk in chunks[:8]])
+        if len(text) > 8000:
+            text = text[:8000]
             
         extracted_data = StatusIngestionAgent.extract_status(text)
         

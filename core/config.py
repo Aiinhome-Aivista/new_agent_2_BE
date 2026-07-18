@@ -46,11 +46,10 @@ class Settings(BaseSettings):
     CONTEXT_COMPACTION_ENABLED: bool = True
     CONTEXT_MAX_CHARACTERS: int = 20000
     
-    SMTP_HOST: str = ""
+    SMTP_SERVER: str = ""
     SMTP_PORT: int = 587
-    SMTP_USERNAME: str = ""
+    SMTP_EMAIL: str = ""
     SMTP_PASSWORD: str = ""
-    SMTP_FROM_EMAIL: str = ""
     SMTP_USE_TLS: bool = True
 
     class Config:

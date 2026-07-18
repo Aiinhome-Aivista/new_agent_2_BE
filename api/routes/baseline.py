@@ -22,9 +22,14 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         raise HTTPException(status_code=400, detail="Only EL and IFA can be used for baseline extraction")
         
     try:
-        # For POC, read the document file and get first 8k chars
-        with open(doc["storage_key"], "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read(8000)
+        from services.document_service import DocumentService
+        import os
+        
+        ext = os.path.splitext(doc["storage_key"])[1].lower()
+        chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        text = "\n".join([chunk["text"] for chunk in chunks[:8]])
+        if len(text) > 8000:
+            text = text[:8000]
             
         extracted_data = ScopeExtractionAgent.extract_scope(text)
         
@@ -36,10 +41,12 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             # Clear previous items from this specific file under this draft
             cursor.execute("DELETE FROM scope_items WHERE baseline_id = %s AND source_document_id = %s", (baseline_id, document_id))
             cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s AND source_document_id = %s", (baseline_id, document_id))
+            cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         else:
             # Create draft baseline
             cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
             baseline_id = cursor.lastrowid
+            cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         
         # Insert scope items
         for item in extracted_data.get("scope_items", []):
@@ -60,6 +67,15 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             cursor.execute(sql, (
                 baseline_id, project_id, item.get("name", "Unknown"), item.get("description", ""),
                 item.get("deadline") if item.get("deadline") else None, item.get("owner"), document_id
+            ))
+            
+        # Insert stakeholders
+        for stakeholder in extracted_data.get("stakeholders", []):
+            sql = """INSERT INTO stakeholders (project_id, name, email, role, responsibility)
+                     VALUES (%s, %s, %s, %s, %s)"""
+            cursor.execute(sql, (
+                project_id, stakeholder.get("name", "Unknown"), stakeholder.get("email"),
+                stakeholder.get("role"), stakeholder.get("responsibility")
             ))
             
         # Update project status
