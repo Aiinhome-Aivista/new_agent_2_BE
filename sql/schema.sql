@@ -498,3 +498,33 @@ CREATE INDEX idx_alerts_project ON alerts(project_id);
 CREATE INDEX idx_workflow_project ON workflow_runs(project_id);
 CREATE INDEX idx_episodic_project ON episodic_memory(project_id, created_at);
 CREATE INDEX idx_audit_project ON audit_logs(project_id, created_at);
+
+DELIMITER //
+
+CREATE PROCEDURE truncate_all_tables_except_users_and_master()
+BEGIN
+    SET FOREIGN_KEY_CHECKS = 0;
+
+    TRUNCATE TABLE alerts;
+    TRUNCATE TABLE audit_logs;
+    TRUNCATE TABLE context_compactions;
+    TRUNCATE TABLE deliverables;
+    TRUNCATE TABLE document_types;
+    TRUNCATE TABLE documents;
+    TRUNCATE TABLE episodic_memory;
+    TRUNCATE TABLE finding_evidence;
+    TRUNCATE TABLE new_requests;
+    TRUNCATE TABLE project_activities;
+    TRUNCATE TABLE project_users;
+    TRUNCATE TABLE projects;
+    TRUNCATE TABLE risk_findings;
+    TRUNCATE TABLE scope_baselines;
+    TRUNCATE TABLE scope_items;
+    TRUNCATE TABLE stakeholders;
+    TRUNCATE TABLE tracker_items;
+    TRUNCATE TABLE workflow_runs;
+
+    SET FOREIGN_KEY_CHECKS = 1;
+END //
+
+DELIMITER ;
