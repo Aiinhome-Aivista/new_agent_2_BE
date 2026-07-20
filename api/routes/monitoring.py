@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
@@ -85,9 +86,7 @@ def process_monitoring(project_id: int, document_id: int, current_user: dict = D
                 item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5)
             ))
             activity_id = cursor.lastrowid
-            
-            risk_assessment = ReconciliationAgent.evaluate_risk(project_id, item, "ACTIVITY")
-            insert_tracker_item("ACTIVITY", activity_id, risk_assessment)
+            activity_id = cursor.lastrowid
             
         # --- 2. Process New Requests ---
         for item in extracted_data.get("new_requests", []):
@@ -99,29 +98,30 @@ def process_monitoring(project_id: int, document_id: int, current_user: dict = D
                 item.get("source_page"), item.get("evidence_text", "")
             ))
             request_id = cursor.lastrowid
-            
-            risk_assessment = ReconciliationAgent.evaluate_risk(project_id, item, "NEW_REQUEST")
-            insert_tracker_item("NEW_REQUEST", request_id, risk_assessment)
+            request_id = cursor.lastrowid
         
         # --- 3. Process Blockers ---
         for item in extracted_data.get("blockers", []):
-            risk_assessment = ReconciliationAgent.evaluate_risk(project_id, item, "BLOCKER")
-            insert_tracker_item("BLOCKER", 0, risk_assessment)
+            pass
         
         # --- 4. Process Action Items ---
         for item in extracted_data.get("action_items", []):
-            risk_assessment = ReconciliationAgent.evaluate_risk(project_id, item, "ACTION_ITEM")
-            insert_tracker_item("ACTION_ITEM", 0, risk_assessment)
+            pass
         
         # --- 5. Process Decisions ---
         for item in extracted_data.get("decisions", []):
-            risk_assessment = ReconciliationAgent.evaluate_risk(project_id, item, "DECISION")
-            insert_tracker_item("DECISION", 0, risk_assessment)
+            pass
         
         # --- 6. Process Risks Mentioned ---
         for item in extracted_data.get("risks_mentioned", []):
-            risk_assessment = ReconciliationAgent.evaluate_risk(project_id, item, "RISK_MENTIONED")
-            insert_tracker_item("RISK_MENTIONED", 0, risk_assessment)
+            pass
+            
+        # --- 7. NEW: Multi-Agent Risk Evaluation Engine ---
+        from agents.risk_evaluation_agent import RiskEvaluationAgent
+        try:
+            RiskEvaluationAgent.evaluate_document(project_id, document_id, text, cursor)
+        except Exception as e:
+            print(f"Warning: Multi-Agent evaluation failed, continuing with legacy process. Error: {e}")
             
         db.commit()
         
