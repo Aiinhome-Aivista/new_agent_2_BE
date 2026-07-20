@@ -5,6 +5,8 @@ from agents.risk_evaluator_subagents import (
     OutOfScopeDetectionAgent,
     DeliverableTimelineEvaluationAgent
 )
+from agents.tracker_audit_agent import TrackerAuditAgent
+from agents.alerting_agent import AlertingAgent
 
 class RiskEvaluationAgent:
     @classmethod
@@ -79,35 +81,42 @@ Output MUST be a valid JSON object matching this exact schema:
             json.dumps(recommendations), json.dumps(sub_agent_results)
         ))
         
-        # 6. Update Scope Tracker (tracker_items)
-        # For simplicity and UI compatibility, we will map the OutOfScope and Delayed Deliverables to tracker_items
+        # 6. Update Scope Tracker (via TrackerAuditAgent) and Trigger Alerts
+        # For simplicity and UI compatibility, we map the OutOfScope and Delayed Deliverables to tracker_items
+        
+        # Helper to fetch stakeholders for alerts
+        db_cursor.execute("SELECT email, role FROM stakeholders WHERE project_id = %s", (project_id,))
+        stakeholders = db_cursor.fetchall()
+        
         for oos_item in out_of_scope_result.get("activities", []):
+            confidence_val = oos_item.get('confidence', 50) / 100.0
             reasoning = f"{oos_item.get('reason', '')} (Confidence: {oos_item.get('confidence', 0)}%)"
-            db_cursor.execute("""
-                INSERT INTO tracker_items 
-                (project_id, source_document_id, item_type, is_out_of_scope, risk_score, risk_level, risk_category, confidence, reasoning, requires_escalation, status)
-                VALUES (%s, %s, 'ACTIVITY', 1, %s, %s, 'SCOPE_CREEP', %s, %s, 1, 'OPEN')
-            """, (
-                project_id, document_id, 
-                80 if oos_item.get('classification') == 'OUT_OF_SCOPE' else 50,
-                'HIGH' if oos_item.get('classification') == 'OUT_OF_SCOPE' else 'MEDIUM',
-                oos_item.get('confidence', 50) / 100.0,
-                f"Activity: {oos_item.get('activity')}\n{reasoning}"
-            ))
+            full_reasoning = f"Activity: {oos_item.get('activity')}\n{reasoning}"
+            risk_score = 80 if oos_item.get('classification') == 'OUT_OF_SCOPE' else 50
+            risk_level = 'HIGH' if oos_item.get('classification') == 'OUT_OF_SCOPE' else 'MEDIUM'
+            
+            TrackerAuditAgent.persist_tracker_item(
+                db_cursor, project_id, document_id, 'ACTIVITY', 
+                True, risk_score, risk_level, 'SCOPE_CREEP', confidence_val, full_reasoning, True
+            )
+            
+            if risk_score >= 70:
+                AlertingAgent.dispatch_alert(project_id, f"Scope Creep: {oos_item.get('activity')}", full_reasoning, stakeholders)
             
         for deliv in timeline_result.get("deliverables", []):
             if deliv.get('risk') in ['HIGH', 'CRITICAL'] or deliv.get('current_status') == 'Delayed':
                 reasoning = f"Delayed by {deliv.get('delay_days', 0)} days. Blockers: {', '.join(deliv.get('blockers', []))}"
-                db_cursor.execute("""
-                    INSERT INTO tracker_items 
-                    (project_id, source_document_id, item_type, is_out_of_scope, risk_score, risk_level, risk_category, confidence, reasoning, requires_escalation, status)
-                    VALUES (%s, %s, 'ACTION_ITEM', 0, %s, %s, 'DELAY', 1.0, %s, 1, 'OPEN')
-                """, (
-                    project_id, document_id, 
-                    85 if deliv.get('risk') == 'CRITICAL' else 65,
-                    deliv.get('risk', 'HIGH'),
-                    f"Deliverable: {deliv.get('deliverable')}\n{reasoning}"
-                ))
+                full_reasoning = f"Deliverable: {deliv.get('deliverable')}\n{reasoning}"
+                risk_score = 85 if deliv.get('risk') == 'CRITICAL' else 65
+                risk_level = deliv.get('risk', 'HIGH')
+                
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, 'ACTION_ITEM', 
+                    False, risk_score, risk_level, 'DELAY', 1.0, full_reasoning, True
+                )
+                
+                if risk_score >= 70:
+                    AlertingAgent.dispatch_alert(project_id, f"Delay: {deliv.get('deliverable')}", full_reasoning, stakeholders)
 
         return {
             "overallRisk": overall_risk,
