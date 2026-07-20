@@ -215,7 +215,13 @@ class RelevanceService:
     @classmethod
     def score_relevance(cls, document_text: str, document_type: str, db=None) -> dict:
         """
-        Score how relevant a document's content is to the declared document type using a HYBRID approach.
+        Score how relevant a document's content is to the declared document type.
+        
+        Strategy:
+        - Step 1: Fast embedding pre-filter to catch completely irrelevant files (< 10%)
+        - Step 2: LLM always makes the final decision for everything else
+        
+        This ensures the same document ALWAYS gets the same accurate score.
         """
         # 1. Get the reference profile text
         reference_text = cls._get_reference_text(document_type, db)
@@ -228,52 +234,54 @@ class RelevanceService:
         raw_similarity = cls._cosine_similarity(doc_embedding, ref_embedding)
 
         # 4. Scale to 0-100 percentage
-        score = int(min(100, max(0, round(raw_similarity * 125))))
+        embedding_score = int(min(100, max(0, round(raw_similarity * 125))))
         type_label = document_type.replace("_", " ").title()
 
-        # 5. Threshold Hybrid Logic
-        if score > 80:
+        # 5. Fast rejection: only for completely irrelevant content (< 10%)
+        #    e.g. uploading a cooking recipe as an "Engagement Letter"
+        if embedding_score < 10:
             return {
-                "score": score,
-                "reasoning": f"Document content shows excellent semantic alignment with {type_label} characteristics. No AI verification needed."
+                "score": embedding_score,
+                "reasoning": f"Document content is completely unrelated to {type_label}. Obvious mismatch, rejected."
             }
-        elif score < 40:
+
+        # 6. LLM always makes the final decision for consistent, accurate scoring
+        from services.llm_service import LLMService
+        
+        # Send a smaller chunk to the LLM to save tokens
+        small_sample = document_text[:3000] 
+        
+        prompt = (
+            f"You are a professional auditor assistant.\n"
+            f"We are analyzing a document to see if it is a valid '{document_type}'.\n"
+            f"Our semantic pre-scanner gave it a preliminary confidence score of {embedding_score}/100.\n\n"
+            f"Please read this excerpt and provide the final accurate relevance score:\n"
+            f"\"\"\"\n{small_sample}\n\"\"\"\n\n"
+            f"Scoring guidelines:\n"
+            f"- 80-100: Clearly a valid {type_label} document\n"
+            f"- 50-79: Partially matches {type_label} but missing key elements\n"
+            f"- 20-49: Weak match, mostly unrelated content\n"
+            f"- 0-19: Completely unrelated to {type_label}\n\n"
+            f"Respond ONLY with a valid JSON object matching this schema:\n"
+            f"{{\n"
+            f"  \"score\": <integer between 0 and 100>,\n"
+            f"  \"reasoning\": \"<brief 1-sentence reasoning explaining why it is or isn't a {document_type}>\"\n"
+            f"}}"
+        )
+        
+        try:
+            res_json = LLMService.generate_json(prompt)
+            final_score = int(res_json.get("score", embedding_score))
+            reasoning = res_json.get("reasoning", f"AI verified with score {final_score}.")
             return {
-                "score": score,
-                "reasoning": f"Document content shows very low similarity to {type_label} characteristics. Obvious mismatch, rejected."
+                "score": final_score,
+                "reasoning": reasoning
             }
-        else:
-            # Borderline case (40 - 80). Use the LLM to make the final accurate decision.
-            from services.llm_service import LLMService
-            
-            # Send a smaller chunk to the LLM to save tokens
-            small_sample = document_text[:3000] 
-            
-            prompt = (
-                f"You are a professional auditor assistant.\n"
-                f"We are analyzing a document to see if it is a valid '{document_type}'.\n"
-                f"Our semantic scanner gave it a borderline confidence score of {score}/100.\n\n"
-                f"Please read this excerpt and make the final decision:\n"
-                f"\"\"\"\n{small_sample}\n\"\"\"\n\n"
-                f"Respond ONLY with a valid JSON object matching this schema:\n"
-                f"{{\n"
-                f"  \"score\": <integer between 0 and 100>,\n"
-                f"  \"reasoning\": \"<brief 1-sentence reasoning explaining why it is or isn't a {document_type}>\"\n"
-                f"}}"
-            )
-            
-            try:
-                res_json = LLMService.generate_json(prompt)
-                final_score = int(res_json.get("score", score))
-                reasoning = res_json.get("reasoning", f"AI verified with score {final_score}.")
-                return {
-                    "score": final_score,
-                    "reasoning": reasoning
-                }
-            except Exception as e:
-                # Fallback to embedding score if LLM fails
-                print(f"Hybrid LLM verification failed: {e}")
-                return {
-                    "score": score,
-                    "reasoning": f"Document content shows moderate similarity to {type_label} characteristics. (AI verification failed, using base score)"
-                }
+        except Exception as e:
+            # Fallback to embedding score if LLM fails
+            print(f"LLM verification failed: {e}")
+            return {
+                "score": embedding_score,
+                "reasoning": f"Document shows {embedding_score}% similarity to {type_label}. (AI verification unavailable, using embedding score)"
+            }
+

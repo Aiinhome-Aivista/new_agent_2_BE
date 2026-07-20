@@ -61,17 +61,38 @@ def truncate_all_except_users():
     # Clear ChromaDB Collections
     print("Clearing ChromaDB collections...")
     try:
-        # pyrefly: ignore [missing-import]
-        import chromadb
-        # pyrefly: ignore [missing-import]
-        from chromadb.config import Settings as ChromaSettings
         db_path = os.path.abspath(settings.CHROMA_PATH)
-        client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))
-        for col in client.list_collections():
-            print(f"Deleting collection: {col.name}")
-            client.delete_collection(col.name)
+        # We try to completely remove the physical files so the folder is clean
+        if os.path.exists(db_path):
+            for item in os.listdir(db_path):
+                # Skip bm25 folder as it is handled separately
+                if item == "bm25":
+                    continue
+                item_path = os.path.join(db_path, item)
+                try:
+                    if os.path.isdir(item_path):
+                        shutil.rmtree(item_path)
+                    else:
+                        os.remove(item_path)
+                    print(f"Deleted: {item_path}")
+                except Exception as e:
+                    print(f"Note: Could not physical delete {item} (might be locked by backend server). Falling back to chromadb API deletion...")
+                    # Fallback to API deletion if file is locked
+                    # pyrefly: ignore [missing-import]
+                    import chromadb
+                    # pyrefly: ignore [missing-import]
+                    from chromadb.config import Settings as ChromaSettings
+                    client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))
+                    for col in client.list_collections():
+                        try:
+                            # Handle both object return type and string return type
+                            col_name = col.name if hasattr(col, 'name') else col
+                            print(f"Deleting collection via API: {col_name}")
+                            client.delete_collection(col_name)
+                        except:
+                            pass
     except Exception as e:
-        print(f"Warning: Could not clear ChromaDB collections: {e}")
+        print(f"Warning: Could not clear ChromaDB: {e}")
 
     # Clear BM25 Index
     bm25_dir = os.path.join(os.path.abspath(settings.CHROMA_PATH), "bm25")

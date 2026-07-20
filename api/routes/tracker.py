@@ -13,7 +13,11 @@ def get_tracker_items(project_id: int, current_user: dict = Depends(get_current_
     cursor = db.cursor(dictionary=True)
     cursor.execute("""
         SELECT ti.*, 
-               CASE WHEN ti.item_type = 'ACTIVITY' THEN pa.activity_name ELSE nr.request_name END as name,
+               CASE 
+                 WHEN ti.item_type = 'ACTIVITY' THEN pa.activity_name 
+                 WHEN ti.item_type = 'NEW_REQUEST' THEN nr.request_name
+                 ELSE CONCAT(REPLACE(ti.item_type, '_', ' '), ' #', ti.id)
+               END as name,
                d.document_name
         FROM tracker_items ti
         LEFT JOIN project_activities pa ON ti.item_type = 'ACTIVITY' AND ti.reference_id = pa.id

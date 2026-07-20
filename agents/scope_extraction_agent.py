@@ -7,40 +7,82 @@ class ScopeExtractionAgent:
 You are an expert contract analyst. Extract the project scope details from the following Engagement Letter or Inter-Firm Approval document text.
 Output MUST be a valid JSON object matching this schema exactly, and nothing else.
 
-Schema:
+Schema Example (Your output MUST follow these keys and value types exactly):
 {{
-  "project_name": "string",
-  "client_name": "string",
-  "engagement_type": "string",
+  "project_name": "NextGen Retail Platform",
+  "client_name": "ABC Corporation",
+  "engagement_type": "Technology Advisory",
   "scope_items": [
     {{
-      "name": "string",
-      "description": "string",
-      "scope_type": "IN_SCOPE" | "OUT_OF_SCOPE" | "UNCERTAIN",
-      "source_page": "number or null",
-      "source_section": "string or null",
-      "evidence_text": "Exact quote from document",
-      "confidence": 0.0 to 1.0
+      "name": "Web Platform Design",
+      "description": "Design and develop the web-based retail platform",
+      "scope_type": "IN_SCOPE",
+      "source_page": 1,
+      "source_section": "Scope of Work",
+      "evidence_text": "The document explicitly states that the firm is responsible for designing and developing the retail platform, which establishes this as a core commitment.",
+      "confidence": 0.9
+    }},
+    {{
+      "name": "Mobile App Development",
+      "description": "Native iOS and Android application development",
+      "scope_type": "OUT_OF_SCOPE",
+      "source_page": 1,
+      "source_section": "Out of Scope",
+      "evidence_text": "The client specifically listed mobile app development as out of scope, meaning the firm has no responsibility to deliver native iOS or Android applications.",
+      "confidence": 0.95
+    }},
+    {{
+      "name": "Hardware Procurement",
+      "description": "Purchasing of servers or hardware",
+      "scope_type": "OUT_OF_SCOPE",
+      "source_page": 1,
+      "source_section": "Out of Scope",
+      "evidence_text": "The contract excludes hardware procurement, indicating the client will handle purchasing their own servers rather than the firm.",
+      "confidence": 0.95
     }}
   ],
   "deliverables": [
     {{
-      "name": "string",
-      "description": "string",
-      "deadline": "YYYY-MM-DD or null",
-      "owner": "string or null"
+      "name": "Final Report",
+      "description": "Comprehensive project deliverable report",
+      "deadline": "2026-12-31",
+      "owner": "Project Manager"
     }}
   ],
   "stakeholders": [
     {{
-      "name": "string",
-      "role": "string",
-      "responsibility": "string"
+      "name": "John Smith",
+      "role": "Engagement Partner",
+      "responsibility": "Overall project oversight"
     }}
+  ],
+  "milestones": [
+    {{
+      "name": "Phase 1 Complete",
+      "description": "Discovery and planning phase completion",
+      "target_date": "2026-09-30"
+    }}
+  ],
+  "assumptions": [
+    "Client will provide access to existing systems within 2 weeks"
+  ],
+  "constraints": [
+    "Budget capped at $500,000"
+  ],
+  "dependencies": [
+    "Client IT team availability for integration testing"
   ]
 }}
 
+Data Types Rules:
+- "scope_type" MUST be one of: "IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN".
+- "source_page" MUST be an integer or null.
+- "confidence" MUST be a float between 0.0 and 1.0.
+- "deadline" and "target_date" MUST be in YYYY-MM-DD format or null.
+- Use null for any fields if the information is missing.
+- If a category has no items, return an empty array [].
+
 Document Text:
-{document_text[:8000]} # Limit to ~8k chars for POC to avoid massive context
+{document_text[:8000]}
 """
         return LLMService.generate_json(prompt)
