@@ -12,18 +12,25 @@ class ProjectCreate(BaseModel):
     client_name: Optional[str] = None
     description: Optional[str] = None
     assigned_lead_id: Optional[int] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
 
 class ProjectUpdate(BaseModel):
-    project_name: Optional[str]
-    client_name: Optional[str]
-    description: Optional[str]
-    monitoring_status: Optional[str]
+    project_name: Optional[str] = None
+    client_name: Optional[str] = None
+    description: Optional[str] = None
+    monitoring_status: Optional[str] = None
+    end_date: Optional[str] = None
 
 @router.post("/")
 def create_project(project: ProjectCreate, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    if project.start_date and project.end_date:
+        if project.start_date > project.end_date:
+            raise HTTPException(status_code=400, detail="Start date cannot be after end date")
+            
     cursor = db.cursor(dictionary=True)
-    sql = "INSERT INTO projects (project_name, client_name, description, created_by) VALUES (%s, %s, %s, %s)"
-    cursor.execute(sql, (project.project_name, project.client_name, project.description, current_user["id"]))
+    sql = "INSERT INTO projects (project_name, client_name, description, start_date, end_date, created_by) VALUES (%s, %s, %s, %s, %s, %s)"
+    cursor.execute(sql, (project.project_name, project.client_name, project.description, project.start_date, project.end_date, current_user["id"]))
     db.commit()
     project_id = cursor.lastrowid
     
@@ -126,3 +133,57 @@ def generate_project_description(
         return {"success": True, "description": description}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate description: {e}")
+
+@router.put("/{project_id}")
+def update_project(
+    project_id: int, 
+    project: ProjectUpdate, 
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), 
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    if project.end_date is not None and project.end_date != "":
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT start_date FROM projects WHERE id = %s", (project_id,))
+        row = cursor.fetchone()
+        cursor.close()
+        if row and row["start_date"]:
+            start_date_str = str(row["start_date"])
+            if start_date_str > project.end_date:
+                raise HTTPException(status_code=400, detail="End date cannot be before start date")
+
+    cursor = db.cursor(dictionary=True)
+    
+    # We build the update SQL dynamically based on what is provided
+    updates = []
+    values = []
+    
+    if project.project_name is not None:
+        updates.append("project_name = %s")
+        values.append(project.project_name)
+    if project.client_name is not None:
+        updates.append("client_name = %s")
+        values.append(project.client_name)
+    if project.description is not None:
+        updates.append("description = %s")
+        values.append(project.description)
+    if project.monitoring_status is not None:
+        updates.append("monitoring_status = %s")
+        values.append(project.monitoring_status)
+    if project.end_date is not None:
+        updates.append("end_date = %s")
+        values.append(project.end_date if project.end_date != "" else None)
+        
+    if not updates:
+        raise HTTPException(status_code=400, detail="No updates provided")
+        
+    sql = f"UPDATE projects SET {', '.join(updates)} WHERE id = %s"
+    values.append(project_id)
+    
+    cursor.execute(sql, tuple(values))
+    db.commit()
+    cursor.close()
+    
+    return {"success": True, "message": "Project updated successfully"}
+
