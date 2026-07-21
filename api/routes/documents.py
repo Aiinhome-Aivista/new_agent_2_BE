@@ -31,16 +31,8 @@ def check_document_relevance(
 
     cursor = db.cursor(dictionary=True)
     
-    # 1. Duplicate check (strict check for EL and IFA types)
-    if document_type in ["EL", "IFA"]:
-        cursor.execute("SELECT id FROM documents WHERE project_id = %s AND document_type = %s", (project_id, document_type))
-        existing_doc = cursor.fetchone()
-        if existing_doc:
-            cursor.close()
-            raise HTTPException(
-                status_code=400, 
-                detail=f"An active document of type '{document_type}' has already been uploaded for this project. Please delete the existing document before uploading a new one."
-            )
+    # 1. Duplicate check (strict check for EL and IFA types) - REMOVED for Multi-Upload Support
+    # Allow multiple EL and IFA uploads.
 
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in [".pdf", ".docx", ".txt"]:
@@ -115,19 +107,8 @@ def confirm_upload_document(
 
     cursor = db.cursor(dictionary=True)
     
-    # Duplicate check again for safety
-    if payload.document_type in ["EL", "IFA"]:
-        cursor.execute("SELECT id FROM documents WHERE project_id = %s AND document_type = %s", (project_id, payload.document_type))
-        existing_doc = cursor.fetchone()
-        if existing_doc:
-            cursor.close()
-            # Clean up temp file
-            if os.path.exists(temp_file_path):
-                os.remove(temp_file_path)
-            raise HTTPException(
-                status_code=400, 
-                detail=f"An active document of type '{payload.document_type}' has already been uploaded for this project."
-            )
+    # Duplicate check again for safety - REMOVED for Multi-Upload Support
+    # Allow multiple EL and IFA uploads.
 
     # Move file to permanent project folder
     storage_dir = os.path.join(settings.UPLOAD_PATH, str(project_id))

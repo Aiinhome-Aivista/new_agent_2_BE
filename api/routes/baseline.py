@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
@@ -36,38 +37,91 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         # Check if there is an existing DRAFT baseline for the project
         cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'DRAFT' ORDER BY id DESC LIMIT 1", (project_id,))
         existing_draft = cursor.fetchone()
+        
         if existing_draft:
             baseline_id = existing_draft["id"]
-            # Clear previous items from this specific file under this draft
-            cursor.execute("DELETE FROM scope_items WHERE baseline_id = %s AND source_document_id = %s", (baseline_id, document_id))
-            cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s AND source_document_id = %s", (baseline_id, document_id))
             cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         else:
             # Create draft baseline
             cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
             baseline_id = cursor.lastrowid
+            
+            # Copy items from latest APPROVED baseline to carry forward historical data
+            cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
+            latest_approved = cursor.fetchone()
+            if latest_approved:
+                app_baseline_id = latest_approved["id"]
+                # Copy scope items
+                cursor.execute("""
+                    INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence)
+                    SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence
+                    FROM scope_items WHERE baseline_id = %s
+                """, (baseline_id, app_baseline_id))
+                
+                # Copy deliverables
+                cursor.execute("""
+                    INSERT INTO deliverables (baseline_id, project_id, name, description, deadline, owner, source_document_id)
+                    SELECT %s, project_id, name, description, deadline, owner, source_document_id
+                    FROM deliverables WHERE baseline_id = %s
+                """, (baseline_id, app_baseline_id))
+
             cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         
-        # Insert scope items
+        # Smart Diffing (UPSERT)
         for item in extracted_data.get("scope_items", []):
-            sql = """INSERT INTO scope_items 
-                     (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence)
-                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (
-                baseline_id, project_id, item.get("name", "Unknown"), item.get("description", ""),
-                item.get("scope_type", "UNCERTAIN"), document_id, item.get("source_page"),
-                item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5)
-            ))
+            item_name = item.get("name", "Unknown")
+            item_type = item.get("scope_type", "UNCERTAIN")
             
-        # Insert deliverables
+            cursor.execute("SELECT id, scope_type FROM scope_items WHERE baseline_id = %s AND LOWER(name) = %s", (baseline_id, item_name.lower()))
+            existing_item = cursor.fetchone()
+            
+            if existing_item:
+                status_change_tag = None
+                old_type = existing_item["scope_type"]
+                if old_type != item_type:
+                    status_change_tag = f"Changed from {old_type} to {item_type}"
+                    
+                sql = """UPDATE scope_items 
+                         SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
+                             source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s
+                         WHERE id = %s"""
+                cursor.execute(sql, (
+                    item.get("description", ""), item_type, document_id, item.get("source_page"),
+                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5), status_change_tag, existing_item["id"]
+                ))
+            else:
+                sql = """INSERT INTO scope_items 
+                         (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                cursor.execute(sql, (
+                    baseline_id, project_id, item_name, item.get("description", ""),
+                    item_type, document_id, item.get("source_page"),
+                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5)
+                ))
+            
+        # UPSERT deliverables
         for item in extracted_data.get("deliverables", []):
-            sql = """INSERT INTO deliverables
-                     (baseline_id, project_id, name, description, deadline, owner, source_document_id)
-                     VALUES (%s, %s, %s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (
-                baseline_id, project_id, item.get("name", "Unknown"), item.get("description", ""),
-                item.get("deadline") if item.get("deadline") else None, item.get("owner"), document_id
-            ))
+            item_name = item.get("name", "Unknown")
+            deadline = item.get("deadline") if item.get("deadline") else None
+            
+            cursor.execute("SELECT id FROM deliverables WHERE baseline_id = %s AND LOWER(name) = %s", (baseline_id, item_name.lower()))
+            existing_deliv = cursor.fetchone()
+            
+            if existing_deliv:
+                sql = """UPDATE deliverables
+                         SET description = %s, deadline = %s, owner = %s, source_document_id = %s
+                         WHERE id = %s"""
+                cursor.execute(sql, (
+                    item.get("description", ""), deadline, item.get("owner"), document_id, existing_deliv["id"]
+                ))
+            else:
+                sql = """INSERT INTO deliverables
+                         (baseline_id, project_id, name, description, deadline, owner, source_document_id)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s)"""
+                cursor.execute(sql, (
+                    baseline_id, project_id, item_name, item.get("description", ""),
+                    deadline, item.get("owner"), document_id
+                ))
             
         # Insert stakeholders
         for stakeholder in extracted_data.get("stakeholders", []):
