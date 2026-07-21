@@ -129,3 +129,74 @@ def approve_baseline(project_id: int, current_user: dict = Depends(require_roles
     cursor.close()
     
     return {"success": True, "message": "Baseline approved. Project is now ACTIVE."}
+
+class ScopeItemCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    scope_type: str = "IN_SCOPE"
+    evidence_text: Optional[str] = None
+    confidence: Optional[float] = 1.0
+
+@router.post("/items")
+def add_scope_item(
+    project_id: int,
+    item: ScopeItemCreate,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    cursor = db.cursor(dictionary=True)
+    
+    cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
+    baseline = cursor.fetchone()
+    if not baseline:
+        cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
+        db.commit()
+        baseline_id = cursor.lastrowid
+    else:
+        baseline_id = baseline["id"]
+        
+    sql = """
+        INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, evidence_text, confidence)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+    """
+    cursor.execute(sql, (
+        baseline_id,
+        project_id,
+        item.name,
+        item.description or "",
+        item.scope_type,
+        item.evidence_text or "Manually added item",
+        item.confidence if item.confidence is not None else 1.0
+    ))
+    db.commit()
+    item_id = cursor.lastrowid
+    
+    cursor.execute("SELECT * FROM scope_items WHERE id = %s", (item_id,))
+    created_item = cursor.fetchone()
+    cursor.close()
+    
+    return {"success": True, "message": "Scope item added successfully", "data": created_item}
+
+@router.delete("/items/{item_id}")
+def delete_scope_item(
+    project_id: int,
+    item_id: int,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    cursor = db.cursor(dictionary=True)
+    
+    cursor.execute("SELECT id FROM scope_items WHERE id = %s AND project_id = %s", (item_id, project_id))
+    item = cursor.fetchone()
+    if not item:
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Scope item not found")
+        
+    cursor.execute("DELETE FROM scope_items WHERE id = %s AND project_id = %s", (item_id, project_id))
+    db.commit()
+    cursor.close()
+    
+    return {"success": True, "message": "Scope item deleted successfully"}
+
