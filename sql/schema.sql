@@ -70,12 +70,19 @@ name VARCHAR(150) NOT NULL,
 email VARCHAR(255),
 role VARCHAR(100),
 responsibility TEXT,
+user_id BIGINT NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_stakeholders_project
         FOREIGN KEY (project_id)
         REFERENCES projects(id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_stakeholders_user
+        FOREIGN KEY (user_id)
+        REFERENCES users(id)
+        ON DELETE SET NULL
 );
 
 CREATE TABLE documents (
