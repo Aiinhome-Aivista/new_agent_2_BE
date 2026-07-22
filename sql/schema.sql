@@ -196,6 +196,7 @@ source_page INT NULL,
 source_section VARCHAR(255),
 evidence_text TEXT NOT NULL,
 confidence DECIMAL(5,4),
+deadline DATE NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_scope_item_baseline

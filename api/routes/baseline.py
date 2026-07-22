@@ -60,8 +60,8 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 app_baseline_id = latest_approved["id"]
                 # Copy scope items
                 cursor.execute("""
-                    INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence)
-                    SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence
+                    INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
+                    SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline
                     FROM scope_items WHERE baseline_id = %s
                 """, (baseline_id, app_baseline_id))
                 
@@ -100,20 +100,20 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     
                 sql = """UPDATE scope_items 
                          SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
-                             source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s
+                             source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s, deadline = %s
                          WHERE id = %s"""
                 cursor.execute(sql, (
                     item.get("description", ""), item_type, document_id, item.get("source_page"),
-                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5), status_change_tag, existing_item["id"]
+                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5), status_change_tag, item.get("deadline"), existing_item["id"]
                 ))
             else:
                 sql = """INSERT INTO scope_items 
-                         (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence)
-                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                         (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
+                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
                 cursor.execute(sql, (
                     baseline_id, project_id, item_name, item.get("description", ""),
                     item_type, document_id, item.get("source_page"),
-                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5)
+                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5), item.get("deadline")
                 ))
             
         # UPSERT deliverables

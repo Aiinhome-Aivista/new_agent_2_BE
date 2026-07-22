@@ -20,7 +20,8 @@ Schema Example (Your output MUST follow these keys and value types exactly):
       "source_page": 1,
       "source_section": "Scope of Work",
       "evidence_text": "The document explicitly states that the firm is responsible for designing and developing the retail platform, which establishes this as a core commitment.",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "deadline": "2026-10-31"
     }},
     {{
       "name": "Mobile App Development",
@@ -29,7 +30,8 @@ Schema Example (Your output MUST follow these keys and value types exactly):
       "source_page": 1,
       "source_section": "Out of Scope",
       "evidence_text": "The client specifically listed mobile app development as out of scope, meaning the firm has no responsibility to deliver native iOS or Android applications.",
-      "confidence": 0.95
+      "confidence": 0.95,
+      "deadline": null
     }},
     {{
       "name": "Hardware Procurement",
@@ -38,7 +40,8 @@ Schema Example (Your output MUST follow these keys and value types exactly):
       "source_page": 1,
       "source_section": "Out of Scope",
       "evidence_text": "The contract excludes hardware procurement, indicating the client will handle purchasing their own servers rather than the firm.",
-      "confidence": 0.95
+      "confidence": 0.95,
+      "deadline": null
     }}
   ],
   "deliverables": [
