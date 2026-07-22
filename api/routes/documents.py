@@ -278,3 +278,31 @@ def delete_document(
         
     cursor.close()
     return {"success": True, "message": "Document deleted successfully"}
+
+@router.get("/{document_id}/download")
+def download_document(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
+    doc = cursor.fetchone()
+    cursor.close()
+    
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+        
+    file_path = doc["storage_key"]
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="Physical file not found on disk")
+        
+    from fastapi.responses import FileResponse
+    return FileResponse(
+        path=file_path,
+        filename=doc["document_name"],
+        media_type="application/octet-stream"
+    )
+
