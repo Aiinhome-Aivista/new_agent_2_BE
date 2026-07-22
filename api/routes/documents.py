@@ -17,6 +17,7 @@ class ConfirmUploadRequest(BaseModel):
     document_type: str
     original_name: str
 
+"""
 @router.post("/check-relevance")
 def check_document_relevance(
     project_id: int,
@@ -90,33 +91,33 @@ def check_document_relevance(
         "temp_key": unique_filename,
         "original_name": file.filename
     }
+"""
 
 @router.post("/confirm-upload")
 def confirm_upload_document(
     project_id: int,
-    payload: ConfirmUploadRequest,
+    document_type: str = Form(...),
+    file: UploadFile = File(...),
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
-    temp_dir = os.path.join(settings.UPLOAD_PATH, "temp")
-    temp_file_path = os.path.join(temp_dir, payload.temp_key)
-    
-    if not os.path.exists(temp_file_path):
-        raise HTTPException(status_code=400, detail="Temporary file session not found or expired")
-
     cursor = db.cursor(dictionary=True)
     
-    # Duplicate check again for safety - REMOVED for Multi-Upload Support
-    # Allow multiple EL and IFA uploads.
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in [".pdf", ".docx", ".txt"]:
+        cursor.close()
+        raise HTTPException(status_code=400, detail="Unsupported file format")
 
     # Move file to permanent project folder
     storage_dir = os.path.join(settings.UPLOAD_PATH, str(project_id))
     os.makedirs(storage_dir, exist_ok=True)
-    storage_key = os.path.join(storage_dir, payload.temp_key)
+    unique_filename = f"{uuid.uuid4()}{ext}"
+    storage_key = os.path.join(storage_dir, unique_filename)
     
     try:
-        os.rename(temp_file_path, storage_key)
+        with open(storage_key, "wb") as f:
+            f.write(file.file.read())
     except Exception as e:
         cursor.close()
         raise HTTPException(status_code=500, detail=f"Failed to finalize file storage: {e}")
@@ -125,7 +126,7 @@ def confirm_upload_document(
         INSERT INTO documents (project_id, document_name, document_type, storage_key, processing_status, uploaded_by)
         VALUES (%s, %s, %s, %s, %s, %s)
     """
-    cursor.execute(sql, (project_id, payload.original_name, payload.document_type, storage_key, "UPLOADED", current_user["id"]))
+    cursor.execute(sql, (project_id, file.filename, document_type, storage_key, "UPLOADED", current_user["id"]))
     db.commit()
     document_id = cursor.lastrowid
     cursor.close()
