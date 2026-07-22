@@ -42,8 +42,13 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             baseline_id = existing_draft["id"]
             cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         else:
+            # Get max version to auto-increment it for the new draft
+            cursor.execute("SELECT MAX(version) as max_v FROM scope_baselines WHERE project_id = %s", (project_id,))
+            max_v_row = cursor.fetchone()
+            next_version = (max_v_row["max_v"] or 0) + 1 if max_v_row else 1
+            
             # Create draft baseline
-            cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
+            cursor.execute("INSERT INTO scope_baselines (project_id, status, version) VALUES (%s, 'DRAFT', %s)", (project_id, next_version))
             baseline_id = cursor.lastrowid
             
             # Copy items from latest APPROVED baseline to carry forward historical data
@@ -68,12 +73,22 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         
         # Smart Diffing (UPSERT)
+        import difflib
+        
+        cursor.execute("SELECT id, name, scope_type FROM scope_items WHERE baseline_id = %s", (baseline_id,))
+        existing_scope_items = cursor.fetchall()
+        
         for item in extracted_data.get("scope_items", []):
             item_name = item.get("name", "Unknown")
             item_type = item.get("scope_type", "UNCERTAIN")
             
-            cursor.execute("SELECT id, scope_type FROM scope_items WHERE baseline_id = %s AND LOWER(name) = %s", (baseline_id, item_name.lower()))
-            existing_item = cursor.fetchone()
+            existing_item = None
+            best_ratio = 0.0
+            for db_item in existing_scope_items:
+                ratio = difflib.SequenceMatcher(None, item_name.lower(), db_item["name"].lower()).ratio()
+                if ratio > 0.8 and ratio > best_ratio:
+                    best_ratio = ratio
+                    existing_item = db_item
             
             if existing_item:
                 status_change_tag = None
@@ -100,12 +115,21 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 ))
             
         # UPSERT deliverables
+        cursor.execute("SELECT id, name FROM deliverables WHERE baseline_id = %s", (baseline_id,))
+        existing_deliverables = cursor.fetchall()
+        
         for item in extracted_data.get("deliverables", []):
             item_name = item.get("name", "Unknown")
             deadline = item.get("deadline") if item.get("deadline") else None
             
-            cursor.execute("SELECT id FROM deliverables WHERE baseline_id = %s AND LOWER(name) = %s", (baseline_id, item_name.lower()))
-            existing_deliv = cursor.fetchone()
+            existing_deliv = None
+            best_ratio = 0.0
+            for db_item in existing_deliverables:
+                ratio = difflib.SequenceMatcher(None, item_name.lower(), db_item["name"].lower()).ratio()
+                if ratio > 0.8 and ratio > best_ratio:
+                    best_ratio = ratio
+                    existing_deliv = db_item
+
             
             if existing_deliv:
                 sql = """UPDATE deliverables
@@ -148,7 +172,7 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
+    cursor.execute("SELECT * FROM scope_baselines WHERE project_id = %s ORDER BY id DESC LIMIT 1", (project_id,))
     baseline = cursor.fetchone()
     
     if not baseline:

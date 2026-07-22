@@ -24,8 +24,10 @@ class ReconciliationAgent:
         query = item.get("activity_name", item.get("request_name", item.get("blocker_name", item.get("action_name", item.get("decision", item.get("risk_name", ""))))))
         evidence = MCPTools.search_baseline(project_id, query)
         
-        evidence_text = "\n".join([f"- {e['text']} (Score: {e.get('rerank_score', e.get('score', 0)):.2f})" for e in evidence])
-        
+        evidence_text = "\n".join([
+            f"- [Source: {e.get('metadata', {}).get('document_name', 'Unknown Document')}] {e['text']} (Score: {e.get('rerank_score', e.get('score', 0)):.2f})"
+            for e in evidence
+        ])
         # 3. Build item description for the LLM
         item_desc = ""
         if item_type == "ACTIVITY":
@@ -61,7 +63,7 @@ Baseline Evidence (from contract/EL/IFA):
 {evidence_text if evidence_text.strip() else "No direct baseline evidence found for this item."}
 
 Your task:
-1. Determine if this item is within the original project scope or is a deviation
+1. Determine if this item is within the original project scope or is a deviation. If baseline evidence contradicts itself (e.g. an original EL vs an Addendum), you MUST prioritize the information from the most recent/latest document source.
 2. Classify the risk category
 3. Calculate a risk score from 0 to 100
 4. Provide a detailed description explaining WHY you assigned this risk score
