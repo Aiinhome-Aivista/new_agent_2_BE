@@ -102,6 +102,9 @@ def confirm_upload_document(
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
+    if document_type in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
+        raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to upload EL or IFA documents.")
+        
     cursor = db.cursor(dictionary=True)
     
     ext = os.path.splitext(file.filename)[1].lower()
@@ -203,6 +206,10 @@ def process_document(
         cursor.close()
         raise HTTPException(status_code=404, detail="Document not found")
         
+    if doc["document_type"] in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
+        cursor.close()
+        raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to process EL or IFA documents.")
+        
     try:
         cursor.execute("UPDATE documents SET processing_status = 'PROCESSING' WHERE id = %s", (document_id,))
         db.commit()
@@ -241,6 +248,10 @@ def delete_document(
     if not doc:
         cursor.close()
         raise HTTPException(status_code=404, detail="Document not found")
+        
+    if doc["document_type"] in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
+        cursor.close()
+        raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to delete EL or IFA documents.")
         
     try:
         # 1. Clean up RAG resources if it was completed

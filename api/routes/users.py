@@ -24,7 +24,7 @@ class UserStatusUpdate(BaseModel):
     is_active: bool
 
 @router.get("/")
-def get_users(role: Optional[str] = None, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+def get_users(role: Optional[str] = None, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     cursor = db.cursor(dictionary=True)
     if role:
         cursor.execute("SELECT id, name, email, role, is_active, created_at FROM users WHERE role = %s", (role,))
