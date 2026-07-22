@@ -19,6 +19,11 @@ class TrackerRepository:
                     conn.commit()
                 except Exception:
                     pass
+                try:
+                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN title VARCHAR(255) NULL AFTER reference_id;")
+                    conn.commit()
+                except Exception:
+                    pass
                 cursor.close()
                 conn.close()
         except Exception as e:
@@ -29,11 +34,12 @@ class TrackerRepository:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
             SELECT ti.*, 
-                   CASE 
-                     WHEN ti.item_type = 'ACTIVITY' THEN pa.activity_name 
-                     WHEN ti.item_type = 'NEW_REQUEST' THEN nr.request_name
-                     ELSE CONCAT(REPLACE(ti.item_type, '_', ' '), ' #', ti.id)
-                   END as name,
+                   COALESCE(ti.title, 
+                            CASE 
+                              WHEN ti.item_type = 'ACTIVITY' THEN pa.activity_name 
+                              WHEN ti.item_type = 'NEW_REQUEST' THEN nr.request_name
+                              ELSE CONCAT(REPLACE(ti.item_type, '_', ' '), ' #', ti.id)
+                            END) as name,
                    d.document_name,
                    u.name as resolved_by_name,
                    u.email as resolved_by_email
