@@ -28,9 +28,10 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
-        text = "\n".join([chunk["text"] for chunk in chunks[:8]])
-        if len(text) > 8000:
-            text = text[:8000]
+        
+        # Combine all chunks and pre-process to save tokens
+        raw_text = "\n".join([chunk["text"] for chunk in chunks])
+        text = DocumentService.clean_contract_text(raw_text)
             
         extracted_data = ScopeExtractionAgent.extract_scope(text)
         

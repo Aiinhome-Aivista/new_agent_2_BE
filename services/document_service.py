@@ -1,4 +1,5 @@
 import os
+# pyrefly: ignore [missing-import]
 import fitz # PyMuPDF
 from docx import Document
 from typing import List, Dict, Any
@@ -6,17 +7,39 @@ from core.config import settings
 import uuid
 
 def chunk_text(text: str) -> List[str]:
-    # A simple token/character based chunker
-    size = settings.CHUNK_SIZE
-    overlap = settings.CHUNK_OVERLAP
-    chunks = []
-    i = 0
-    while i < len(text):
-        chunks.append(text[i:i + size])
-        i += size - overlap
-    return [c for c in chunks if c.strip()]
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=settings.CHUNK_SIZE,
+        chunk_overlap=settings.CHUNK_OVERLAP,
+        separators=["\n\n", "\n", ". ", " ", ""]
+    )
+    
+    return text_splitter.split_text(text)
+
+import re
 
 class DocumentService:
+    @staticmethod
+    def clean_contract_text(text: str) -> str:
+        """Strips out mathematical junk and standard legal boilerplate to save LLM tokens."""
+        # Remove massive whitespace blocks
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        
+        # Remove standard legal boilerplate sections (simplified regex for demo purposes)
+        boilerplate_patterns = [
+            r"(?i)(Limitation of Liability[\s\S]{100,500}?(?=\n\n|\Z))",
+            r"(?i)(Governing Law[\s\S]{50,300}?(?=\n\n|\Z))",
+            r"(?i)(Severability[\s\S]{50,300}?(?=\n\n|\Z))",
+            r"(?i)(Force Majeure[\s\S]{50,300}?(?=\n\n|\Z))",
+            r"(?i)(Table of Contents[\s\S]{50,1000}?(?=\n\n[A-Z]))"
+        ]
+        
+        for pattern in boilerplate_patterns:
+            text = re.sub(pattern, "", text)
+            
+        return text.strip()
+
     @staticmethod
     def process_txt(file_path: str) -> List[Dict[str, Any]]:
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:

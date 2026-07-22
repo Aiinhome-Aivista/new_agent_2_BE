@@ -82,7 +82,12 @@ Data Types Rules:
 - Use null for any fields if the information is missing.
 - If a category has no items, return an empty array [].
 
+Implicit Scope Inference Rules:
+1. If the text says "The vendor will deliver..." or "Our responsibilities include...", classify as IN_SCOPE.
+2. If the text says "The client is responsible for..." or "Assuming the client provides...", classify as OUT_OF_SCOPE (Client Responsibility).
+3. If the text lists assumptions like "Assuming no data migration is needed", extract "Data Migration" and classify as OUT_OF_SCOPE.
+
 Document Text:
-{document_text[:8000]}
+{document_text}
 """
         return LLMService.generate_json(prompt)
