@@ -41,6 +41,7 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         
         if existing_draft:
             baseline_id = existing_draft["id"]
+            cursor.execute("UPDATE scope_baselines SET source_document_id = %s WHERE id = %s", (document_id, baseline_id))
             cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
         else:
             # Get max version to auto-increment it for the new draft
@@ -49,7 +50,7 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             next_version = (max_v_row["max_v"] or 0) + 1 if max_v_row else 1
             
             # Create draft baseline
-            cursor.execute("INSERT INTO scope_baselines (project_id, status, version) VALUES (%s, 'DRAFT', %s)", (project_id, next_version))
+            cursor.execute("INSERT INTO scope_baselines (project_id, status, version, source_document_id) VALUES (%s, 'DRAFT', %s, %s)", (project_id, next_version, document_id))
             baseline_id = cursor.lastrowid
             
             # Copy items from latest APPROVED baseline to carry forward historical data
@@ -190,6 +191,33 @@ def get_baseline(project_id: int, current_user: dict = Depends(get_current_user)
     
     cursor.close()
     return {"success": True, "data": baseline}
+
+@router.get("/versions")
+def get_baseline_versions(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
+    cursor = db.cursor(dictionary=True)
+    
+    # Fetch all baselines for this project, sorted by version DESC
+    cursor.execute("""
+        SELECT sb.*, d.document_name as document_name 
+        FROM scope_baselines sb
+        LEFT JOIN documents d ON sb.source_document_id = d.id
+        WHERE sb.project_id = %s 
+        ORDER BY sb.version DESC
+    """, (project_id,))
+    baselines = cursor.fetchall()
+    
+    for b in baselines:
+        # Fetch scope items for this baseline
+        cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (b["id"],))
+        b["scope_items"] = cursor.fetchall()
+        
+        # Fetch deliverables for this baseline
+        cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (b["id"],))
+        b["deliverables"] = cursor.fetchall()
+        
+    cursor.close()
+    return {"success": True, "data": baselines}
 
 @router.post("/approve")
 def approve_baseline(project_id: int, current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "ADMIN"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):

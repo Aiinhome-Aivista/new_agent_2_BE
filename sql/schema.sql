@@ -159,6 +159,7 @@ status ENUM(
 ) NOT NULL DEFAULT 'DRAFT',
 approved_by BIGINT NULL,
 approved_at DATETIME NULL,
+source_document_id BIGINT NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT uq_baseline_version
@@ -171,7 +172,12 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_baseline_approved_by
         FOREIGN KEY (approved_by)
-        REFERENCES users(id)
+        REFERENCES users(id),
+
+    CONSTRAINT fk_baseline_document
+        FOREIGN KEY (source_document_id)
+        REFERENCES documents(id)
+        ON DELETE SET NULL
 );
 
 CREATE TABLE scope_items (
