@@ -24,6 +24,9 @@ class Settings(BaseSettings):
     LLM_API_URL: str
     LLM_MODEL: str
     LLM_TIMEOUT: int = 3600
+    
+    USE_GEMINI: bool = False
+    GEMINI_API_KEY: str = ""
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     CHROMA_PATH: str = "data/chroma_db"

@@ -2,10 +2,31 @@ import requests
 import json
 import re
 from core.config import settings
+import os
+
+try:
+    from google import genai
+    if settings.USE_GEMINI and settings.GEMINI_API_KEY:
+        gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+except ImportError:
+    gemini_client = None
 
 class LLMService:
     @classmethod
     def generate(cls, prompt: str) -> str:
+        if settings.USE_GEMINI:
+            try:
+                if not gemini_client:
+                    raise RuntimeError("Gemini client is not initialized.")
+                response = gemini_client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=prompt
+                )
+                return response.text
+            except Exception as e:
+                print(f"Gemini LLM Error: {e}")
+                raise RuntimeError(f"Gemini generation failed: {e}")
+
         payload = {
             "model": settings.LLM_MODEL,
             "prompt": prompt,
