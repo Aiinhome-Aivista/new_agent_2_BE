@@ -1,8 +1,11 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
 from core.database import get_db
 from api.dependencies.auth import get_current_user, require_roles, verify_project_access
+from services.llm_service import LLMService
+from repositories.project_repository import ProjectRepository
 import mysql.connector
 
 router = APIRouter()
@@ -28,54 +31,46 @@ def create_project(project: ProjectCreate, current_user: dict = Depends(require_
         if project.start_date > project.end_date:
             raise HTTPException(status_code=400, detail="Start date cannot be after end date")
             
-    cursor = db.cursor(dictionary=True)
-    sql = "INSERT INTO projects (project_name, client_name, description, start_date, end_date, created_by) VALUES (%s, %s, %s, %s, %s, %s)"
-    cursor.execute(sql, (project.project_name, project.client_name, project.description, project.start_date, project.end_date, current_user["id"]))
+    project_id = ProjectRepository.create_project(
+        db=db,
+        project_name=project.project_name,
+        client_name=project.client_name,
+        description=project.description,
+        start_date=project.start_date,
+        end_date=project.end_date,
+        created_by=current_user["id"]
+    )
     db.commit()
-    project_id = cursor.lastrowid
     
     # Auto assign creator to project
-    cursor.execute("INSERT INTO project_users (project_id, user_id) VALUES (%s, %s)", (project_id, current_user["id"]))
+    ProjectRepository.assign_user_to_project(db, project_id, current_user["id"])
     
     # If assigned_lead_id is provided, assign that Project Lead
     if project.assigned_lead_id:
         try:
-            cursor.execute("INSERT INTO project_users (project_id, user_id) VALUES (%s, %s)", (project_id, project.assigned_lead_id))
+            ProjectRepository.assign_user_to_project(db, project_id, project.assigned_lead_id)
         except Exception:
             pass
             
     db.commit()
-    cursor.close()
-    
     return {"success": True, "message": "Project created successfully", "data": {"id": project_id}}
 
 @router.get("/")
 def get_projects(current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
     if current_user["role"] in ["ADMIN", "PMO_REVIEWER", "FINANCE_COMMERCIAL"]:
-        cursor.execute("SELECT * FROM projects")
+        projects = ProjectRepository.get_all_projects(db)
     else:
-        cursor.execute("""
-            SELECT p.* FROM projects p
-            JOIN project_users pu ON p.id = pu.project_id
-            WHERE pu.user_id = %s
-        """, (current_user["id"],))
-    projects = cursor.fetchall()
-    cursor.close()
+        projects = ProjectRepository.get_projects_for_user(db, current_user["id"])
     return {"success": True, "data": projects}
 
 @router.get("/{project_id}")
 def get_project(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
     if current_user["role"] not in ["ADMIN", "PMO_REVIEWER", "FINANCE_COMMERCIAL"]:
-        cursor.execute("SELECT 1 FROM project_users WHERE project_id = %s AND user_id = %s", (project_id, current_user["id"]))
-        if not cursor.fetchone():
+        assigned = ProjectRepository.check_user_project_assignment(db, project_id, current_user["id"])
+        if not assigned:
             raise HTTPException(status_code=403, detail="Not assigned to this project")
             
-    cursor.execute("SELECT * FROM projects WHERE id = %s", (project_id,))
-    project = cursor.fetchone()
-    cursor.close()
-    
+    project = ProjectRepository.get_project_by_id(db, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
     return {"success": True, "data": project}
@@ -86,27 +81,17 @@ class ProjectUserAdd(BaseModel):
 @router.post("/{project_id}/users")
 def add_project_user(project_id: int, user_req: ProjectUserAdd, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
     try:
-        cursor.execute("INSERT INTO project_users (project_id, user_id) VALUES (%s, %s)", (project_id, user_req.user_id))
+        ProjectRepository.assign_user_to_project(db, project_id, user_req.user_id)
         db.commit()
     except mysql.connector.IntegrityError:
         pass # Already assigned
-    cursor.close()
     return {"success": True, "message": "User assigned to project"}
 
 @router.get("/{project_id}/users")
 def get_project_users(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("""
-        SELECT u.id, u.name, u.email, u.role 
-        FROM users u 
-        JOIN project_users pu ON u.id = pu.user_id 
-        WHERE pu.project_id = %s
-    """, (project_id,))
-    users = cursor.fetchall()
-    cursor.close()
+    users = ProjectRepository.get_project_users(db, project_id)
     return {"success": True, "data": users}
 
 class DescriptionGenerateRequest(BaseModel):
@@ -119,7 +104,6 @@ def generate_project_description(
     current_user: dict = Depends(get_current_user),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
-    from services.llm_service import LLMService
     prompt = (
         f"You are a professional project management assistant. "
         f"Generate a concise, professional 2-3 sentence project description for a project named '{payload.project_name}' "
@@ -144,46 +128,28 @@ def update_project(
     verify_project_access(project_id, current_user, db)
     
     if project.end_date is not None and project.end_date != "":
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT start_date FROM projects WHERE id = %s", (project_id,))
-        row = cursor.fetchone()
-        cursor.close()
-        if row and row["start_date"]:
-            start_date_str = str(row["start_date"])
+        start_date = ProjectRepository.get_project_start_date(db, project_id)
+        if start_date:
+            start_date_str = str(start_date)
             if start_date_str > project.end_date:
                 raise HTTPException(status_code=400, detail="End date cannot be before start date")
 
-    cursor = db.cursor(dictionary=True)
-    
-    # We build the update SQL dynamically based on what is provided
-    updates = []
-    values = []
-    
+    # We build the update dict dynamically based on what is provided
+    updates = {}
     if project.project_name is not None:
-        updates.append("project_name = %s")
-        values.append(project.project_name)
+        updates["project_name"] = project.project_name
     if project.client_name is not None:
-        updates.append("client_name = %s")
-        values.append(project.client_name)
+        updates["client_name"] = project.client_name
     if project.description is not None:
-        updates.append("description = %s")
-        values.append(project.description)
+        updates["description"] = project.description
     if project.monitoring_status is not None:
-        updates.append("monitoring_status = %s")
-        values.append(project.monitoring_status)
+        updates["monitoring_status"] = project.monitoring_status
     if project.end_date is not None:
-        updates.append("end_date = %s")
-        values.append(project.end_date if project.end_date != "" else None)
+        updates["end_date"] = project.end_date if project.end_date != "" else None
         
     if not updates:
         raise HTTPException(status_code=400, detail="No updates provided")
         
-    sql = f"UPDATE projects SET {', '.join(updates)} WHERE id = %s"
-    values.append(project_id)
-    
-    cursor.execute(sql, tuple(values))
+    ProjectRepository.update_project_fields(db, project_id, updates)
     db.commit()
-    cursor.close()
-    
     return {"success": True, "message": "Project updated successfully"}
-

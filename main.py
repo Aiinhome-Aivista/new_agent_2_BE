@@ -3,6 +3,7 @@ from fastapi import FastAPI
 # pyrefly: ignore [missing-import]
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
+from core.response import APIStandardResponseMiddleware
 from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard
 app = FastAPI(
     title=settings.APP_NAME,
@@ -10,6 +11,9 @@ app = FastAPI(
     docs_url=f"{settings.API_PREFIX}/docs",
     redoc_url=f"{settings.API_PREFIX}/redoc",
 )
+
+# Register API Response Standardizer Middleware
+app.add_middleware(APIStandardResponseMiddleware)
 
 # CORS configuration
 app.add_middleware(

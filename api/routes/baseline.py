@@ -2,9 +2,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
+import os
+import difflib
 from core.database import get_db
 from api.dependencies.auth import get_current_user, require_roles, verify_project_access
+from services.document_service import DocumentService
 from agents.scope_extraction_agent import ScopeExtractionAgent
+from repositories.baseline_repository import BaselineRepository
 import mysql.connector
 
 router = APIRouter()
@@ -12,10 +16,8 @@ router = APIRouter()
 @router.post("/extract")
 def extract_baseline(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
     
-    cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
-    doc = cursor.fetchone()
+    doc = BaselineRepository.get_document(db, document_id, project_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
         
@@ -23,9 +25,6 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         raise HTTPException(status_code=400, detail="Only EL and IFA can be used for baseline extraction")
         
     try:
-        from services.document_service import DocumentService
-        import os
-        
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
         
@@ -36,49 +35,34 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         extracted_data = ScopeExtractionAgent.extract_scope(text)
         
         # Check if there is an existing DRAFT baseline for the project
-        cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'DRAFT' ORDER BY id DESC LIMIT 1", (project_id,))
-        existing_draft = cursor.fetchone()
+        existing_draft = BaselineRepository.get_draft_baseline(db, project_id)
         
         if existing_draft:
             baseline_id = existing_draft["id"]
-            cursor.execute("UPDATE scope_baselines SET source_document_id = %s WHERE id = %s", (document_id, baseline_id))
-            cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
+            BaselineRepository.update_baseline_source_document(db, baseline_id, document_id)
+            BaselineRepository.delete_stakeholders_by_project(db, project_id)
         else:
             # Get max version to auto-increment it for the new draft
-            cursor.execute("SELECT MAX(version) as max_v FROM scope_baselines WHERE project_id = %s", (project_id,))
-            max_v_row = cursor.fetchone()
-            next_version = (max_v_row["max_v"] or 0) + 1 if max_v_row else 1
+            max_v = BaselineRepository.get_max_baseline_version(db, project_id)
+            next_version = max_v + 1
             
             # Create draft baseline
-            cursor.execute("INSERT INTO scope_baselines (project_id, status, version, source_document_id) VALUES (%s, 'DRAFT', %s, %s)", (project_id, next_version, document_id))
-            baseline_id = cursor.lastrowid
+            baseline_id = BaselineRepository.create_baseline(db, project_id, next_version, document_id)
             
             # Copy items from latest APPROVED baseline to carry forward historical data
-            cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
-            latest_approved = cursor.fetchone()
+            latest_approved = BaselineRepository.get_latest_approved_baseline(db, project_id)
             if latest_approved:
                 app_baseline_id = latest_approved["id"]
                 # Copy scope items
-                cursor.execute("""
-                    INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
-                    SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline
-                    FROM scope_items WHERE baseline_id = %s
-                """, (baseline_id, app_baseline_id))
+                BaselineRepository.copy_scope_items(db, app_baseline_id, baseline_id)
                 
                 # Copy deliverables
-                cursor.execute("""
-                    INSERT INTO deliverables (baseline_id, project_id, name, description, deadline, owner, source_document_id)
-                    SELECT %s, project_id, name, description, deadline, owner, source_document_id
-                    FROM deliverables WHERE baseline_id = %s
-                """, (baseline_id, app_baseline_id))
+                BaselineRepository.copy_deliverables(db, app_baseline_id, baseline_id)
 
-            cursor.execute("DELETE FROM stakeholders WHERE project_id = %s", (project_id,))
+            BaselineRepository.delete_stakeholders_by_project(db, project_id)
         
         # Smart Diffing (UPSERT)
-        import difflib
-        
-        cursor.execute("SELECT id, name, scope_type FROM scope_items WHERE baseline_id = %s", (baseline_id,))
-        existing_scope_items = cursor.fetchall()
+        existing_scope_items = BaselineRepository.get_scope_items_for_diff(db, baseline_id)
         
         for item in extracted_data.get("scope_items", []):
             item_name = item.get("name", "Unknown")
@@ -98,27 +82,37 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 if old_type != item_type:
                     status_change_tag = f"Changed from {old_type} to {item_type}"
                     
-                sql = """UPDATE scope_items 
-                         SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
-                             source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s, deadline = %s
-                         WHERE id = %s"""
-                cursor.execute(sql, (
-                    item.get("description", ""), item_type, document_id, item.get("source_page"),
-                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5), status_change_tag, item.get("deadline"), existing_item["id"]
-                ))
+                BaselineRepository.update_scope_item(
+                    db=db,
+                    item_id=existing_item["id"],
+                    description=item.get("description", ""),
+                    scope_type=item_type,
+                    source_document_id=document_id,
+                    source_page=item.get("source_page"),
+                    source_section=item.get("source_section"),
+                    evidence_text=item.get("evidence_text", ""),
+                    confidence=item.get("confidence", 0.5),
+                    status_change_tag=status_change_tag,
+                    deadline=item.get("deadline")
+                )
             else:
-                sql = """INSERT INTO scope_items 
-                         (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
-                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-                cursor.execute(sql, (
-                    baseline_id, project_id, item_name, item.get("description", ""),
-                    item_type, document_id, item.get("source_page"),
-                    item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5), item.get("deadline")
-                ))
+                BaselineRepository.insert_scope_item_extracted(
+                    db=db,
+                    baseline_id=baseline_id,
+                    project_id=project_id,
+                    name=item_name,
+                    description=item.get("description", ""),
+                    scope_type=item_type,
+                    source_document_id=document_id,
+                    source_page=item.get("source_page"),
+                    source_section=item.get("source_section"),
+                    evidence_text=item.get("evidence_text", ""),
+                    confidence=item.get("confidence", 0.5),
+                    deadline=item.get("deadline")
+                )
             
         # UPSERT deliverables
-        cursor.execute("SELECT id, name FROM deliverables WHERE baseline_id = %s", (baseline_id,))
-        existing_deliverables = cursor.fetchall()
+        existing_deliverables = BaselineRepository.get_deliverables_for_diff(db, baseline_id)
         
         for item in extracted_data.get("deliverables", []):
             item_name = item.get("name", "Unknown")
@@ -131,109 +125,72 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 if ratio > 0.8 and ratio > best_ratio:
                     best_ratio = ratio
                     existing_deliv = db_item
-
             
             if existing_deliv:
-                sql = """UPDATE deliverables
-                         SET description = %s, deadline = %s, owner = %s, source_document_id = %s
-                         WHERE id = %s"""
-                cursor.execute(sql, (
-                    item.get("description", ""), deadline, item.get("owner"), document_id, existing_deliv["id"]
-                ))
+                BaselineRepository.update_deliverable(
+                    db=db,
+                    item_id=existing_deliv["id"],
+                    description=item.get("description", ""),
+                    deadline=deadline,
+                    owner=item.get("owner"),
+                    source_document_id=document_id
+                )
             else:
-                sql = """INSERT INTO deliverables
-                         (baseline_id, project_id, name, description, deadline, owner, source_document_id)
-                         VALUES (%s, %s, %s, %s, %s, %s, %s)"""
-                cursor.execute(sql, (
-                    baseline_id, project_id, item_name, item.get("description", ""),
-                    deadline, item.get("owner"), document_id
-                ))
+                BaselineRepository.insert_deliverable(
+                    db=db,
+                    baseline_id=baseline_id,
+                    project_id=project_id,
+                    name=item_name,
+                    description=item.get("description", ""),
+                    deadline=deadline,
+                    owner=item.get("owner"),
+                    source_document_id=document_id
+                )
             
         # Insert stakeholders
         for stakeholder in extracted_data.get("stakeholders", []):
-            sql = """INSERT INTO stakeholders (project_id, name, email, role, responsibility)
-                     VALUES (%s, %s, %s, %s, %s)"""
-            cursor.execute(sql, (
-                project_id, stakeholder.get("name", "Unknown"), stakeholder.get("email"),
-                stakeholder.get("role"), stakeholder.get("responsibility")
-            ))
+            BaselineRepository.insert_stakeholder(
+                db=db,
+                project_id=project_id,
+                name=stakeholder.get("name", "Unknown"),
+                email=stakeholder.get("email"),
+                role=stakeholder.get("role"),
+                responsibility=stakeholder.get("responsibility")
+            )
             
         # Update project status
-        cursor.execute("UPDATE projects SET monitoring_status = 'BASELINE_PENDING_REVIEW' WHERE id = %s", (project_id,))
+        BaselineRepository.update_project_monitoring_status(db, project_id, 'BASELINE_PENDING_REVIEW')
         db.commit()
         
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Baseline extraction failed: {e}")
-    finally:
-        cursor.close()
         
     return {"success": True, "message": "Draft baseline extracted", "data": {"baseline_id": baseline_id}}
 
 @router.get("/")
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM scope_baselines WHERE project_id = %s ORDER BY id DESC LIMIT 1", (project_id,))
-    baseline = cursor.fetchone()
-    
-    if not baseline:
-        return {"success": True, "data": None}
-        
-    cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (baseline["id"],))
-    scope_items = cursor.fetchall()
-    
-    cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (baseline["id"],))
-    deliverables = cursor.fetchall()
-    
-    baseline["scope_items"] = scope_items
-    baseline["deliverables"] = deliverables
-    
-    cursor.close()
-    return {"success": True, "data": baseline}
+    data = BaselineRepository.get_latest_baseline_details(db, project_id)
+    return {"success": True, "data": data}
 
 @router.get("/versions")
 def get_baseline_versions(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
-    
-    # Fetch all baselines for this project, sorted by version DESC
-    cursor.execute("""
-        SELECT sb.*, d.document_name as document_name 
-        FROM scope_baselines sb
-        LEFT JOIN documents d ON sb.source_document_id = d.id
-        WHERE sb.project_id = %s 
-        ORDER BY sb.version DESC
-    """, (project_id,))
-    baselines = cursor.fetchall()
-    
-    for b in baselines:
-        # Fetch scope items for this baseline
-        cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (b["id"],))
-        b["scope_items"] = cursor.fetchall()
-        
-        # Fetch deliverables for this baseline
-        cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (b["id"],))
-        b["deliverables"] = cursor.fetchall()
-        
-    cursor.close()
+    baselines = BaselineRepository.get_all_baseline_versions(db, project_id)
     return {"success": True, "data": baselines}
 
 @router.post("/approve")
 def approve_baseline(project_id: int, current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "ADMIN"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
     
-    cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'DRAFT' ORDER BY id DESC LIMIT 1", (project_id,))
-    baseline = cursor.fetchone()
+    baseline = BaselineRepository.get_draft_baseline(db, project_id)
     if not baseline:
         raise HTTPException(status_code=404, detail="No draft baseline found")
         
-    cursor.execute("UPDATE scope_baselines SET status = 'APPROVED', approved_by = %s, approved_at = NOW() WHERE id = %s", (current_user["id"], baseline["id"]))
-    cursor.execute("UPDATE projects SET monitoring_status = 'ACTIVE' WHERE id = %s", (project_id,))
-    
+    BaselineRepository.approve_baseline(db, baseline["id"], current_user["id"])
+    BaselineRepository.update_project_monitoring_status(db, project_id, 'ACTIVE')
     db.commit()
-    cursor.close()
     
     return {"success": True, "message": "Baseline approved. Project is now ACTIVE."}
 
@@ -252,37 +209,27 @@ def add_scope_item(
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
     
-    cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
-    baseline = cursor.fetchone()
+    baseline = BaselineRepository.get_latest_baseline(db, project_id)
     if not baseline:
-        cursor.execute("INSERT INTO scope_baselines (project_id, status) VALUES (%s, 'DRAFT')", (project_id,))
+        baseline_id = BaselineRepository.create_simple_baseline(db, project_id, 'DRAFT')
         db.commit()
-        baseline_id = cursor.lastrowid
     else:
         baseline_id = baseline["id"]
         
-    sql = """
-        INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, evidence_text, confidence)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-    """
-    cursor.execute(sql, (
-        baseline_id,
-        project_id,
-        item.name,
-        item.description or "",
-        item.scope_type,
-        item.evidence_text or "Manually added item",
-        item.confidence if item.confidence is not None else 1.0
-    ))
+    item_id = BaselineRepository.create_scope_item(
+        db=db,
+        baseline_id=baseline_id,
+        project_id=project_id,
+        name=item.name,
+        description=item.description or "",
+        scope_type=item.scope_type,
+        evidence_text=item.evidence_text or "Manually added item",
+        confidence=item.confidence if item.confidence is not None else 1.0
+    )
     db.commit()
-    item_id = cursor.lastrowid
     
-    cursor.execute("SELECT * FROM scope_items WHERE id = %s", (item_id,))
-    created_item = cursor.fetchone()
-    cursor.close()
-    
+    created_item = BaselineRepository.get_scope_item(db, item_id)
     return {"success": True, "message": "Scope item added successfully", "data": created_item}
 
 @router.delete("/items/{item_id}")
@@ -293,17 +240,12 @@ def delete_scope_item(
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
-    cursor = db.cursor(dictionary=True)
     
-    cursor.execute("SELECT id FROM scope_items WHERE id = %s AND project_id = %s", (item_id, project_id))
-    item = cursor.fetchone()
+    item = BaselineRepository.check_scope_item_exists_in_project(db, item_id, project_id)
     if not item:
-        cursor.close()
         raise HTTPException(status_code=404, detail="Scope item not found")
         
-    cursor.execute("DELETE FROM scope_items WHERE id = %s AND project_id = %s", (item_id, project_id))
+    BaselineRepository.delete_scope_item(db, item_id, project_id)
     db.commit()
-    cursor.close()
     
     return {"success": True, "message": "Scope item deleted successfully"}
-

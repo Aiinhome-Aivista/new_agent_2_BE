@@ -5,10 +5,10 @@ from docx import Document
 from typing import List, Dict, Any
 from core.config import settings
 import uuid
+# pyrefly: ignore [missing-import]
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 def chunk_text(text: str) -> List[str]:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-    
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.CHUNK_SIZE,
         chunk_overlap=settings.CHUNK_OVERLAP,

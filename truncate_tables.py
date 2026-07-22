@@ -2,6 +2,10 @@ import sys
 import os
 import shutil
 import mysql.connector
+# pyrefly: ignore [missing-import]
+import chromadb
+# pyrefly: ignore [missing-import]
+from chromadb.config import Settings as ChromaSettings
 
 # Add backend directory to sys.path to allow importing core
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -78,10 +82,6 @@ def truncate_all_except_users():
                 except Exception as e:
                     print(f"Note: Could not physical delete {item} (might be locked by backend server). Falling back to chromadb API deletion...")
                     # Fallback to API deletion if file is locked
-                    # pyrefly: ignore [missing-import]
-                    import chromadb
-                    # pyrefly: ignore [missing-import]
-                    from chromadb.config import Settings as ChromaSettings
                     client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))
                     for col in client.list_collections():
                         try:
