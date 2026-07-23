@@ -10,17 +10,30 @@ from agents.alerting_agent import AlertingAgent
 
 
 def _fetch_scope_items(db_cursor, project_id: int) -> list:
-    """Fetch all approved scope items from MySQL for this project."""
+    """
+    Fetch IN_SCOPE items ONLY from the latest APPROVED baseline for this project.
+
+    Why APPROVED only?
+    - DRAFT baselines contain items that are still under review and not yet
+      contractually agreed upon with the client.
+    - Using DRAFT items for risk evaluation would cause false negatives
+      (agent marks something as IN_SCOPE when the client never signed off on it).
+    - When the Engagement Manager approves a new baseline version, the NEXT
+      document processing run will automatically use that new approved list.
+    """
     try:
         db_cursor.execute("""
-            SELECT id, name, scope_type 
-            FROM scope_items 
-            WHERE project_id = %s AND scope_type = 'IN_SCOPE'
-            ORDER BY id
+            SELECT si.id, si.name, si.scope_type
+            FROM scope_items si
+            JOIN scope_baselines sb ON si.baseline_id = sb.id
+            WHERE si.project_id = %s
+              AND si.scope_type = 'IN_SCOPE'
+              AND sb.status = 'APPROVED'
+            ORDER BY sb.id DESC, si.id ASC
         """, (project_id,))
         return db_cursor.fetchall() or []
     except Exception as e:
-        print(f"Warning: Could not fetch scope items: {e}")
+        print(f"Warning: Could not fetch approved scope items: {e}")
         return []
 
 
