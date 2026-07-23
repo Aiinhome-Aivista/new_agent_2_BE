@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
-from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard
+from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag
 app = FastAPI(
     title=settings.APP_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
@@ -39,6 +39,7 @@ app.include_router(documents.router, prefix=f"{settings.API_PREFIX}/projects/{{p
 app.include_router(baseline.router, prefix=f"{settings.API_PREFIX}/projects/{{project_id}}/baseline", tags=["baseline"])
 app.include_router(monitoring.router, prefix=f"{settings.API_PREFIX}/projects/{{project_id}}/monitoring", tags=["monitoring"])
 app.include_router(tracker.router, prefix=f"{settings.API_PREFIX}/projects/{{project_id}}/tracker", tags=["tracker"])
+app.include_router(rag.router, prefix=f"{settings.API_PREFIX}/projects/{{project_id}}/rag", tags=["rag"])
 app.include_router(dashboard.router, prefix=f"{settings.API_PREFIX}/dashboard", tags=["dashboard"])
 
 @app.get("/")
