@@ -8,7 +8,7 @@ class MCPTools:
     @staticmethod
     def search_baseline(project_id: int, query: str) -> list:
         """Searches the approved baseline documents specifically."""
-        return RAGService.retrieve_evidence(project_id, query, document_types=["EL", "IFA"])
+        return RAGService.retrieve_evidence(project_id, query, document_types=["EL", "IFA", "MANUAL_SCOPE"])
         
     @staticmethod
     def search_documents(project_id: int, query: str, doc_types: list = None) -> list:
