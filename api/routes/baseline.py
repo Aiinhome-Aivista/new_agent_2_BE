@@ -41,11 +41,16 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
         
         # Pipeline Step 3: Small LLM Classification with Hybrid Retrieval Evidence
+        import concurrent.futures
+
         classified_candidates = []
-        for candidate in raw_candidates:
-            # We process them independently to keep prompt sizes tiny (~1000 tokens)
-            classified = ScopeClassifier.classify_candidate(project_id, candidate)
-            classified_candidates.append(classified)
+        # Process candidates concurrently to drastically reduce processing time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Create a helper function that passes project_id along with the candidate
+            def classify(candidate):
+                return ScopeClassifier.classify_candidate(project_id, candidate)
+                
+            classified_candidates = list(executor.map(classify, raw_candidates))
             
         # Pipeline Step 4: Fuzzy Deduplication
         deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)

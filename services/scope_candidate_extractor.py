@@ -54,7 +54,7 @@ class ScopeCandidateExtractor:
     def _create_candidate(text: str, chunk: dict, document_id: int) -> dict:
         # Determine a short name (first few words or up to first punctuation)
         # e.g., "Web Portal Design - We will build the portal" -> "Web Portal Design"
-        name_match = re.split(r'[:\.\-]', text, 1)
+        name_match = re.split(r'[:\.]|\s-\s', text, 1)
         name = name_match[0].strip() if name_match[0] else text[:50]
         if len(name) > 60:
             name = text[:60].rsplit(' ', 1)[0] + "..."
