@@ -9,6 +9,8 @@ from api.dependencies.auth import get_current_user, require_roles, verify_projec
 from services.document_service import DocumentService
 from agents.scope_extraction_agent import ScopeExtractionAgent
 from repositories.baseline_repository import BaselineRepository
+from services.chroma_service import ChromaService
+from services.embedding_service import EmbeddingService
 import mysql.connector
 
 router = APIRouter()
@@ -213,9 +215,11 @@ def add_scope_item(
     baseline = BaselineRepository.get_latest_baseline(db, project_id)
     if not baseline:
         baseline_id = BaselineRepository.create_simple_baseline(db, project_id, 'DRAFT')
+        source_document_id = None
         db.commit()
     else:
         baseline_id = baseline["id"]
+        source_document_id = baseline.get("source_document_id")
         
     item_id = BaselineRepository.create_scope_item(
         db=db,
@@ -225,9 +229,30 @@ def add_scope_item(
         description=item.description or "",
         scope_type=item.scope_type,
         evidence_text=item.evidence_text or "Manually added item",
-        confidence=item.confidence if item.confidence is not None else 1.0
+        confidence=item.confidence if item.confidence is not None else 1.0,
+        source_document_id=source_document_id
     )
     db.commit()
+    
+    try:
+        # Sync to Vector DB so it can be queried by agents
+        text_to_embed = f"{item.name}: {item.description or ''}\nReasoning: {item.evidence_text or ''}"
+        embeddings = EmbeddingService.encode_batch([text_to_embed])
+        chunk = {
+            "chunk_index": item_id, # Use item_id to make it unique
+            "text": text_to_embed,
+            "page_number": 0
+        }
+        ChromaService.add_chunks(
+            project_id=project_id,
+            document_id=source_document_id or 0,
+            document_name="Manual Addition",
+            document_type="MANUAL_SCOPE",
+            chunks=[chunk],
+            embeddings=embeddings
+        )
+    except Exception as e:
+        print(f"Warning: Failed to sync manual scope item to ChromaDB: {e}")
     
     created_item = BaselineRepository.get_scope_item(db, item_id)
     return {"success": True, "message": "Scope item added successfully", "data": created_item}
