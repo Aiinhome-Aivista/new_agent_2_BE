@@ -79,7 +79,7 @@ def _match_to_scope_item(detected_name: str, similar_deliverable: str, scope_ite
 class RiskEvaluationAgent:
     @classmethod
     def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
-                          activity_map: dict = None, request_map: dict = None) -> dict:
+                          activity_map: dict = None, request_map: dict = None, progress_callback=None) -> dict:
         """
         Orchestrates the 3 sub-agents, aggregates their results, calculates overall risk,
         stores the history in `risk_evaluations`, and updates `tracker_items` with
@@ -92,22 +92,37 @@ class RiskEvaluationAgent:
         scope_items = _fetch_scope_items(db_cursor, project_id)
 
         # 1. Run Sub-Agent 1 (In-Scope) — receives BOTH MySQL scope list + ChromaDB evidence
+        if progress_callback:
+            progress_callback("Running In-Scope Evaluation Agent", 40, "running")
+
         in_scope_result = InScopeEvaluationAgent.evaluate(
             project_id, document_text, mysql_scope_items=scope_items
         )
 
         # 2. Run Sub-Agent 2 (Out-of-Scope) — receives BOTH MySQL scope list + ChromaDB exclusion evidence
+        matched_count = len([a for a in in_scope_result.get("activities", []) if a.get("classification") == "IN_SCOPE"])
+        if progress_callback:
+            progress_callback("Running Out-of-Scope Detection Agent", 50, "running", details={"matched_activities": matched_count})
+
         activities = in_scope_result.get("activities", [])
         out_of_scope_result = OutOfScopeDetectionAgent.detect(
             project_id, activities, document_text, mysql_scope_items=scope_items
         )
 
         # 3. Run Sub-Agent 3 (Deliverables & Timeline) — receives MySQL scope list for accurate name mapping
+        oos_count = len([a for a in out_of_scope_result.get("activities", []) if a.get("classification") == "OUT_OF_SCOPE"])
+        if progress_callback:
+            progress_callback("Running Deliverable Evaluation Agent", 60, "running", details={"oos_activities": oos_count})
+
         timeline_result = DeliverableTimelineEvaluationAgent.evaluate(
             project_id, document_text, mysql_scope_items=scope_items
         )
 
         # 4. Aggregate and Generate Overall Risk Summary
+        delayed_count = len([d for d in timeline_result.get("deliverables", []) if d.get("current_status") == "Delayed" or d.get("risk") in ["HIGH", "CRITICAL"]])
+        if progress_callback:
+            progress_callback("Calculating Risk Score", 70, "running", details={"delayed_deliverables": delayed_count})
+
         aggregation_prompt = f"""You are the Parent Risk Evaluation Agent.
 Your job is to aggregate the outputs of three specialized sub-agents and generate an overall risk summary for the project.
 
@@ -138,6 +153,9 @@ Output MUST be a valid JSON object matching this exact schema:
    ]
 }}
 """
+        if progress_callback:
+            progress_callback("Generating AI Summary", 80, "running")
+
         final_assessment = LLMService.generate_json(aggregation_prompt)
 
         overall_risk = final_assessment.get("overallRisk", "LOW")
@@ -152,6 +170,9 @@ Output MUST be a valid JSON object matching this exact schema:
         }
 
         # 5. Store in Risk History (risk_evaluations)
+        if progress_callback:
+            progress_callback("Saving Results", 90, "running")
+
         insert_eval_sql = """
             INSERT INTO risk_evaluations 
             (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)

@@ -3,7 +3,7 @@ from agents.risk_evaluation_agent import RiskEvaluationAgent
 
 class OrchestratorAgent:
     @classmethod
-    def run_workflow(cls, project_id: int, document_id: int, text: str, db_cursor):
+    def run_workflow(cls, project_id: int, document_id: int, text: str, db_cursor, progress_callback=None):
         """
         Coordinates the document monitoring workflow.
         Follows the Plan-and-Execute pattern:
@@ -12,6 +12,9 @@ class OrchestratorAgent:
         3. Delegates advanced risk evaluation to RiskEvaluationAgent.
         """
         # 1. Delegate to Status Ingestion Agent to extract structured JSON from raw text
+        if progress_callback:
+            progress_callback("Extracting Activities", 30, "running")
+            
         extracted_data = StatusIngestionAgent.extract_status(text)
         
         # 2. Manage State: Insert standard items into the database and retrieve maps
@@ -25,10 +28,14 @@ class OrchestratorAgent:
                 document_text=text,
                 db_cursor=db_cursor,
                 activity_map=activity_map,
-                request_map=request_map
+                request_map=request_map,
+                progress_callback=progress_callback
             )
         except Exception as e:
             print(f"Warning: Multi-Agent risk evaluation failed. Termination handled gracefully. Error: {e}")
+            if progress_callback:
+                progress_callback("Saving Results", 90, "failed", error=str(e))
+            raise e
             
     @classmethod
     def _persist_ingested_data(cls, project_id: int, document_id: int, extracted_data: dict, db_cursor):
