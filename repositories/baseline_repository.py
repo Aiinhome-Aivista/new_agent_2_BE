@@ -201,7 +201,7 @@ class BaselineRepository:
     @staticmethod
     def get_latest_baseline(db: mysql.connector.connection.MySQLConnection, project_id: int) -> Optional[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
+        cursor.execute("SELECT id, source_document_id FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
         baseline = cursor.fetchone()
         cursor.close()
         return baseline
@@ -215,13 +215,13 @@ class BaselineRepository:
         return baseline_id
 
     @staticmethod
-    def create_scope_item(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, evidence_text: str, confidence: float) -> int:
+    def create_scope_item(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, evidence_text: str, confidence: float, source_document_id: Optional[int] = None) -> int:
         cursor = db.cursor()
         sql = """
-            INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, evidence_text, confidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, evidence_text, confidence, source_document_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (baseline_id, project_id, name, description, scope_type, evidence_text, confidence))
+        cursor.execute(sql, (baseline_id, project_id, name, description, scope_type, evidence_text, confidence, source_document_id))
         item_id = cursor.lastrowid
         cursor.close()
         return item_id
