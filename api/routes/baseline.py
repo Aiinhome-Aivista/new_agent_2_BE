@@ -249,3 +249,28 @@ def delete_scope_item(
     db.commit()
     
     return {"success": True, "message": "Scope item deleted successfully"}
+
+class ScopeItemCompletionUpdate(BaseModel):
+    completion_status: str
+
+@router.patch("/items/{item_id}/completion")
+def update_scope_item_completion(
+    project_id: int,
+    item_id: int,
+    data: ScopeItemCompletionUpdate,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    item = BaselineRepository.check_scope_item_exists_in_project(db, item_id, project_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Scope item not found")
+        
+    if data.completion_status not in ["ACTIVE", "COMPLETED", "CANCELLED"]:
+        raise HTTPException(status_code=400, detail="Invalid completion status")
+        
+    BaselineRepository.update_scope_item_completion(db, item_id, project_id, data.completion_status)
+    db.commit()
+    
+    return {"success": True, "message": f"Scope item marked as {data.completion_status}"}

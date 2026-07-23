@@ -60,7 +60,7 @@ class BaselineRepository:
         cursor.execute("""
             INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
             SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline
-            FROM scope_items WHERE baseline_id = %s
+            FROM scope_items WHERE baseline_id = %s AND completion_status NOT IN ('COMPLETED', 'CANCELLED')
         """, (target_baseline_id, source_baseline_id))
         cursor.close()
 
@@ -246,4 +246,22 @@ class BaselineRepository:
     def delete_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, project_id: int) -> None:
         cursor = db.cursor()
         cursor.execute("DELETE FROM scope_items WHERE id = %s AND project_id = %s", (item_id, project_id))
+        cursor.close()
+
+    @staticmethod
+    def delete_baseline(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int) -> None:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s AND project_id = %s", (baseline_id, project_id))
+        cursor.execute("DELETE FROM scope_items WHERE baseline_id = %s AND project_id = %s", (baseline_id, project_id))
+        sql = "DELETE FROM scope_baselines WHERE id = %s AND project_id = %s AND status = 'DRAFT'"
+        cursor.execute(sql, (baseline_id, project_id))
+        cursor.close()
+
+    @staticmethod
+    def update_scope_item_completion(db: mysql.connector.connection.MySQLConnection, item_id: int, project_id: int, completion_status: str) -> None:
+        cursor = db.cursor()
+        cursor.execute(
+            "UPDATE scope_items SET completion_status = %s WHERE id = %s AND project_id = %s",
+            (completion_status, item_id, project_id)
+        )
         cursor.close()

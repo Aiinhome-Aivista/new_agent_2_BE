@@ -11,7 +11,8 @@ from agents.alerting_agent import AlertingAgent
 
 def _fetch_scope_items(db_cursor, project_id: int) -> list:
     """
-    Fetch IN_SCOPE items ONLY from the latest APPROVED baseline for this project.
+    Fetch IN_SCOPE items ONLY from the latest APPROVED baseline for this project,
+    and ONLY those that are still ACTIVE.
 
     Why APPROVED only?
     - DRAFT baselines contain items that are still under review and not yet
@@ -29,6 +30,7 @@ def _fetch_scope_items(db_cursor, project_id: int) -> list:
             WHERE si.project_id = %s
               AND si.scope_type = 'IN_SCOPE'
               AND sb.status = 'APPROVED'
+              AND si.completion_status = 'ACTIVE'
             ORDER BY sb.id DESC, si.id ASC
         """, (project_id,))
         return db_cursor.fetchall() or []
