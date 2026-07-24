@@ -88,7 +88,9 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 BaselineRepository.copy_deliverables(db, app_baseline_id, baseline_id)
 
             BaselineRepository.delete_stakeholders_by_project(db, project_id)
-        
+        # Check if this project has an approved baseline to compare against
+        has_approved = BaselineRepository.get_latest_approved_baseline(db, project_id) is not None
+
         # Smart Diffing (UPSERT)
         existing_scope_items = BaselineRepository.get_scope_items_for_diff(db, baseline_id)
         
@@ -107,7 +109,8 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             if existing_item:
                 status_change_tag = None
                 old_type = existing_item["scope_type"]
-                if old_type != item_type:
+                # Only show 'Changed from X to Y' if there is an approved version
+                if has_approved and old_type != item_type:
                     status_change_tag = f"Changed from {old_type} to {item_type}"
                     
                 BaselineRepository.update_scope_item(
