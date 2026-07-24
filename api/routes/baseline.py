@@ -11,6 +11,10 @@ from agents.scope_extraction_agent import ScopeExtractionAgent
 from repositories.baseline_repository import BaselineRepository
 from services.chroma_service import ChromaService
 from services.embedding_service import EmbeddingService
+from services.scope_section_detector import ScopeSectionDetector
+from services.scope_candidate_extractor import ScopeCandidateExtractor
+from services.scope_classifier import ScopeClassifier
+from services.scope_deduplicator import ScopeDeduplicator
 import mysql.connector
 
 router = APIRouter()
@@ -30,11 +34,33 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
         
-        # Combine all chunks and pre-process to save tokens
-        raw_text = "\n".join([chunk["text"] for chunk in chunks])
-        text = DocumentService.clean_contract_text(raw_text)
+        # Pipeline Step 1: Detect Sections deterministically
+        chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
+        
+        # Pipeline Step 2: Extract Candidates deterministically
+        raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
+        
+        # Pipeline Step 3: Small LLM Classification with Hybrid Retrieval Evidence
+        import concurrent.futures
+
+        classified_candidates = []
+        # Process candidates concurrently to drastically reduce processing time
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            # Create a helper function that passes project_id along with the candidate
+            def classify(candidate):
+                return ScopeClassifier.classify_candidate(project_id, candidate)
+                
+            classified_candidates = list(executor.map(classify, raw_candidates))
             
-        extracted_data = ScopeExtractionAgent.extract_scope(text)
+        # Pipeline Step 4: Fuzzy Deduplication
+        deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
+        
+        # Format for downstream smart diff and saving
+        extracted_data = {
+            "scope_items": deduped_candidates,
+            "deliverables": [],
+            "stakeholders": []
+        }
         
         # Check if there is an existing DRAFT baseline for the project
         existing_draft = BaselineRepository.get_draft_baseline(db, project_id)

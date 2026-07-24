@@ -22,18 +22,12 @@ def truncate_all_except_users():
     )
     cursor = db.cursor()
     
-    # Call Stored Procedure
-    print("Calling stored procedure truncate_all_tables_except_users_and_master()...")
+    # Dynamically fetch all tables and truncate them
+    print("Fetching all tables to truncate...")
     try:
-        cursor.callproc("truncate_all_tables_except_users_and_master")
-        db.commit()
-        print("MySQL tables truncated successfully (preserving 'users' and 'master_document_types').")
-    except Exception as e:
-        print(f"Error executing stored procedure: {e}")
-        print("Falling back to manual table truncation...")
-        # Fallback manual logic if SP doesn't exist
         cursor.execute("SHOW TABLES")
         tables = [row[0] for row in cursor.fetchall()]
+        
         cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
         for table in tables:
             if table.lower() not in ['users', 'master_document_types']:
@@ -41,7 +35,9 @@ def truncate_all_except_users():
                 cursor.execute(f"TRUNCATE TABLE {table}")
         cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
         db.commit()
-        print("Manual fallback truncation completed.")
+        print("MySQL tables truncated successfully (preserving 'users' and 'master_document_types').")
+    except Exception as e:
+        print(f"Error truncating tables: {e}")
         
     cursor.close()
     db.close()

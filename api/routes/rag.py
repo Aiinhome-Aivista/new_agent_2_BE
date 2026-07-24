@@ -171,6 +171,68 @@ def get_session_messages(
     cursor.close()
     return {"success": True, "data": messages}
 
+@router.get("/suggestions")
+def get_project_suggestions(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    cursor = db.cursor(dictionary=True)
+    
+    # 1. Fetch project
+    cursor.execute("SELECT project_name FROM projects WHERE id = %s", (project_id,))
+    project = cursor.fetchone()
+    project_name = project["project_name"] if project else "the project"
+    
+    # 2. Fetch documents
+    cursor.execute("SELECT document_name, document_type FROM documents WHERE project_id = %s LIMIT 5", (project_id,))
+    docs = cursor.fetchall()
+    doc_details = [f"{d['document_name']} ({d['document_type']})" for d in docs]
+    
+    # 3. Fetch scope items
+    cursor.execute("SELECT name, scope_type FROM scope_items WHERE project_id = %s LIMIT 5", (project_id,))
+    scope_items = cursor.fetchall()
+    scope_details = [f"{s['name']} ({s['scope_type']})" for s in scope_items]
+    
+    cursor.close()
+    
+    # 4. Generate suggestions using LLM
+    prompt = f"""You are the Project AI Assistant. Based on the following project context, generate exactly 4 highly specific, relevant, and realistic questions that a user (e.g. project manager, delivery lead, reviewer) would want to ask to understand the project's scope, deliverables, or exclusions.
+Make the questions directly reference the specific documents or scope items listed below.
+
+Project Name: {project_name}
+Uploaded Documents: {", ".join(doc_details) if doc_details else "None"}
+Baseline Scope Items: {", ".join(scope_details) if scope_details else "None"}
+
+Requirements:
+- Generate exactly 4 questions.
+- Each question must be realistic and refer to actual files or scope items if available.
+- Keep them under 15 words each.
+- Do not use markdown bullet characters, dashes (-), or hashes (#).
+- Return the response as a JSON array of strings, e.g., ["Question 1", "Question 2", "Question 3", "Question 4"].
+- Return ONLY the raw JSON array. Do not wrap in ```json or any other text.
+"""
+    try:
+        res_text = LLMService.generate(prompt).strip()
+        # Clean any markdown block formatting
+        if res_text.startswith("```"):
+            res_text = res_text.replace("```json", "").replace("```", "").strip()
+        suggestions = json.loads(res_text)
+        if not isinstance(suggestions, list) or len(suggestions) < 2:
+            raise ValueError("Invalid format")
+    except Exception as e:
+        print(f"Failed to generate dynamic suggestions using LLM: {e}")
+        # Clean fallback
+        suggestions = [
+            f"What is the status of deliverables in {project_name}?",
+            f"Are there any scope deviations in {project_name}?",
+            f"Summarize the key exclusions from the contract documents",
+            f"What are the main client dependencies for {project_name}?"
+        ]
+        
+    return {"success": True, "data": suggestions[:4]}
+
 @router.post("/sessions/{session_id}/messages")
 def send_chat_message(
     project_id: int,
@@ -190,6 +252,29 @@ def send_chat_message(
         
     query = payload.query
     
+    # 0. Check if this is the first message in the session to rename it dynamically (from 'New Chat')
+    cursor.execute("SELECT COUNT(*) as count FROM rag_chat_messages WHERE session_id = %s", (session_id,))
+    msg_count_res = cursor.fetchone()
+    is_first_msg = (msg_count_res["count"] == 0) if msg_count_res else True
+    
+    if is_first_msg:
+        try:
+            # Let LLM generate a short title based on query
+            title_prompt = f"Given the user query: '{query}', generate a short, descriptive 3 to 4 word title for this chat session. Do not use quotes, hashtags, or formatting. Return ONLY the 3-4 word title."
+            short_title = LLMService.generate(title_prompt).strip().strip('"').strip("'").rstrip('.').strip()
+            # If the LLM returned nothing or something too long, fallback
+            if not short_title or len(short_title.split()) > 5:
+                short_title = " ".join(query.split()[:4])
+                if len(query.split()) > 4:
+                    short_title += "..."
+        except Exception:
+            short_title = " ".join(query.split()[:4])
+            if len(query.split()) > 4:
+                short_title += "..."
+        
+        cursor.execute("UPDATE rag_chat_sessions SET session_name = %s WHERE id = %s", (short_title, session_id))
+        db.commit()
+
     # 1. Fetch structured scope baseline items from MySQL
     cursor.execute("""
         SELECT si.*, d.document_name 
@@ -258,7 +343,12 @@ You have access to two sources of information:
 === INSTRUCTIONS ===
 - Answer the user's query precisely using ONLY the provided contexts. If the context does not contain the answer, say "I cannot find the answer in the project documents."
 - Ground your answer in the provided facts. Do not assume or extrapolate.
-- Structure your answer cleanly with bullet points if helpful.
+- CRITICAL: Do NOT use the hyphen/dash symbol (-) or asterisk (*) as bullet points, separators, or list markers.
+- CRITICAL: Do NOT output raw horizontal line dividers (like ---).
+- Structure your response cleanly, using double newlines for paragraph breaks and numbered points (e.g., 1., 2., 3.) with bold titles for any lists.
+- Example of correct points format:
+  1. **Point Title**: Details of the point.
+  2. **Point Title**: Details of the point.
 - Cite the source documents, page numbers, or baseline items you referenced in your response.
 """
     
