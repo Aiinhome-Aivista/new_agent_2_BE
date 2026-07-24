@@ -12,6 +12,7 @@ from repositories.baseline_repository import BaselineRepository
 from services.chroma_service import ChromaService
 from services.embedding_service import EmbeddingService
 from services.scope_section_detector import ScopeSectionDetector
+from services.milestone_deadline_extractor import MilestoneDeadlineExtractor
 from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
@@ -55,9 +56,12 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         # Pipeline Step 4: Fuzzy Deduplication
         deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
         
+        # Pipeline Step 5: Milestone & Deadline Extraction
+        enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
+        
         # Format for downstream smart diff and saving
         extracted_data = {
-            "scope_items": deduped_candidates,
+            "scope_items": enriched_candidates,
             "deliverables": [],
             "stakeholders": []
         }
@@ -107,11 +111,33 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     existing_item = db_item
             
             if existing_item:
-                status_change_tag = None
+                tags = []
                 old_type = existing_item["scope_type"]
-                # Only show 'Changed from X to Y' if there is an approved version
-                if has_approved and old_type != item_type:
-                    status_change_tag = f"Changed from {old_type} to {item_type}"
+                if has_approved:
+                    if old_type != item_type:
+                        tags.append(f"Changed from {old_type} to {item_type}")
+                        
+                    old_deadline = existing_item.get("deadline_text")
+                    new_deadline = item.get("deadline_text")
+                    if old_deadline != new_deadline:
+                        if not old_deadline and new_deadline:
+                            tags.append(f"Deadline Added: {new_deadline}")
+                        elif old_deadline and not new_deadline:
+                            tags.append(f"Deadline Removed")
+                        else:
+                            tags.append(f"Deadline Changed: {old_deadline} -> {new_deadline}")
+                            
+                    old_milestone = existing_item.get("milestone")
+                    new_milestone = item.get("milestone")
+                    if old_milestone != new_milestone:
+                        if not old_milestone and new_milestone:
+                            tags.append(f"Milestone Added: {new_milestone}")
+                        elif old_milestone and not new_milestone:
+                            tags.append(f"Milestone Removed")
+                        else:
+                            tags.append(f"Milestone Changed: {old_milestone} -> {new_milestone}")
+                            
+                status_change_tag = " | ".join(tags) if tags else None
                     
                 BaselineRepository.update_scope_item(
                     db=db,
@@ -124,7 +150,11 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     evidence_text=item.get("evidence_text", ""),
                     confidence=item.get("confidence", 0.5),
                     status_change_tag=status_change_tag,
-                    deadline=item.get("deadline")
+                    deadline=item.get("deadline"),
+                    milestone=item.get("milestone"),
+                    deadline_text=item.get("deadline_text"),
+                    extraction_confidence=item.get("extraction_confidence"),
+                    extraction_method=item.get("extraction_method")
                 )
             else:
                 BaselineRepository.insert_scope_item_extracted(
@@ -139,7 +169,11 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     source_section=item.get("source_section"),
                     evidence_text=item.get("evidence_text", ""),
                     confidence=item.get("confidence", 0.5),
-                    deadline=item.get("deadline")
+                    deadline=item.get("deadline"),
+                    milestone=item.get("milestone"),
+                    deadline_text=item.get("deadline_text"),
+                    extraction_confidence=item.get("extraction_confidence"),
+                    extraction_method=item.get("extraction_method")
                 )
             
         # UPSERT deliverables
@@ -231,6 +265,9 @@ class ScopeItemCreate(BaseModel):
     scope_type: str = "IN_SCOPE"
     evidence_text: Optional[str] = None
     confidence: Optional[float] = 1.0
+    milestone: Optional[str] = None
+    deadline_text: Optional[str] = None
+    deadline: Optional[str] = None
 
 @router.post("/items")
 def add_scope_item(
@@ -259,7 +296,10 @@ def add_scope_item(
         scope_type=item.scope_type,
         evidence_text=item.evidence_text or "Manually added item",
         confidence=item.confidence if item.confidence is not None else 1.0,
-        source_document_id=source_document_id
+        source_document_id=source_document_id,
+        deadline=item.deadline,
+        milestone=item.milestone,
+        deadline_text=item.deadline_text
     )
     db.commit()
     
@@ -267,10 +307,21 @@ def add_scope_item(
         # Sync to Vector DB so it can be queried by agents
         text_to_embed = f"{item.name}: {item.description or ''}\nReasoning: {item.evidence_text or ''}"
         embeddings = EmbeddingService.encode_batch([text_to_embed])
+        
+        # Determine baseline_version (0 for draft)
+        version_rec = BaselineRepository.get_latest_approved_baseline(db, project_id)
+        version = version_rec["version"] if version_rec and "version" in version_rec else 0
+
         chunk = {
             "chunk_index": item_id, # Use item_id to make it unique
             "text": text_to_embed,
-            "page_number": 0
+            "page_number": 0,
+            "scope_item": item.name,
+            "scope_type": item.scope_type,
+            "milestone": item.milestone or "NULL",
+            "deadline": item.deadline_text or "NULL",
+            "baseline_version": version,
+            "status": "APPROVED" if version > 0 else "DRAFT"
         }
         ChromaService.add_chunks(
             project_id=project_id,

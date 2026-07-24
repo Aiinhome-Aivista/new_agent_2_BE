@@ -58,8 +58,8 @@ class BaselineRepository:
     def copy_scope_items(db: mysql.connector.connection.MySQLConnection, source_baseline_id: int, target_baseline_id: int) -> None:
         cursor = db.cursor()
         cursor.execute("""
-            INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
-            SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline
+            INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, milestone, deadline_text, extraction_confidence, extraction_method)
+            SELECT %s, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, milestone, deadline_text, extraction_confidence, extraction_method
             FROM scope_items WHERE baseline_id = %s AND completion_status NOT IN ('COMPLETED', 'CANCELLED')
         """, (target_baseline_id, source_baseline_id))
         cursor.close()
@@ -77,34 +77,37 @@ class BaselineRepository:
     @staticmethod
     def get_scope_items_for_diff(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> List[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT id, name, scope_type FROM scope_items WHERE baseline_id = %s", (baseline_id,))
+        cursor.execute("SELECT id, name, scope_type, milestone, deadline_text FROM scope_items WHERE baseline_id = %s", (baseline_id,))
         items = cursor.fetchall()
         cursor.close()
         return items
 
     @staticmethod
-    def update_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, status_change_tag: Optional[str], deadline: Optional[str]) -> None:
+    def update_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, status_change_tag: Optional[str], deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None) -> None:
         cursor = db.cursor()
         sql = """UPDATE scope_items 
                  SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
-                     source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s, deadline = %s
+                     source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s, deadline = %s,
+                     milestone = %s, deadline_text = %s, extraction_confidence = %s, extraction_method = %s
                  WHERE id = %s"""
         cursor.execute(sql, (
             description, scope_type, source_document_id, source_page,
-            source_section, evidence_text, confidence, status_change_tag, deadline, item_id
+            source_section, evidence_text, confidence, status_change_tag, deadline,
+            milestone, deadline_text, extraction_confidence, extraction_method, item_id
         ))
         cursor.close()
 
     @staticmethod
-    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str]) -> None:
+    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None) -> None:
         cursor = db.cursor()
         sql = """INSERT INTO scope_items 
-                 (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                 (baseline_id, project_id, name, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, milestone, deadline_text, extraction_confidence, extraction_method)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
         cursor.execute(sql, (
             baseline_id, project_id, name, description,
             scope_type, source_document_id, source_page,
-            source_section, evidence_text, confidence, deadline
+            source_section, evidence_text, confidence, deadline,
+            milestone, deadline_text, extraction_confidence, extraction_method
         ))
         cursor.close()
 
@@ -215,13 +218,13 @@ class BaselineRepository:
         return baseline_id
 
     @staticmethod
-    def create_scope_item(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, evidence_text: str, confidence: float, source_document_id: Optional[int] = None) -> int:
+    def create_scope_item(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, evidence_text: str, confidence: float, source_document_id: Optional[int] = None, deadline: Optional[str] = None, milestone: Optional[str] = None, deadline_text: Optional[str] = None) -> int:
         cursor = db.cursor()
         sql = """
-            INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, evidence_text, confidence, source_document_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO scope_items (baseline_id, project_id, name, description, scope_type, evidence_text, confidence, source_document_id, deadline, milestone, deadline_text)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (baseline_id, project_id, name, description, scope_type, evidence_text, confidence, source_document_id))
+        cursor.execute(sql, (baseline_id, project_id, name, description, scope_type, evidence_text, confidence, source_document_id, deadline, milestone, deadline_text))
         item_id = cursor.lastrowid
         cursor.close()
         return item_id
