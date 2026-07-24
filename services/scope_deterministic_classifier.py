@@ -19,11 +19,14 @@ class ScopeDeterministicClassifier:
         Returns a classification dict if highly confident, otherwise returns a low confidence result so LLM can fallback.
         """
         rules = cls._load_rules()
-        evidence_lower = combined_evidence.lower()
         
+        # We should only check for deterministic keywords inside the candidate's actual sentence.
+        # If we check the entire `combined_evidence` (which contains 3 retrieved paragraphs), 
+        # a single mention of "excluded" anywhere in those 3 paragraphs will cause a false positive.
+        search_text = candidate.get("description", "").lower()
         # Priority 1: Explicit Exclusions
         for kw in rules.get("explicit_exclusions", []):
-            if kw.lower() in evidence_lower:
+            if kw.lower() in search_text:
                 return {
                     "scope_type": "OUT_OF_SCOPE",
                     "confidence": 0.98,
@@ -32,7 +35,7 @@ class ScopeDeterministicClassifier:
                 
         # Priority 2: Customer Responsibilities
         for kw in rules.get("customer_responsibilities", []):
-            if kw.lower() in evidence_lower:
+            if kw.lower() in search_text:
                 return {
                     "scope_type": "OUT_OF_SCOPE",
                     "confidence": 0.98,
@@ -41,7 +44,7 @@ class ScopeDeterministicClassifier:
 
         # Priority 3: Vendor Responsibilities
         for kw in rules.get("vendor_responsibilities", []):
-            if kw.lower() in evidence_lower:
+            if kw.lower() in search_text:
                 return {
                     "scope_type": "IN_SCOPE",
                     "confidence": 0.98,
