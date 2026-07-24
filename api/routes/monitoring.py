@@ -89,7 +89,7 @@ def process_monitoring(
     project_id: int, 
     document_id: int, 
     background_tasks: BackgroundTasks,
-    current_user: dict = Depends(require_roles(["ADMIN", "PROJECT_LEAD"])), 
+    current_user: dict = Depends(require_roles(["ADMIN", "PROJECT_LEAD", "ENGAGEMENT_MANAGER"])), 
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
