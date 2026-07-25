@@ -15,7 +15,10 @@ class ScopeCandidateExtractor:
         "project scope", "out of scope", "assumptions", "change control", 
         "deliverables", "milestones", "acceptance", "definitions", 
         "responsibilities", "appendix", "revision history", 
-        "client responsibilities", "dependencies", "scope of work"
+        "client responsibilities", "dependencies", "scope of work",
+        "governance", "commercial terms", "signature page", 
+        "business objectives", "executive summary", "project background", 
+        "roles & responsibilities", "acceptance criteria"
     }
 
     @classmethod
@@ -76,7 +79,17 @@ class ScopeCandidateExtractor:
                         cls._process_and_add(candidates, candidate_text, chunk, document_id)
                         continue
                         
-                # Rule 3: Short standalone sentences
+                # Rule 3: Table rows with dates at the end (e.g., M1  Discovery  15 Jul)
+                table_match = re.search(r'^(.*?)\s{2,}([0-9]{1,2}\s+[A-Za-z]+(?:\s+[0-9]{2,4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})$', line)
+                if table_match:
+                    item_text = table_match.group(1).strip()
+                    date_text = table_match.group(2).strip()
+                    if len(item_text) > 5 and not cls._is_heading(item_text):
+                        reconstructed = f"{item_text} by {date_text}"
+                        cls._process_and_add(candidates, reconstructed, chunk, document_id)
+                    continue
+                        
+                # Rule 4: Short standalone sentences
                 if 10 < len(line) < 150 and not line.endswith(':'):
                     cls._process_and_add(candidates, line, chunk, document_id)
 

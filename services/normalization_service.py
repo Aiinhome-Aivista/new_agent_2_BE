@@ -17,7 +17,7 @@ class NormalizationService:
     )
 
     DEADLINE_SUFFIX_PATTERN = re.compile(
-        r"\s+(?:by|on|before|after|scheduled\s+for|due\s+on)\s+(?:[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}|[0-9]{1,2}\s+[A-Za-z]+|[A-Za-z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of [A-Za-z]+)\.?",
+        r"(?:\s*\([^)]+\))?\s+(?:by|on|before|after|scheduled\s+for|due\s+on|prior\s+to)\s+(?:(?:[0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}|[0-9]{1,2}\s+[A-Za-z]+|[A-Za-z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of [A-Za-z]+)(?:\s+.*)?|implementation(?:[^.]*)?)\.?",
         re.IGNORECASE
     )
 

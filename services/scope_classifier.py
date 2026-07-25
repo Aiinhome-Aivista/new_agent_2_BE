@@ -33,28 +33,43 @@ class ScopeClassifier:
         candidate_name_lower = candidate["name"].lower()
         candidate_idx = candidate.get("chunk_index", 0)
         
+        # Issue 3: Filter chunks to ONLY same sentence/paragraph (idx distance <= 1), 
+        # same section, or nearest neighbor.
+        strictly_filtered_chunks = []
+        for chunk in filtered_chunks:
+            chunk_section = chunk.get("metadata", {}).get("section", "General")
+            chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
+            text = chunk.get("text", "").lower()
+            
+            # Keep if scope item is in the text (same sentence/paragraph)
+            if candidate_name_lower in text:
+                strictly_filtered_chunks.append(chunk)
+                continue
+                
+            # Keep if same section and it's near (nearest neighbor / distance <= 3)
+            distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
+            if chunk_section == candidate.get("section", "General") and distance <= 3:
+                strictly_filtered_chunks.append(chunk)
+                continue
+                
         def rank_score(chunk):
             text = chunk.get("text", "").lower()
-            meta = chunk.get("metadata", {}) or {}
-            chunk_section = meta.get("section", "General")
-            chunk_idx = meta.get("chunk_index", 0)
+            chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
             
             score = 0
             if candidate_name_lower in text:
                 score += 1000
-            if chunk_section == candidate.get("section", "General"):
-                score += 500
             
             distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
             score -= distance
             return score
             
-        filtered_chunks.sort(key=rank_score, reverse=True)
+        strictly_filtered_chunks.sort(key=rank_score, reverse=True)
         
         # Take the top 3 most relevant chunks to keep the context window small, deduplicating them first
         evidence_texts = []
         seen_texts = []
-        for chunk in filtered_chunks:
+        for chunk in strictly_filtered_chunks:
             text = chunk['text']
             is_duplicate = False
             for seen in seen_texts:

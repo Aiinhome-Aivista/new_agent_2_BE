@@ -7,7 +7,7 @@ class ScopeDeduplicator:
     """
     
     @classmethod
-    def deduplicate(cls, candidates: list[dict], similarity_threshold: float = 0.85) -> list[dict]:
+    def deduplicate(cls, candidates: list[dict], similarity_threshold: float = 0.80) -> list[dict]:
         if not candidates:
             return []
             
