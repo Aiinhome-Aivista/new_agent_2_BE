@@ -59,6 +59,21 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         # Pipeline Step 5: Milestone & Deadline Extraction
         enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
         
+        # Issue 8: Structured candidate logging
+        print("\n" + "="*60)
+        print("EXTRACTION PIPELINE RESULTS:")
+        print("="*60)
+        for item in enriched_candidates:
+            print(f"Scope Item: {item.get('name')}")
+            print(f"  Source Section: {item.get('section')}")
+            evidence = item.get('evidence_text', '')
+            print(f"  Evidence Used: {evidence[:100] + '...' if len(evidence) > 100 else evidence}")
+            print(f"  Milestone: {item.get('milestone')}")
+            print(f"  Deadline: {item.get('deadline_text')} ({item.get('deadline')})")
+            print(f"  Classification Conf: {item.get('confidence')}")
+            print(f"  Extraction Method: {item.get('extraction_method')} ({item.get('extraction_confidence')})")
+            print("-" * 60)
+            
         # Format for downstream smart diff and saving
         extracted_data = {
             "scope_items": enriched_candidates,

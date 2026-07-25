@@ -4,10 +4,8 @@ from services.llm_service import LLMService
 
 class MilestoneDeadlineExtractor:
     
-    # Deterministic keywords
-    # Captures things like "completed by 15 April", "due on End of June", "scheduled for 2026-04-15", "target date is Q2 2027"
     DATE_PATTERNS = [
-        r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date|acceptance\s+date)\s+([A-Za-z0-9\-\/\s]+)(?:\.|\,|$|\n)"
+        r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date|acceptance\s+date|\bby\b|\bon\b)\s+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}|[0-9]{1,2}\s+[A-Za-z]+|[A-Za-z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of [A-Za-z]+)"
     ]
 
     MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer", "milestone"]
@@ -23,42 +21,55 @@ class MilestoneDeadlineExtractor:
             desc = candidate.get("description", "")
             combined_text = f"{desc} {evidence}"
 
-            # Default values
+            # Default values (Issue 7: NO SCHEDULE INFORMATION)
             candidate["milestone"] = None
             candidate["deadline_text"] = None
             candidate["deadline"] = None
             candidate["extraction_method"] = None
             candidate["extraction_confidence"] = None
 
-            # 1. Deterministic Extraction
+            # 1. Deterministic Extraction (Issue 3 & 6: Inline Deadlines)
             found_date_text = None
-            for pattern in cls.DATE_PATTERNS:
-                match = re.search(pattern, combined_text)
-                if match:
-                    found_date_text = match.group(1).strip()
-                    break
-            
             found_milestone = None
-            for mk in cls.MILESTONE_KEYWORDS:
-                if mk.lower() in combined_text.lower():
-                    # Check if the milestone is the subject (like "Go Live is scheduled for...")
-                    # or if the candidate itself is the milestone
-                    found_milestone = mk
+            candidate_name_lower = candidate.get("name", "").lower()
+            
+            sentences = re.split(r'\.\s+', combined_text)
+            for sentence in sentences:
+                has_item = candidate_name_lower in sentence.lower()
+                has_mk = any(mk.lower() in sentence.lower() for mk in cls.MILESTONE_KEYWORDS)
+                
+                # If we have multiple sentences and this one is totally unrelated, skip it
+                if len(sentences) > 1 and not (has_item or has_mk):
+                    continue
+                    
+                for pattern in cls.DATE_PATTERNS:
+                    match = re.search(pattern, sentence)
+                    if match:
+                        found_date_text = match.group(1).strip()
+                        if has_item:
+                            found_milestone = candidate.get("name")
+                        else:
+                            for mk in cls.MILESTONE_KEYWORDS:
+                                if mk.lower() in sentence.lower():
+                                    found_milestone = mk
+                                    break
+                        if not found_milestone:
+                            found_milestone = candidate.get("name")
+                        break
+                if found_date_text:
                     break
 
             if found_date_text:
                 candidate["deadline_text"] = found_date_text
                 candidate["deadline"] = cls._normalize_date(found_date_text)
-                candidate["milestone"] = found_milestone if found_milestone else candidate.get("name")
+                candidate["milestone"] = found_milestone
                 candidate["extraction_method"] = "Deterministic"
                 candidate["extraction_confidence"] = 0.95
                 continue
                 
-            # If we found a milestone keyword but no clear date format deterministically,
-            # or if we suspect there is scheduling info but regex failed, we can use LLM.
-            # We'll use LLM if any keyword is present just to be safe.
+            # If we suspect there is scheduling info but regex failed, use LLM.
             keywords = ["completed by", "before", "after", "scheduled for", "due on", "delivery date", "target date", "completion date", "acceptance date"]
-            needs_llm = any(kw in combined_text.lower() for kw in keywords) or found_milestone
+            needs_llm = any(kw in combined_text.lower() for kw in keywords) or any(mk.lower() in combined_text.lower() for mk in cls.MILESTONE_KEYWORDS)
             
             if needs_llm:
                 llm_res = cls._extract_via_llm(candidate["name"], combined_text)

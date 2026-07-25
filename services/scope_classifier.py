@@ -16,10 +16,45 @@ class ScopeClassifier:
         # Only search EL and IFA to determine scope explicitly
         retrieved_chunks = HybridRetrievalService.retrieve(project_id, search_query, document_types=["EL", "IFA"])
         
+        # Issue 4 & 5: Filter and Rank chunks
+        filtered_chunks = []
+        bad_sections = {"Out of Scope", "Assumptions", "Client Responsibilities", "Customer Responsibilities"}
+        for chunk in retrieved_chunks:
+            meta = chunk.get("metadata", {}) or {}
+            chunk_section = meta.get("section", "General")
+            
+            cand_section = candidate.get("section", "General")
+            if chunk_section in bad_sections and cand_section not in bad_sections:
+                continue
+            if cand_section in bad_sections and chunk_section not in bad_sections:
+                continue
+            filtered_chunks.append(chunk)
+            
+        candidate_name_lower = candidate["name"].lower()
+        candidate_idx = candidate.get("chunk_index", 0)
+        
+        def rank_score(chunk):
+            text = chunk.get("text", "").lower()
+            meta = chunk.get("metadata", {}) or {}
+            chunk_section = meta.get("section", "General")
+            chunk_idx = meta.get("chunk_index", 0)
+            
+            score = 0
+            if candidate_name_lower in text:
+                score += 1000
+            if chunk_section == candidate.get("section", "General"):
+                score += 500
+            
+            distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
+            score -= distance
+            return score
+            
+        filtered_chunks.sort(key=rank_score, reverse=True)
+        
         # Take the top 3 most relevant chunks to keep the context window small, deduplicating them first
         evidence_texts = []
         seen_texts = []
-        for chunk in retrieved_chunks:
+        for chunk in filtered_chunks:
             text = chunk['text']
             is_duplicate = False
             for seen in seen_texts:

@@ -11,6 +11,40 @@ class ScopeCandidateExtractor:
         "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies"
     }
 
+    HEADING_BLACKLIST = {
+        "project scope", "out of scope", "assumptions", "change control", 
+        "deliverables", "milestones", "acceptance", "definitions", 
+        "responsibilities", "appendix", "revision history", 
+        "client responsibilities", "dependencies", "scope of work"
+    }
+
+    @classmethod
+    def _is_heading(cls, text: str) -> bool:
+        lower_text = text.lower().strip()
+        if lower_text in cls.HEADING_BLACKLIST:
+            return True
+        if lower_text.startswith("section "):
+            return True
+        # Strip punctuation and check again
+        cleaned = re.sub(r'[^\w\s]', '', lower_text).strip()
+        if cleaned in cls.HEADING_BLACKLIST:
+            return True
+        return False
+
+    @classmethod
+    def _process_and_add(cls, candidates: list, text: str, chunk: dict, document_id: int):
+        # Issue 2: Split multiple obligations
+        parts = re.split(r'\.\s+|;\s+', text)
+        for part in parts:
+            part = part.strip()
+            if part.endswith('.') or part.endswith(';'):
+                part = part[:-1].strip()
+            
+            if len(part) < 5 or cls._is_heading(part):
+                continue
+                
+            candidates.append(cls._create_candidate(part, chunk, document_id))
+
     @classmethod
     def extract_candidates(cls, chunks: list[dict], document_id: int) -> list[dict]:
         candidates = []
@@ -32,21 +66,19 @@ class ScopeCandidateExtractor:
                 if re.match(r'^[\-\•\*o]\s+', line):
                     candidate_text = re.sub(r'^[\-\•\*o]\s+', '', line).strip()
                     if candidate_text:
-                        candidates.append(cls._create_candidate(candidate_text, chunk, document_id))
+                        cls._process_and_add(candidates, candidate_text, chunk, document_id)
                         continue
                 
                 # Rule 2: Numbered lists (e.g., 1., 1.1, a))
                 if re.match(r'^([0-9]+(\.[0-9]+)*\.|[a-zA-Z]\))\s+', line):
                     candidate_text = re.sub(r'^([0-9]+(\.[0-9]+)*\.|[a-zA-Z]\))\s+', '', line).strip()
                     if candidate_text:
-                        candidates.append(cls._create_candidate(candidate_text, chunk, document_id))
+                        cls._process_and_add(candidates, candidate_text, chunk, document_id)
                         continue
                         
-                # Rule 3: Short standalone sentences (likely headings or key points if in a targeted section)
-                # But only if it's not too long and not ending in a colon
+                # Rule 3: Short standalone sentences
                 if 10 < len(line) < 150 and not line.endswith(':'):
-                    # Check if it looks like a sentence (starts with capital, ends with punctuation or just short phrase)
-                    candidates.append(cls._create_candidate(line, chunk, document_id))
+                    cls._process_and_add(candidates, line, chunk, document_id)
 
         return candidates
         
