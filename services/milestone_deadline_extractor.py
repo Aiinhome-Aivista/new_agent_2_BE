@@ -3,12 +3,21 @@ from datetime import datetime
 from services.llm_service import LLMService
 
 class MilestoneDeadlineExtractor:
-    
+
     DATE_PATTERNS = [
         r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date|acceptance\s+date|\bby\b|\bon\b)\s+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}|[0-9]{1,2}\s+[A-Za-z]+|[A-Za-z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of [A-Za-z]+)"
     ]
 
     MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer", "milestone"]
+
+    # >>> NEW: month-name lookup so _normalize_date can handle "15 April 2026",
+    # "Apr 15, 2026" etc. without needing an external dateutil dependency.
+    MONTHS = {
+        "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+        "july": 7, "august": 8, "september": 9, "october": 10, "november": 11, "december": 12,
+        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+        "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,
+    }
 
     @classmethod
     def extract(cls, candidates: list[dict]) -> list[dict]:
@@ -32,16 +41,16 @@ class MilestoneDeadlineExtractor:
             found_date_text = None
             found_milestone = None
             candidate_name_lower = candidate.get("name", "").lower()
-            
+
             sentences = re.split(r'\.\s+', combined_text)
             for sentence in sentences:
                 has_item = candidate_name_lower in sentence.lower()
                 has_mk = any(mk.lower() in sentence.lower() for mk in cls.MILESTONE_KEYWORDS)
-                
+
                 # If we have multiple sentences and this one is totally unrelated, skip it
                 if len(sentences) > 1 and not (has_item or has_mk):
                     continue
-                    
+
                 for pattern in cls.DATE_PATTERNS:
                     match = re.search(pattern, sentence)
                     if match:
@@ -66,11 +75,11 @@ class MilestoneDeadlineExtractor:
                 candidate["extraction_method"] = "Deterministic"
                 candidate["extraction_confidence"] = 0.95
                 continue
-                
+
             # If we suspect there is scheduling info but regex failed, use LLM.
             keywords = ["completed by", "before", "after", "scheduled for", "due on", "delivery date", "target date", "completion date", "acceptance date"]
             needs_llm = any(kw in combined_text.lower() for kw in keywords) or any(mk.lower() in combined_text.lower() for mk in cls.MILESTONE_KEYWORDS)
-            
+
             if needs_llm:
                 llm_res = cls._extract_via_llm(candidate["name"], combined_text)
                 if llm_res.get("has_schedule"):
@@ -91,37 +100,45 @@ class MilestoneDeadlineExtractor:
         """
         Attempts to normalize date strings to YYYY-MM-DD.
         Never guess missing year, but if only day/month provided we might not be able to parse.
-        Prompt says: "Never guess missing year. Never invent a normalized date."
-        So if it's "15 Apr", standard datetime parsing might append current year. We should be careful.
-        Actually, dateparser or similar is best, but we'll use a safe approach.
         """
         if not text:
             return None
-            
-        # Common strict formats
+        text = text.strip()
+
         # 15/04/2026 or 15-04-2026
         match = re.search(r"(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})", text)
         if match:
             day, month, year = match.groups()
             return f"{year}-{int(month):02d}-{int(day):02d}"
-            
+
         # YYYY-MM-DD
         match = re.search(r"(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})", text)
         if match:
             year, month, day = match.groups()
             return f"{year}-{int(month):02d}-{int(day):02d}"
 
-        # 15 April 2026
-        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
-                  "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
-        
+        # >>> NEW: "15 April 2026" / "15 Apr 2026" (day-month-year, textual month)
+        match = re.search(r"\b(\d{1,2})\s+([A-Za-z]+)\s+(\d{4})\b", text)
+        if match:
+            day, month_name, year = match.groups()
+            month_num = cls.MONTHS.get(month_name.lower())
+            if month_num:
+                return f"{year}-{month_num:02d}-{int(day):02d}"
+
+        # >>> NEW: "April 15, 2026" / "Apr 15 2026" (month-day-year, textual month)
+        match = re.search(r"\b([A-Za-z]+)\s+(\d{1,2}),?\s+(\d{4})\b", text)
+        if match:
+            month_name, day, year = match.groups()
+            month_num = cls.MONTHS.get(month_name.lower())
+            if month_num:
+                return f"{year}-{month_num:02d}-{int(day):02d}"
+
         # If year is missing in text, we DO NOT normalize. "Never guess missing year."
         if not re.search(r"\d{4}", text):
             return None
-            
-        # Example for explicit parsing of like 15 April 2026 if regex above failed
-        # Since dateutil might not be installed, we just return None for complex strings.
-        # Strict formats were handled above.
+
+        # Anything else (e.g. "Q1 2026", "End of June", bare "15 April" with no
+        # year caught above) is left unnormalized rather than guessed.
         return None
 
     @classmethod

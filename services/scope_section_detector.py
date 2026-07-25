@@ -5,15 +5,27 @@ class ScopeSectionDetector:
     Deterministically identifies sections in document chunks.
     Avoids using LLMs for section detection to save tokens and ensure consistency.
     """
-    
+
     SECTION_PATTERNS = {
         "Scope of Work": r"(?i)^(?:[0-9]+\.?\s*)?(?:Scope|Scope of Work|Project Scope|Engagement Scope)",
         "Deliverables": r"(?i)^(?:[0-9]+\.?\s*)?(?:Deliverables|Key Deliverables|Project Deliverables)",
         "Responsibilities": r"(?i)^(?:[0-9]+\.?\s*)?(?:Responsibilities|Our Responsibilities|Vendor Responsibilities)",
         "Client Responsibilities": r"(?i)^(?:[0-9]+\.?\s*)?(?:Client Responsibilities|Your Responsibilities)",
-        "Out of Scope": r"(?i)^(?:[0-9]+\.?\s*)?(?:Out of Scope|Exclusions|Not Included)",
+        "Out of Scope": r"(?i)^(?:[0-9]+\.?\s*)?(?:Out[\s-]of[\s-]Scope|Exclusions|Not Included)",
         "Assumptions": r"(?i)^(?:[0-9]+\.?\s*)?(?:Assumptions|Key Assumptions|Project Assumptions|Commercial assumptions)",
-        "Dependencies": r"(?i)^(?:[0-9]+\.?\s*)?(?:Dependencies|Project Dependencies)"
+        "Dependencies": r"(?i)^(?:[0-9]+\.?\s*)?(?:Dependencies|Project Dependencies)",
+        # >>> NEW: previously missing — content under these headings was
+        # falling through and staying tagged as whatever the PREVIOUS
+        # section was (e.g. "Milestones" content getting tagged as
+        # "Out of Scope"), which cascaded into ScopeDeduplicator merging
+        # unrelated items together with a growing "Furthermore" evidence chain.
+        "Milestones": r"(?i)^(?:[0-9]+\.?\s*)?(?:Milestones(?:\s*&\s*Timeline)?|Timeline|Project Timeline|Key Dates|Schedule)",
+        "Change Control": r"(?i)^(?:[0-9]+\.?\s*)?(?:Change Control|Change Management(?:\s*Process)?)",
+        "Commercial Terms": r"(?i)^(?:[0-9]+\.?\s*)?(?:Commercial Terms|Fees|Pricing|Payment Terms)",
+        "Governance": r"(?i)^(?:[0-9]+\.?\s*)?(?:Governance(?:\s*&\s*Management)?|Roles\s*&\s*Responsibilities|RACI)",
+        "Acceptance Criteria": r"(?i)^(?:[0-9]+\.?\s*)?(?:Acceptance Criteria)",
+        "Risk Management": r"(?i)^(?:[0-9]+\.?\s*)?(?:Risk(?:\s*&\s*Issue)?\s*Management)",
+        "Signature": r"(?i)^(?:[0-9]+\.?\s*)?(?:Signature Page|Signatories|Authorized Signatory)",
     }
 
     @classmethod
@@ -24,16 +36,16 @@ class ScopeSectionDetector:
         """
         current_section = "General"
         new_chunks = []
-        
+
         for chunk in chunks:
             text = chunk.get("text", "")
             lines = text.split("\n")
-            
+
             current_subchunk_lines = []
-            
+
             for line in lines:
                 clean_line = line.strip()
-                
+
                 # Check if this line is a section header
                 if 0 < len(clean_line) < 100:
                     matched_section = None
@@ -41,7 +53,7 @@ class ScopeSectionDetector:
                         if re.search(pattern, clean_line):
                             matched_section = section_name
                             break
-                            
+
                     if matched_section and matched_section != current_section:
                         # Save the previous subchunk if it has content
                         if current_subchunk_lines:
@@ -53,9 +65,9 @@ class ScopeSectionDetector:
                             })
                             current_subchunk_lines = []
                         current_section = matched_section
-                
+
                 current_subchunk_lines.append(line)
-                
+
             # Append the remainder of the chunk
             if current_subchunk_lines:
                 new_chunks.append({
@@ -64,5 +76,5 @@ class ScopeSectionDetector:
                     "text": "\n".join(current_subchunk_lines),
                     "section": current_section
                 })
-                
+
         return new_chunks

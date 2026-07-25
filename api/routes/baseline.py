@@ -16,6 +16,9 @@ from services.milestone_deadline_extractor import MilestoneDeadlineExtractor
 from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
+from services.document_quality_checker import DocumentQualityChecker
+from services.deliverable_extractor import DeliverableExtractor
+from services.extraction_quality import evaluate_extraction_quality
 import mysql.connector
 
 router = APIRouter()
@@ -35,6 +38,21 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
         
+
+        precheck = DocumentQualityChecker.check(chunks)
+        if not precheck["has_scope_content"]:
+            return {
+                "success": True,
+                "message": "Document does not appear to contain scope-of-work details",
+                "data": {
+                    "baseline_id": None,
+                    "extraction_quality": {
+                        "status": "NO_SCOPE_CONTENT",
+                        "reason": precheck["reasoning"],
+                        "deliverable_note": None,
+                    },
+                },
+            }
         # Pipeline Step 1: Detect Sections deterministically
         chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
         
@@ -58,7 +76,8 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         
         # Pipeline Step 5: Milestone & Deadline Extraction
         enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
-        
+        # Pipeline Step 6: Deliverable extraction
+        extracted_deliverables = DeliverableExtractor.extract(enriched_candidates)
         # Issue 8: Structured candidate logging
         print("\n" + "="*60)
         print("EXTRACTION PIPELINE RESULTS:")
@@ -74,11 +93,45 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             print(f"  Extraction Method: {item.get('extraction_method')} ({item.get('extraction_confidence')})")
             print("-" * 60)
             
+        # Pipeline Step 7: Stakeholder extraction
+        # General and first few chunks are most likely to contain stakeholder details.
+        stakeholder_chunks = [c for c in chunks_with_sections if c.get("section") == "General"]
+        if not stakeholder_chunks:
+            stakeholder_chunks = chunks_with_sections[:5]
+        else:
+            stakeholder_chunks = stakeholder_chunks[:5]
+            
+        stakeholder_text = "\n\n".join([c.get("text", "") for c in stakeholder_chunks])
+        
+        stakeholder_prompt = f"""You are an expert contract analyst. Extract the key project stakeholders (e.g. Engagement Partner, Project Manager, Client Lead, etc.) mentioned in the following text.
+Output MUST be a valid JSON object matching this schema exactly, and nothing else:
+{{
+  "stakeholders": [
+    {{
+      "name": "Stakeholder Name",
+      "role": "Stakeholder Role/Title",
+      "email": "Email address if mentioned, or null",
+      "responsibility": "Stakeholder Responsibility or null"
+    }}
+  ]
+}}
+
+Text:
+{stakeholder_text}
+"""
+        try:
+            from services.llm_service import LLMService
+            st_result = LLMService.generate_json(stakeholder_prompt)
+            extracted_stakeholders = st_result.get("stakeholders", [])
+        except Exception as e:
+            print(f"Failed to extract stakeholders: {e}")
+            extracted_stakeholders = []
+
         # Format for downstream smart diff and saving
         extracted_data = {
             "scope_items": enriched_candidates,
-            "deliverables": [],
-            "stakeholders": []
+            "deliverables": extracted_deliverables,
+            "stakeholders": extracted_stakeholders
         }
         
         # Check if there is an existing DRAFT baseline for the project
@@ -246,7 +299,17 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         db.rollback()
         raise HTTPException(status_code=500, detail=f"Baseline extraction failed: {e}")
         
-    return {"success": True, "message": "Draft baseline extracted", "data": {"baseline_id": baseline_id}}
+    # return {"success": True, "message": "Draft baseline extracted", "data": {"baseline_id": baseline_id}}
+    quality = evaluate_extraction_quality(enriched_candidates, extracted_deliverables)
+
+    return {
+        "success": True,
+        "message": "Draft baseline extracted",
+        "data": {
+            "baseline_id": baseline_id,
+            "extraction_quality": quality,
+        },
+    }
 
 @router.get("/")
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
