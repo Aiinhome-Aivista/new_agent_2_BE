@@ -1,140 +1,250 @@
 import json
 from services.llm_service import LLMService
-from agents.risk_evaluator_subagents import (
-    InScopeEvaluationAgent,
-    OutOfScopeDetectionAgent,
-    DeliverableTimelineEvaluationAgent
-)
+from services.project_knowledge_service import ProjectKnowledgeService
+from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivityRiskAgent
 from agents.tracker_audit_agent import TrackerAuditAgent
 from agents.alerting_agent import AlertingAgent
 
+# ---------------------------------------------------------------------------
+# DETERMINISTIC MATCHING HELPERS
+# These run BEFORE any LLM call. If confidence is high enough, LLM is skipped.
+# ---------------------------------------------------------------------------
 
-def _fetch_scope_items(db_cursor, project_id: int) -> list:
+def _normalize(text: str) -> str:
+    """Normalize text for matching: lowercase, strip, remove common filler."""
+    stop_words = {"the", "a", "an", "of", "for", "in", "on", "to", "and", "or", "is", "was", "has", "have"}
+    words = text.lower().strip().split()
+    return " ".join(w for w in words if w not in stop_words)
+
+
+def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
     """
-    Fetch IN_SCOPE items ONLY from the latest APPROVED baseline for this project,
-    and ONLY those that are still ACTIVE.
-
-    Why APPROVED only?
-    - DRAFT baselines contain items that are still under review and not yet
-      contractually agreed upon with the client.
-    - Using DRAFT items for risk evaluation would cause false negatives
-      (agent marks something as IN_SCOPE when the client never signed off on it).
-    - When the Engagement Manager approves a new baseline version, the NEXT
-      document processing run will automatically use that new approved list.
+    STEP 3: Deterministic Scope Matching.
+    Tries exact → normalized → substring → token overlap in that order.
+    
+    Returns (scope_item_dict, confidence_score 0-100, match_type)
+    If no match found, returns (None, 0, None).
+    
+    Per the spec: if confidence >= threshold, DO NOT invoke LLM.
     """
-    try:
-        db_cursor.execute("""
-            SELECT si.id, si.name, si.scope_type
-            FROM scope_items si
-            JOIN scope_baselines sb ON si.baseline_id = sb.id
-            WHERE si.project_id = %s
-              AND si.scope_type = 'IN_SCOPE'
-              AND sb.status = 'APPROVED'
-              AND si.completion_status = 'ACTIVE'
-            ORDER BY sb.id DESC, si.id ASC
-        """, (project_id,))
-        return db_cursor.fetchall() or []
-    except Exception as e:
-        print(f"Warning: Could not fetch approved scope items: {e}")
-        return []
+    act_norm = _normalize(activity_name)
+    act_words = set(act_norm.split())
 
+    best_match = None
+    best_score = 0
+    best_type = None
 
-def _match_to_scope_item(detected_name: str, similar_deliverable: str, scope_items: list):
-    """
-    Fuzzy-match a detected activity/deliverable name to an actual scope item.
-    Returns (scope_item_id, scope_item_name) or (None, None) if no match found.
-    Priority: 
-      1. Match similar_deliverable field (what LLM says it's similar to)
-      2. Substring match on detected_name
-    """
-    detected_lower = detected_name.lower().strip()
-    similar_lower = (similar_deliverable or '').lower().strip()
-
-    # Priority 1: match via similar_deliverable (LLM already did the reasoning)
-    if similar_lower and similar_lower not in ('n/a', 'none', ''):
-        for si in scope_items:
-            si_name_lower = si['name'].lower()
-            if similar_lower in si_name_lower or si_name_lower in similar_lower:
-                return si['id'], si['name']
-            # Word overlap check
-            similar_words = set(similar_lower.split())
-            si_words = set(si_name_lower.split())
-            if len(similar_words & si_words) >= 2:
-                return si['id'], si['name']
-
-    # Priority 2: substring match on the raw detected activity name
     for si in scope_items:
-        si_name_lower = si['name'].lower()
-        if detected_lower in si_name_lower or si_name_lower in detected_lower:
-            return si['id'], si['name']
-        # Word overlap check (at least 2 words match)
-        detected_words = set(detected_lower.split())
-        si_words = set(si_name_lower.split())
-        if len(detected_words & si_words) >= 2:
-            return si['id'], si['name']
+        si_norm = _normalize(si["name"])
+        si_words = set(si_norm.split())
 
-    return None, None
+        # 1. Exact match (normalized)
+        if act_norm == si_norm:
+            return si, 100, "exact"
 
+        # 2. Substring match
+        if act_norm in si_norm or si_norm in act_norm:
+            score = 90
+            if score > best_score:
+                best_match, best_score, best_type = si, score, "substring"
+            continue
+
+        # 3. Token overlap (Jaccard-style)
+        if act_words and si_words:
+            overlap = len(act_words & si_words)
+            union = len(act_words | si_words)
+            if union > 0:
+                jaccard = (overlap / union) * 100
+                # Require at least 2 common words AND >50% Jaccard
+                if overlap >= 2 and jaccard > 50 and jaccard > best_score:
+                    best_match, best_score, best_type = si, int(jaccard), "token_overlap"
+
+    return best_match, best_score, best_type
+
+
+# ---------------------------------------------------------------------------
+# RISK EVALUATION AGENT
+# ---------------------------------------------------------------------------
 
 class RiskEvaluationAgent:
+    """
+    Implements the Activity-Centric risk evaluation flow from risk-tracker-improve-1.md.
+    
+    Total LLM calls: 3 max (regardless of document size or activity count)
+      - Call 1: Activity Extraction
+      - Call 2: Batch Risk Evaluation (ambiguous activities only, 0 if all matched)  
+      - Call 3: Risk Aggregation
+    
+    Deterministically-matched activities SKIP the LLM entirely.
+    """
+
+    # Confidence threshold above which LLM evaluation is skipped
+    DETERMINISTIC_CONFIDENCE_THRESHOLD = 85
+
     @classmethod
     def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
                           activity_map: dict = None, request_map: dict = None) -> dict:
-        """
-        Orchestrates the 3 sub-agents, aggregates their results, calculates overall risk,
-        stores the history in `risk_evaluations`, and updates `tracker_items` with
-        the actual scope item name as the card title.
-        """
         activity_map = activity_map or {}
         request_map = request_map or {}
 
-        # Fetch approved scope items from MySQL — these are the "ground truth" scope names
-        scope_items = _fetch_scope_items(db_cursor, project_id)
+        # ===========================================================
+        # STEP 1: Fetch approved baseline from MySQL (no LLM)
+        # ===========================================================
+        scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
 
-        # 1. Run Sub-Agent 1 (In-Scope) — receives BOTH MySQL scope list + ChromaDB evidence
-        in_scope_result = InScopeEvaluationAgent.evaluate(
-            project_id, document_text, mysql_scope_items=scope_items
-        )
+        # ===========================================================
+        # STEP 2: Extract activities once — LLM CALL #1
+        # The document is sent to the LLM exactly once for extraction.
+        # ===========================================================
+        raw_activities = ActivityExtractorAgent.extract_activities(document_text)
 
-        # 2. Run Sub-Agent 2 (Out-of-Scope) — receives BOTH MySQL scope list + ChromaDB exclusion evidence
-        activities = in_scope_result.get("activities", [])
-        out_of_scope_result = OutOfScopeDetectionAgent.detect(
-            project_id, activities, document_text, mysql_scope_items=scope_items
-        )
+        # Deduplicate
+        seen = set()
+        cleaned_activities = []
+        for item in raw_activities:
+            name = str(item.get("activity", "")).strip()
+            if not name or name.lower() in seen:
+                continue
+            seen.add(name.lower())
+            cleaned_activities.append(name)
 
-        # 3. Run Sub-Agent 3 (Deliverables & Timeline) — receives MySQL scope list for accurate name mapping
-        timeline_result = DeliverableTimelineEvaluationAgent.evaluate(
-            project_id, document_text, mysql_scope_items=scope_items
-        )
+        # ===========================================================
+        # STEP 3: Deterministic Scope Matching (no LLM)
+        # High-confidence matches → IN_SCOPE immediately, skip LLM.
+        # Ambiguous activities → go to hybrid retrieval + LLM.
+        # ===========================================================
+        deterministic_in_scope = []   # Matched with high confidence
+        ambiguous_activities = []      # Need ChromaDB + LLM evaluation
 
-        # 4. Aggregate and Generate Overall Risk Summary
-        aggregation_prompt = f"""You are the Parent Risk Evaluation Agent.
-Your job is to aggregate the outputs of three specialized sub-agents and generate an overall risk summary for the project.
+        for activity_name in cleaned_activities:
+            matched_si, confidence, match_type = _deterministic_match(activity_name, scope_items)
 
-Sub-Agent 1 (In-Scope Evaluation):
-{json.dumps(in_scope_result, indent=2)}
+            if confidence >= cls.DETERMINISTIC_CONFIDENCE_THRESHOLD:
+                # High-confidence match — mark as IN_SCOPE without LLM
+                print(f"  [Deterministic] '{activity_name}' → IN_SCOPE via {match_type} (confidence: {confidence}%)")
+                deterministic_in_scope.append({
+                    "activity": activity_name,
+                    "classification": "IN_SCOPE",
+                    "deliverable": matched_si["name"],
+                    "confidence": confidence,
+                    "match_type": match_type
+                })
+            else:
+                # Ambiguous — needs deeper analysis
+                ambiguous_activities.append({
+                    "activity": activity_name,
+                    "matched_si": matched_si,  # Could be None or a low-confidence match
+                    "confidence": confidence
+                })
 
-Sub-Agent 2 (Out-of-Scope Detection):
-{json.dumps(out_of_scope_result, indent=2)}
+        # ===========================================================
+        # STEP 4: Hybrid Retrieval for ambiguous activities (no LLM)
+        # Per-activity compact context using MySQL metadata + ChromaDB.
+        # ===========================================================
+        activities_with_contexts = []
+        for item in ambiguous_activities:
+            activity_name = item["activity"]
+            matched_si = item["matched_si"]
 
-Sub-Agent 3 (Deliverables & Timeline):
-{json.dumps(timeline_result, indent=2)}
+            # Build per-activity compact context
+            context = ProjectKnowledgeService.get_activity_context(
+                project_id=project_id,
+                activity_name=activity_name,
+                matched_scope_item=matched_si
+            )
+            activities_with_contexts.append({
+                "activity": activity_name,
+                "context": context,
+                "matched_si": matched_si
+            })
 
-Calculate the Overall Risk Score (0-100) and Overall Risk Level (LOW, MEDIUM, HIGH, CRITICAL) considering:
-- Number of Out-of-Scope Activities
-- Number of Delayed Deliverables
-- Missing Deliverables
-- Active Blockers
-- Progress against Milestones
+        # ===========================================================
+        # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
+        # ALL ambiguous activities are evaluated in ONE single LLM call.
+        # If all activities matched deterministically, this call is SKIPPED.
+        # ===========================================================
+        llm_risk_results = []
+        if activities_with_contexts:
+            print(f"  [LLM] Batch-evaluating {len(activities_with_contexts)} ambiguous activities...")
+            llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts)
 
-Output MUST be a valid JSON object matching this exact schema:
+        # ===========================================================
+        # STEP 6: Categorize all results
+        # ===========================================================
+        out_of_scope_activities = []
+        timeline_deliverables = []
+        in_scope_activities = list(deterministic_in_scope)  # Start with deterministic matches
+
+        # Process LLM results for ambiguous activities
+        for i, result in enumerate(llm_risk_results):
+            activity_name = result.get("activity", "Unknown")
+            risk_cat = result.get("risk_category", "NONE")
+            risk_lvl = result.get("risk_level", "LOW")
+            reasoning = result.get("reasoning", "")
+            matched_name = result.get("matched_baseline_item")
+
+            # Fallback: use the deterministic partial match if LLM didn't identify one
+            if not matched_name and i < len(activities_with_contexts):
+                si = activities_with_contexts[i].get("matched_si")
+                if si:
+                    matched_name = si["name"]
+
+            mapped_deliv = matched_name or activity_name
+
+            if risk_cat == "SCOPE_CREEP":
+                out_of_scope_activities.append({
+                    "activity": activity_name,
+                    "classification": "OUT_OF_SCOPE" if risk_lvl in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
+                    "reason": reasoning,
+                    "similar_deliverable": mapped_deliv,
+                    "confidence": 90
+                })
+            elif risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
+                timeline_deliverables.append({
+                    "deliverable": mapped_deliv,
+                    "expected_date": "Unknown",
+                    "current_status": "Delayed" if risk_cat == "DELAY" else "Blocked",
+                    "delay_days": 0,
+                    "blockers": [reasoning],
+                    "dependency_status": risk_cat,
+                    "risk": risk_lvl
+                })
+            else:
+                in_scope_activities.append({
+                    "activity": activity_name,
+                    "classification": "IN_SCOPE",
+                    "deliverable": mapped_deliv,
+                    "confidence": 90
+                })
+
+        in_scope_result = {"activities": in_scope_activities}
+        out_of_scope_result = {"activities": out_of_scope_activities}
+        timeline_result = {"deliverables": timeline_deliverables}
+
+        # ===========================================================
+        # STEP 7: Aggregation — LLM CALL #3
+        # Produces overall risk score, summary, and recommendations.
+        # ===========================================================
+        aggregation_prompt = f"""You are the Risk Aggregation Agent.
+Summarize the following risk evaluation results and compute an overall project risk score.
+
+In-Scope Activities: {len(in_scope_activities)} (including {len(deterministic_in_scope)} confirmed by baseline matching)
+Out-of-Scope / Scope Creep Items: {len(out_of_scope_activities)}
+Delayed / Blocked Deliverables: {len(timeline_deliverables)}
+
+Scope Creep Items:
+{json.dumps(out_of_scope_activities, indent=2)}
+
+Delayed / Blocked Items:
+{json.dumps(timeline_deliverables, indent=2)}
+
+Output MUST be a valid JSON object:
 {{
    "overallRisk": "HIGH",
    "riskScore": 72,
-   "summary": "Project risk increased due to delayed deliverables and newly detected scope creep.",
+   "summary": "2 sentence summary of overall project risk status.",
    "recommendations": [
-      "Submit a change request for SAP Integration.",
-      "Escalate the UI Design blocker to the client."
+      "One specific actionable recommendation per identified risk."
    ]
 }}
 """
@@ -151,9 +261,11 @@ Output MUST be a valid JSON object matching this exact schema:
             "timeline": timeline_result
         }
 
-        # 5. Store in Risk History (risk_evaluations)
+        # ===========================================================
+        # STEP 8: Persist to DB
+        # ===========================================================
         insert_eval_sql = """
-            INSERT INTO risk_evaluations 
+            INSERT INTO risk_evaluations
             (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
         """
@@ -162,21 +274,24 @@ Output MUST be a valid JSON object matching this exact schema:
             json.dumps(recommendations), json.dumps(sub_agent_results)
         ))
 
-        # 6. Fetch stakeholders for alerts
+        # Fetch stakeholders for alerts
         db_cursor.execute("SELECT email, role FROM stakeholders WHERE project_id = %s", (project_id,))
         stakeholders = db_cursor.fetchall()
 
-        # 7. Persist Out-of-Scope risks — title = matched scope item name
+        # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')
             similar_deliverable = oos_item.get('similar_deliverable', '')
 
-            # Match to actual scope item from MySQL
-            matched_scope_id, matched_scope_name = _match_to_scope_item(
-                oos_name, similar_deliverable, scope_items
-            )
+            # Find matching scope item for reference
+            matched_scope_id = None
+            matched_scope_name = similar_deliverable
+            for si in scope_items:
+                if si["name"].lower() in similar_deliverable.lower() or similar_deliverable.lower() in si["name"].lower():
+                    matched_scope_id = si["id"]
+                    matched_scope_name = si["name"]
+                    break
 
-            # Fuzzy match activity_map for reference_id (links to project_activities row)
             oos_name_clean = oos_name.lower().strip()
             ref_id = None
             for name, act_id in activity_map.items():
@@ -184,13 +299,11 @@ Output MUST be a valid JSON object matching this exact schema:
                     ref_id = act_id
                     break
 
-            confidence_val = oos_item.get('confidence', 50) / 100.0
-            reasoning = f"{oos_item.get('reason', '')} (Confidence: {oos_item.get('confidence', 0)}%)"
+            confidence_val = oos_item.get('confidence', 90) / 100.0
+            reasoning = f"{oos_item.get('reason', '')} (Confidence: {oos_item.get('confidence', 90)}%)"
             full_reasoning = f"Activity: {oos_name}\n{reasoning}"
             item_risk_score = 80 if oos_item.get('classification') == 'OUT_OF_SCOPE' else 50
             item_risk_level = 'HIGH' if oos_item.get('classification') == 'OUT_OF_SCOPE' else 'MEDIUM'
-
-            # Use the matched scope item name as title; fallback to detected activity name
             card_title = matched_scope_name if matched_scope_name else oos_name
 
             TrackerAuditAgent.persist_tracker_item(
@@ -206,43 +319,40 @@ Output MUST be a valid JSON object matching this exact schema:
                     full_reasoning, stakeholders, db_cursor=db_cursor
                 )
 
-        # 8. Persist Delayed Deliverable risks — title = matched scope item name
+        # Persist Timeline / Delay risks to tracker
         for deliv in timeline_result.get("deliverables", []):
-            if deliv.get('risk') in ['HIGH', 'CRITICAL'] or deliv.get('current_status') == 'Delayed':
-                deliv_name = deliv.get('deliverable', 'Unknown')
+            deliv_name = deliv.get('deliverable', 'Unknown')
+            matched_scope_name = None
+            for si in scope_items:
+                if si["name"].lower() in deliv_name.lower() or deliv_name.lower() in si["name"].lower():
+                    matched_scope_name = si["name"]
+                    break
 
-                # Match to actual scope item
-                matched_scope_id, matched_scope_name = _match_to_scope_item(
-                    deliv_name, '', scope_items
+            deliv_name_clean = deliv_name.lower().strip()
+            ref_id = None
+            for name, act_id in activity_map.items():
+                if name in deliv_name_clean or deliv_name_clean in name:
+                    ref_id = act_id
+                    break
+
+            reasoning = f"Status: {deliv.get('current_status')}. Blockers: {', '.join(deliv.get('blockers', []))}"
+            full_reasoning = f"Deliverable: {deliv_name}\n{reasoning}"
+            item_risk_score = 85 if deliv.get('risk') == 'CRITICAL' else 65
+            item_risk_level = deliv.get('risk', 'HIGH')
+            card_title = matched_scope_name if matched_scope_name else deliv_name
+
+            TrackerAuditAgent.persist_tracker_item(
+                db_cursor, project_id, document_id, 'ACTION_ITEM',
+                False, item_risk_score, item_risk_level, 'DELAY',
+                1.0, full_reasoning, True,
+                title=card_title, reference_id=ref_id
+            )
+
+            if item_risk_score >= 70:
+                AlertingAgent.dispatch_alert(
+                    project_id, f"Delay Risk: {card_title}",
+                    full_reasoning, stakeholders, db_cursor=db_cursor
                 )
-
-                deliv_name_clean = deliv_name.lower().strip()
-                ref_id = None
-                for name, act_id in activity_map.items():
-                    if name in deliv_name_clean or deliv_name_clean in name:
-                        ref_id = act_id
-                        break
-
-                reasoning = f"Delayed by {deliv.get('delay_days', 0)} days. Blockers: {', '.join(deliv.get('blockers', []))}"
-                full_reasoning = f"Deliverable: {deliv_name}\n{reasoning}"
-                item_risk_score = 85 if deliv.get('risk') == 'CRITICAL' else 65
-                item_risk_level = deliv.get('risk', 'HIGH')
-
-                # Use the matched scope item name as title; fallback to deliverable name
-                card_title = matched_scope_name if matched_scope_name else deliv_name
-
-                TrackerAuditAgent.persist_tracker_item(
-                    db_cursor, project_id, document_id, 'ACTION_ITEM',
-                    False, item_risk_score, item_risk_level, 'DELAY',
-                    1.0, full_reasoning, True,
-                    title=card_title, reference_id=ref_id
-                )
-
-                if item_risk_score >= 70:
-                    AlertingAgent.dispatch_alert(
-                        project_id, f"Delay Risk: {card_title}",
-                        full_reasoning, stakeholders, db_cursor=db_cursor
-                    )
 
         return {
             "overallRisk": overall_risk,

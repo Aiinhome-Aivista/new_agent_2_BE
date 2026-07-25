@@ -66,8 +66,8 @@ class TrackerAuditAgent:
         
         audit_sql = """
             INSERT INTO audit_logs
-            (project_id, action_type, entity_type, entity_id, details)
-            VALUES (%s, %s, 'TRACKER_ITEM', %s, %s)
+            (project_id, agent_name, action, entity_type, entity_id, details_json)
+            VALUES (%s, 'TrackerAuditAgent', %s, 'TRACKER_ITEM', %s, %s)
         """
         try:
             db_cursor.execute(audit_sql, (project_id, action_type, tracker_id, json.dumps(audit_details)))

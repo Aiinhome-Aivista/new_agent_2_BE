@@ -21,7 +21,7 @@ class LLMService:
                 
                 # Simple retry logic for 429 Rate Limits
                 import time
-                max_retries = 3
+                max_retries = 2
                 for attempt in range(max_retries):
                     try:
                         response = gemini_client.models.generate_content(
@@ -30,9 +30,12 @@ class LLMService:
                         )
                         return response.text
                     except Exception as e:
-                        if "429" in str(e) and attempt < max_retries - 1:
-                            print(f"Gemini Rate Limit hit. Retrying in 40s (Attempt {attempt + 1}/{max_retries})...")
-                            time.sleep(40)
+                        err_str = str(e)
+                        # Only retry on per-minute rate limit, not daily quota exhaustion
+                        if "429" in err_str and "GenerateRequestsPerDayPerProjectPerModel" not in err_str and attempt < max_retries - 1:
+                            wait = 30
+                            print(f"Gemini RPM limit hit. Waiting {wait}s (Attempt {attempt + 1}/{max_retries})...")
+                            time.sleep(wait)
                         else:
                             raise e
                             
