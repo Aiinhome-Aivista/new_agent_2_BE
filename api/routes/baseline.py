@@ -16,6 +16,7 @@ from services.milestone_deadline_extractor import MilestoneDeadlineExtractor
 from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
+from services.normalization_service import NormalizationService
 import mysql.connector
 
 router = APIRouter()
@@ -59,19 +60,27 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
         # Pipeline Step 5: Milestone & Deadline Extraction
         enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
         
-        # Issue 8: Structured candidate logging
+        # Pipeline Step 6: Normalization
+        for item in enriched_candidates:
+            item["scope_item_normalized"] = NormalizationService.normalize_scope_item(item.get("name"))
+            item["milestone_normalized"] = NormalizationService.normalize_milestone(item.get("milestone"), item.get("scope_item_normalized"))
+            item["deadline_original"] = item.get("deadline_text")
+            item["deadline_normalized"] = item.get("deadline")
+        
+        # Issue 8 & 10: Structured candidate logging with normalized values
         print("\n" + "="*60)
         print("EXTRACTION PIPELINE RESULTS:")
         print("="*60)
         for item in enriched_candidates:
-            print(f"Scope Item: {item.get('name')}")
-            print(f"  Source Section: {item.get('section')}")
+            print(f"Original Text: {item.get('name')}")
+            print(f"Normalized Scope Item: {item.get('scope_item_normalized')}")
+            print(f"Milestone: {item.get('milestone_normalized')}")
+            print(f"Deadline: {item.get('deadline_original')} ({item.get('deadline_normalized')})")
+            print(f"Classification: {item.get('scope_type')}")
+            print(f"Confidence: {item.get('confidence')}")
             evidence = item.get('evidence_text', '')
-            print(f"  Evidence Used: {evidence[:100] + '...' if len(evidence) > 100 else evidence}")
-            print(f"  Milestone: {item.get('milestone')}")
-            print(f"  Deadline: {item.get('deadline_text')} ({item.get('deadline')})")
-            print(f"  Classification Conf: {item.get('confidence')}")
-            print(f"  Extraction Method: {item.get('extraction_method')} ({item.get('extraction_confidence')})")
+            print(f"Evidence Used: {evidence[:100] + '...' if len(evidence) > 100 else evidence}")
+            print(f"Extraction Method: {item.get('extraction_method')} ({item.get('extraction_confidence')})")
             print("-" * 60)
             
         # Format for downstream smart diff and saving
@@ -169,7 +178,11 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     milestone=item.get("milestone"),
                     deadline_text=item.get("deadline_text"),
                     extraction_confidence=item.get("extraction_confidence"),
-                    extraction_method=item.get("extraction_method")
+                    extraction_method=item.get("extraction_method"),
+                    scope_item_normalized=item.get("scope_item_normalized"),
+                    milestone_normalized=item.get("milestone_normalized"),
+                    deadline_original=item.get("deadline_original"),
+                    deadline_normalized=item.get("deadline_normalized")
                 )
             else:
                 BaselineRepository.insert_scope_item_extracted(
@@ -188,7 +201,11 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     milestone=item.get("milestone"),
                     deadline_text=item.get("deadline_text"),
                     extraction_confidence=item.get("extraction_confidence"),
-                    extraction_method=item.get("extraction_method")
+                    extraction_method=item.get("extraction_method"),
+                    scope_item_normalized=item.get("scope_item_normalized"),
+                    milestone_normalized=item.get("milestone_normalized"),
+                    deadline_original=item.get("deadline_original"),
+                    deadline_normalized=item.get("deadline_normalized")
                 )
             
         # UPSERT deliverables
@@ -331,10 +348,11 @@ def add_scope_item(
             "chunk_index": item_id, # Use item_id to make it unique
             "text": text_to_embed,
             "page_number": 0,
-            "scope_item": item.name,
+            "scope_item_normalized": NormalizationService.normalize_scope_item(item.name),
             "scope_type": item.scope_type,
-            "milestone": item.milestone or "NULL",
-            "deadline": item.deadline_text or "NULL",
+            "milestone_normalized": NormalizationService.normalize_milestone(item.milestone, NormalizationService.normalize_scope_item(item.name)) if item.milestone else "NULL",
+            "deadline_original": item.deadline_text or "NULL",
+            "deadline_normalized": item.deadline or "NULL",
             "baseline_version": version,
             "status": "APPROVED" if version > 0 else "DRAFT"
         }

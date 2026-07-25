@@ -7,7 +7,7 @@ class ScopeDeduplicator:
     """
     
     @classmethod
-    def deduplicate(cls, candidates: list[dict], similarity_threshold: float = 0.75) -> list[dict]:
+    def deduplicate(cls, candidates: list[dict], similarity_threshold: float = 0.85) -> list[dict]:
         if not candidates:
             return []
             
@@ -29,7 +29,7 @@ class ScopeDeduplicator:
                     
             if matched_existing:
                 # Merge logic: Append the new description to the existing one to preserve detail
-                if candidate["description"] not in matched_existing["description"]:
+                if candidate["description"] and candidate["description"] not in matched_existing["description"]:
                     matched_existing["description"] += f" | {candidate['description']}"
                     
                 # If there's conflicting scope types, default to the more explicit one (IN/OUT > UNCERTAIN)

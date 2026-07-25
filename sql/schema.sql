@@ -185,6 +185,7 @@ id BIGINT PRIMARY KEY AUTO_INCREMENT,
 baseline_id BIGINT NOT NULL,
 project_id BIGINT NOT NULL,
 name VARCHAR(500) NOT NULL,
+scope_item_normalized VARCHAR(500),
 description TEXT,
 scope_type ENUM(
 'IN_SCOPE',
@@ -197,6 +198,9 @@ source_section VARCHAR(255),
 evidence_text TEXT NOT NULL,
 confidence DECIMAL(5,4),
 deadline DATE NULL,
+deadline_original VARCHAR(255),
+deadline_normalized DATE NULL,
+milestone_normalized VARCHAR(255),
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_scope_item_baseline
