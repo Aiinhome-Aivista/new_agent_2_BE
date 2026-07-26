@@ -17,6 +17,56 @@ def _normalize(text: str) -> str:
     return " ".join(w for w in words if w not in stop_words)
 
 
+import re
+
+def _strip_date_from_title(title: str) -> str:
+    """
+    Remove date suffixes from tracker titles.
+    e.g. "UAT - 15 May 2026" → "UAT"
+         "Go Live - 30 June 2026" → "Go Live"
+    """
+    # Remove " - DD Month YYYY" or " - Month YYYY" or " - YYYY-MM-DD" patterns
+    cleaned = re.sub(r'\s*[-–]\s*\d{1,2}\s+\w+\s+\d{4}', '', title)
+    cleaned = re.sub(r'\s*[-–]\s*\d{4}-\d{2}-\d{2}', '', cleaned)
+    cleaned = re.sub(r'\s*[-–]\s*\w+\s+\d{4}', '', cleaned)
+    return cleaned.strip()
+
+
+def _resolve_tracker_title(activity_name: str, matched_baseline_item: str,
+                           in_scope_items: list, all_baseline_items: list = None) -> tuple:
+    """
+    Implements the Tracker Title Priority rule:
+      1. Matched IN_SCOPE baseline item name  → (canonical_name, True)
+      2. Matched OUT_OF_SCOPE baseline item   → (canonical_name, False)
+      3. Normalized activity name             → (activity_name, False)
+
+    Uses all_baseline_items to resolve canonical names for OUT_OF_SCOPE entries.
+    Returns (canonical_title, is_confirmed_in_scope)
+    """
+    all_items = (all_baseline_items or []) + (in_scope_items or [])
+
+    if matched_baseline_item:
+        norm_match = _normalize(matched_baseline_item)
+
+        # Priority 1: check IN_SCOPE items first
+        for si in in_scope_items:
+            si_norm = _normalize(si["name"])
+            if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
+                return _strip_date_from_title(si["name"]), True
+
+        # Priority 2: check ALL baseline items (including OUT_OF_SCOPE exclusions)
+        for si in all_items:
+            si_norm = _normalize(si["name"])
+            if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
+                return _strip_date_from_title(si["name"]), False
+
+        # Priority 2 fallback: use whatever the LLM said (already normalized)
+        return _strip_date_from_title(matched_baseline_item), False
+
+    # Priority 3: no baseline match — use normalized activity name
+    return _strip_date_from_title(activity_name), False
+
+
 def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
     """
     STEP 3: Deterministic Scope Matching.
@@ -87,10 +137,13 @@ class RiskEvaluationAgent:
         activity_map = activity_map or {}
         request_map = request_map or {}
 
-        # ===========================================================
-        # STEP 1: Fetch approved baseline from MySQL (no LLM)
-        # ===========================================================
+        # Fetch IN_SCOPE items for risk evaluation and title resolution
         scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
+
+        # Fetch ALL baseline items (IN_SCOPE + OUT_OF_SCOPE) for canonical name resolution.
+        # This ensures "Voice Bot implementation (OUT_OF_SCOPE)" resolves to the exact
+        # baseline name, not just the normalized activity name.
+        all_baseline_items = ProjectKnowledgeService.get_full_baseline(db_cursor, project_id)
 
         # ===========================================================
         # STEP 2: Extract activities once — LLM CALL #1
@@ -98,15 +151,23 @@ class RiskEvaluationAgent:
         # ===========================================================
         raw_activities = ActivityExtractorAgent.extract_activities(document_text)
 
-        # Deduplicate
+        # Deduplicate by normalized business entity name (not raw activity string)
+        # This merges "Evaluate SAP Integration Request" + "SAP Integration Request Assessment"
+        # into a single "SAP Integration" entity.
         seen = set()
-        cleaned_activities = []
+        cleaned_activities = []  # list of {activity, source_sentence}
         for item in raw_activities:
             name = str(item.get("activity", "")).strip()
-            if not name or name.lower() in seen:
+            if not name:
                 continue
-            seen.add(name.lower())
-            cleaned_activities.append(name)
+            norm_key = _normalize(name)
+            if norm_key in seen:
+                continue
+            seen.add(norm_key)
+            cleaned_activities.append({
+                "activity": name,
+                "source_sentence": item.get("source_sentence", name)
+            })
 
         # ===========================================================
         # STEP 3: Deterministic Scope Matching (no LLM)
@@ -116,7 +177,9 @@ class RiskEvaluationAgent:
         deterministic_in_scope = []   # Matched with high confidence
         ambiguous_activities = []      # Need ChromaDB + LLM evaluation
 
-        for activity_name in cleaned_activities:
+        for act_item in cleaned_activities:
+            activity_name = act_item["activity"]
+            source_sentence = act_item["source_sentence"]
             matched_si, confidence, match_type = _deterministic_match(activity_name, scope_items)
 
             if confidence >= cls.DETERMINISTIC_CONFIDENCE_THRESHOLD:
@@ -127,12 +190,14 @@ class RiskEvaluationAgent:
                     "classification": "IN_SCOPE",
                     "deliverable": matched_si["name"],
                     "confidence": confidence,
-                    "match_type": match_type
+                    "match_type": match_type,
+                    "source_sentence": source_sentence
                 })
             else:
                 # Ambiguous — needs deeper analysis
                 ambiguous_activities.append({
                     "activity": activity_name,
+                    "source_sentence": source_sentence,
                     "matched_si": matched_si,  # Could be None or a low-confidence match
                     "confidence": confidence
                 })
@@ -154,6 +219,7 @@ class RiskEvaluationAgent:
             )
             activities_with_contexts.append({
                 "activity": activity_name,
+                "source_sentence": item.get("source_sentence", activity_name),
                 "context": context,
                 "matched_si": matched_si
             })
@@ -181,39 +247,61 @@ class RiskEvaluationAgent:
             risk_cat = result.get("risk_category", "NONE")
             risk_lvl = result.get("risk_level", "LOW")
             reasoning = result.get("reasoning", "")
-            matched_name = result.get("matched_baseline_item")
+            matched_baseline_name = result.get("matched_baseline_item")
 
             # Fallback: use the deterministic partial match if LLM didn't identify one
-            if not matched_name and i < len(activities_with_contexts):
+            if not matched_baseline_name and i < len(activities_with_contexts):
                 si = activities_with_contexts[i].get("matched_si")
                 if si:
-                    matched_name = si["name"]
+                    matched_baseline_name = si["name"]
 
-            mapped_deliv = matched_name or activity_name
+            # Get source_sentence as evidence
+            source_sentence = ""
+            if i < len(activities_with_contexts):
+                source_sentence = activities_with_contexts[i].get("source_sentence", activity_name)
+
+            # TRACKER TITLE PRIORITY: resolve canonical title and confirm if IN_SCOPE
+            canonical_title, is_confirmed_in_scope = _resolve_tracker_title(
+                activity_name, matched_baseline_name, scope_items, all_baseline_items
+            )
+
+            # CRITICAL: If item is confirmed IN_SCOPE, it can NEVER be SCOPE_CREEP.
+            # However, DELAY, DEPENDENCY, and BLOCKED are still valid for IN_SCOPE items.
+            # Example: "CRM Integration delayed" → IN_SCOPE + DELAY (correct)
+            #          "CRM Integration is new scope" → IN_SCOPE + SCOPE_CREEP → overridden to NONE (correct)
+            if is_confirmed_in_scope and risk_cat == "SCOPE_CREEP":
+                print(f"  [Override] '{activity_name}' is IN approved baseline — overriding SCOPE_CREEP to NONE (DELAY/DEP/BLOCKED still valid)")
+                risk_cat = "NONE"
+                risk_lvl = "LOW"
+
+            # Build full evidence string (MoM sentence + LLM reasoning)
+            full_evidence = f"MoM Evidence: {source_sentence}" if source_sentence else ""
+            if reasoning:
+                full_evidence = f"{full_evidence}\nAnalysis: {reasoning}".strip()
 
             if risk_cat == "SCOPE_CREEP":
                 out_of_scope_activities.append({
-                    "activity": activity_name,
+                    "activity": canonical_title,
                     "classification": "OUT_OF_SCOPE" if risk_lvl in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
-                    "reason": reasoning,
-                    "similar_deliverable": mapped_deliv,
+                    "reason": full_evidence,
+                    "similar_deliverable": matched_baseline_name or canonical_title,
                     "confidence": 90
                 })
             elif risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
                 timeline_deliverables.append({
-                    "deliverable": mapped_deliv,
+                    "deliverable": canonical_title,
                     "expected_date": "Unknown",
                     "current_status": "Delayed" if risk_cat == "DELAY" else "Blocked",
                     "delay_days": 0,
-                    "blockers": [reasoning],
+                    "blockers": [full_evidence],
                     "dependency_status": risk_cat,
                     "risk": risk_lvl
                 })
             else:
                 in_scope_activities.append({
-                    "activity": activity_name,
+                    "activity": canonical_title,
                     "classification": "IN_SCOPE",
-                    "deliverable": mapped_deliv,
+                    "deliverable": canonical_title,
                     "confidence": 90
                 })
 

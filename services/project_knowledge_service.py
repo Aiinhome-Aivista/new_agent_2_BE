@@ -31,6 +31,28 @@ class ProjectKnowledgeService:
             return []
 
     @classmethod
+    def get_full_baseline(cls, db_cursor, project_id: int) -> list:
+        """
+        Fetch ALL scope items from the latest APPROVED baseline — both IN_SCOPE and OUT_OF_SCOPE.
+        Used for canonical name resolution only (e.g. "Voice Bot implementation" as OUT_OF_SCOPE
+        should use the exact baseline wording, not the normalized activity name).
+        """
+        try:
+            db_cursor.execute("""
+                SELECT si.id, si.name, si.scope_type, si.milestone, si.deadline, si.deadline_text
+                FROM scope_items si
+                JOIN scope_baselines sb ON si.baseline_id = sb.id
+                WHERE si.project_id = %s
+                  AND sb.status = 'APPROVED'
+                  AND si.completion_status = 'ACTIVE'
+                ORDER BY sb.id DESC, si.id ASC
+            """, (project_id,))
+            return db_cursor.fetchall() or []
+        except Exception as e:
+            print(f"Warning: Could not fetch full baseline items: {e}")
+            return []
+
+    @classmethod
     def get_activity_context(cls, project_id: int, activity_name: str, matched_scope_item: dict = None) -> str:
         """
         STEP 5 (Baseline Context Builder): Builds a compact, targeted context string
