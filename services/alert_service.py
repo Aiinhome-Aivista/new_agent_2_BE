@@ -5,7 +5,7 @@ from core.config import settings
 
 class AlertService:
     @staticmethod
-    def send_email(to_email: str, subject: str, body: str):
+    def send_email(to_email: str, subject: str, body: str, html_body: str = None):
         if not settings.SMTP_SERVER:
             # Dummy output if SMTP is not configured
             print(f"--- DUMMY EMAIL ---")
@@ -21,7 +21,11 @@ class AlertService:
             msg['To'] = to_email
             msg['Subject'] = subject
             
-            msg.attach(MIMEText(body, 'plain'))
+            
+            if html_body:
+                msg.attach(MIMEText(html_body, 'html'))
+            else:
+                msg.attach(MIMEText(body, 'plain'))
             
             server = smtplib.SMTP(settings.SMTP_SERVER, settings.SMTP_PORT)
             if settings.SMTP_EMAIL and settings.SMTP_PASSWORD:

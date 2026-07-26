@@ -13,9 +13,35 @@ class TrackerAuditAgent:
         # 1. Check for existing OPEN item for deduplication
         existing_id = None
         if reference_id:
-            db_cursor.execute("SELECT id, risk_score, reasoning FROM tracker_items WHERE project_id = %s AND reference_id = %s AND status = 'OPEN' ORDER BY id DESC LIMIT 1", (project_id, reference_id))
+            db_cursor.execute(
+                "SELECT id, risk_score, reasoning FROM tracker_items WHERE project_id = %s AND reference_id = %s AND status = 'OPEN' ORDER BY id DESC LIMIT 1",
+                (project_id, reference_id)
+            )
         elif title:
-            db_cursor.execute("SELECT id, risk_score, reasoning FROM tracker_items WHERE project_id = %s AND title = %s AND status = 'OPEN' ORDER BY id DESC LIMIT 1", (project_id, title))
+            # Normalize the title for matching: lowercase + strip punctuation
+            # This prevents "VPN Connectivity" and "VPN Connectivity." from creating two records.
+            import re
+            norm_title = re.sub(r'[^\w\s]', '', title.lower().strip())
+            db_cursor.execute(
+                """SELECT id, risk_score, reasoning, title FROM tracker_items
+                   WHERE project_id = %s AND status = 'OPEN'
+                   ORDER BY id DESC""",
+                (project_id,)
+            )
+            all_open = db_cursor.fetchall()
+            # Manual normalized comparison — find best match
+            for row in (all_open or []):
+                existing_title = row['title'] if isinstance(row, dict) else (row[3] if len(row) > 3 else "")
+                norm_existing = re.sub(r'[^\w\s]', '', (existing_title or "").lower().strip())
+                if norm_existing == norm_title:
+                    db_cursor.execute(
+                        "SELECT id, risk_score, reasoning FROM tracker_items WHERE id = %s",
+                        (row['id'] if isinstance(row, dict) else row[0],)
+                    )
+                    break
+            else:
+                db_cursor.execute("SELECT NULL, NULL, NULL WHERE FALSE")  # no match found
+
             
         existing = db_cursor.fetchone()
         

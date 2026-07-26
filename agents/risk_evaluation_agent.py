@@ -1,4 +1,5 @@
 import json
+from typing import Callable, Optional
 from services.llm_service import LLMService
 from services.project_knowledge_service import ProjectKnowledgeService
 from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivityRiskAgent
@@ -133,62 +134,90 @@ class RiskEvaluationAgent:
 
     @classmethod
     def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
-                          activity_map: dict = None, request_map: dict = None) -> dict:
+                          activity_map: dict = None, request_map: dict = None,
+                          emit: Optional[Callable[[str, int], None]] = None) -> dict:
         activity_map = activity_map or {}
         request_map = request_map or {}
 
+        def _emit(step: str, pct: int):
+            if emit:
+                emit(step, pct)
+
         # Fetch IN_SCOPE items for risk evaluation and title resolution
+        _emit("Loading Project Baseline", 10)
         scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
 
         # Fetch ALL baseline items (IN_SCOPE + OUT_OF_SCOPE) for canonical name resolution.
-        # This ensures "Voice Bot implementation (OUT_OF_SCOPE)" resolves to the exact
-        # baseline name, not just the normalized activity name.
         all_baseline_items = ProjectKnowledgeService.get_full_baseline(db_cursor, project_id)
 
-        # ===========================================================
         # STEP 2: Extract activities once — LLM CALL #1
-        # The document is sent to the LLM exactly once for extraction.
-        # ===========================================================
+        _emit("Extracting Activities", 35)
         raw_activities = ActivityExtractorAgent.extract_activities(document_text)
 
-        # Deduplicate by normalized business entity name (not raw activity string)
-        # This merges "Evaluate SAP Integration Request" + "SAP Integration Request Assessment"
-        # into a single "SAP Integration" entity.
-        seen = set()
-        cleaned_activities = []  # list of {activity, source_sentence}
+        # ── Post-extraction: resolve canonical title immediately, then deduplicate ──
+        # Root cause fix: deduplication must happen on the CANONICAL title, not the raw
+        # normalized activity string. Otherwise "Evaluate SAP Integration Request" and
+        # "SAP Integration Request Assessment" produce two different norm_keys and both
+        # survive into the pipeline, creating duplicate tracker records.
+        #
+        # Pipeline:
+        #   raw_activity → _resolve_tracker_title → canonical_title → dedup by canonical
+        seen_canonical = set()
+        cleaned_activities = []  # list of {activity, canonical_title, is_in_scope, source_sentence}
         for item in raw_activities:
             name = str(item.get("activity", "")).strip()
             if not name:
                 continue
-            norm_key = _normalize(name)
-            if norm_key in seen:
+
+            # Resolve canonical title against full baseline RIGHT NOW, before anything else
+            canonical_title, is_in_scope = _resolve_tracker_title(
+                name, None, scope_items, all_baseline_items
+            )
+
+            # Dedup key is the canonical title — so "SAP Integration Request Assessment"
+            # and "Evaluate SAP Integration Request" both resolve to "SAP Integration" → merged
+            dedup_key = _normalize(canonical_title)
+            if dedup_key in seen_canonical:
+                print(f"  [Dedup] Merged '{name}' → already seen as '{canonical_title}'")
                 continue
-            seen.add(norm_key)
+            seen_canonical.add(dedup_key)
+
             cleaned_activities.append({
                 "activity": name,
+                "canonical_title": canonical_title,
+                "is_in_scope": is_in_scope,
                 "source_sentence": item.get("source_sentence", name)
             })
 
-        # ===========================================================
-        # STEP 3: Deterministic Scope Matching (no LLM)
+        # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
         # High-confidence matches → IN_SCOPE immediately, skip LLM.
         # Ambiguous activities → go to hybrid retrieval + LLM.
-        # ===========================================================
         deterministic_in_scope = []   # Matched with high confidence
         ambiguous_activities = []      # Need ChromaDB + LLM evaluation
 
         for act_item in cleaned_activities:
             activity_name = act_item["activity"]
+            canonical_title = act_item["canonical_title"]
+            is_already_in_scope = act_item["is_in_scope"]
             source_sentence = act_item["source_sentence"]
             matched_si, confidence, match_type = _deterministic_match(activity_name, scope_items)
 
-            if confidence >= cls.DETERMINISTIC_CONFIDENCE_THRESHOLD:
-                # High-confidence match — mark as IN_SCOPE without LLM
-                print(f"  [Deterministic] '{activity_name}' → IN_SCOPE via {match_type} (confidence: {confidence}%)")
+            # Also try matching on canonical_title if activity_name didn't hit
+            if confidence < cls.DETERMINISTIC_CONFIDENCE_THRESHOLD:
+                matched_si2, confidence2, match_type2 = _deterministic_match(canonical_title, scope_items)
+                if confidence2 > confidence:
+                    matched_si, confidence, match_type = matched_si2, confidence2, match_type2
+
+            if confidence >= cls.DETERMINISTIC_CONFIDENCE_THRESHOLD or is_already_in_scope:
+                # High-confidence match or pre-resolved IN_SCOPE — mark without LLM
+                resolved_name = matched_si["name"] if matched_si else canonical_title
+                final_title, _ = _resolve_tracker_title(activity_name, resolved_name, scope_items, all_baseline_items)
+                print(f"  [Deterministic] '{activity_name}' → IN_SCOPE as '{final_title}' (confidence: {confidence}%)")
                 deterministic_in_scope.append({
                     "activity": activity_name,
                     "classification": "IN_SCOPE",
-                    "deliverable": matched_si["name"],
+                    "deliverable": final_title,
+                    "canonical_title": final_title,
                     "confidence": confidence,
                     "match_type": match_type,
                     "source_sentence": source_sentence
@@ -197,8 +226,9 @@ class RiskEvaluationAgent:
                 # Ambiguous — needs deeper analysis
                 ambiguous_activities.append({
                     "activity": activity_name,
+                    "canonical_title": canonical_title,
                     "source_sentence": source_sentence,
-                    "matched_si": matched_si,  # Could be None or a low-confidence match
+                    "matched_si": matched_si,
                     "confidence": confidence
                 })
 
@@ -224,11 +254,8 @@ class RiskEvaluationAgent:
                 "matched_si": matched_si
             })
 
-        # ===========================================================
         # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
-        # ALL ambiguous activities are evaluated in ONE single LLM call.
-        # If all activities matched deterministically, this call is SKIPPED.
-        # ===========================================================
+        _emit("Running In-Scope Evaluation Agent", 55)
         llm_risk_results = []
         if activities_with_contexts:
             print(f"  [LLM] Batch-evaluating {len(activities_with_contexts)} ambiguous activities...")
@@ -249,11 +276,16 @@ class RiskEvaluationAgent:
             reasoning = result.get("reasoning", "")
             matched_baseline_name = result.get("matched_baseline_item")
 
-            # Fallback: use the deterministic partial match if LLM didn't identify one
+            # Fallback: use the pre-resolved canonical_title from the extraction phase
+            pre_resolved = activities_with_contexts[i].get("canonical_title") if i < len(activities_with_contexts) else None
+
+            # Fallback chain: LLM match → deterministic partial match → pre-resolved canonical
             if not matched_baseline_name and i < len(activities_with_contexts):
                 si = activities_with_contexts[i].get("matched_si")
                 if si:
                     matched_baseline_name = si["name"]
+            if not matched_baseline_name and pre_resolved:
+                matched_baseline_name = pre_resolved
 
             # Get source_sentence as evidence
             source_sentence = ""
@@ -309,10 +341,8 @@ class RiskEvaluationAgent:
         out_of_scope_result = {"activities": out_of_scope_activities}
         timeline_result = {"deliverables": timeline_deliverables}
 
-        # ===========================================================
         # STEP 7: Aggregation — LLM CALL #3
-        # Produces overall risk score, summary, and recommendations.
-        # ===========================================================
+        _emit("Calculating Risk Score", 80)
         aggregation_prompt = f"""You are the Risk Aggregation Agent.
 Summarize the following risk evaluation results and compute an overall project risk score.
 
@@ -349,9 +379,8 @@ Output MUST be a valid JSON object:
             "timeline": timeline_result
         }
 
-        # ===========================================================
         # STEP 8: Persist to DB
-        # ===========================================================
+        _emit("Saving Results", 92)
         insert_eval_sql = """
             INSERT INTO risk_evaluations
             (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
@@ -368,17 +397,22 @@ Output MUST be a valid JSON object:
 
         # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):
-            oos_name = oos_item.get('activity', 'Unknown')
-            similar_deliverable = oos_item.get('similar_deliverable', '')
+            oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline
 
-            # Find matching scope item for reference
+            # The canonical title is already resolved — just find matching scope item ID
+            # Look in ALL baseline items (not just IN_SCOPE) so OUT_OF_SCOPE exclusions are found
             matched_scope_id = None
-            matched_scope_name = similar_deliverable
-            for si in scope_items:
-                if si["name"].lower() in similar_deliverable.lower() or similar_deliverable.lower() in si["name"].lower():
+            matched_scope_name = None
+            for si in all_baseline_items:
+                si_norm = _normalize(si["name"])
+                oos_norm = _normalize(oos_name)
+                if si_norm == oos_norm or si_norm in oos_norm or oos_norm in si_norm:
                     matched_scope_id = si["id"]
-                    matched_scope_name = si["name"]
+                    matched_scope_name = si["name"]  # Use exact baseline wording
                     break
+
+            # card_title: prefer the exact baseline wording, else use the already-canonical oos_name
+            card_title = matched_scope_name if matched_scope_name else oos_name
 
             oos_name_clean = oos_name.lower().strip()
             ref_id = None
@@ -409,12 +443,19 @@ Output MUST be a valid JSON object:
 
         # Persist Timeline / Delay risks to tracker
         for deliv in timeline_result.get("deliverables", []):
-            deliv_name = deliv.get('deliverable', 'Unknown')
+            deliv_name = deliv.get('deliverable', 'Unknown')  # Already canonical from pipeline
+
+            # Resolve against ALL baseline items for canonical baseline wording
             matched_scope_name = None
-            for si in scope_items:
-                if si["name"].lower() in deliv_name.lower() or deliv_name.lower() in si["name"].lower():
+            for si in all_baseline_items:
+                si_norm = _normalize(si["name"])
+                deliv_norm = _normalize(deliv_name)
+                if si_norm == deliv_norm or si_norm in deliv_norm or deliv_norm in si_norm:
                     matched_scope_name = si["name"]
                     break
+
+            # card_title: prefer exact baseline wording
+            card_title = matched_scope_name if matched_scope_name else deliv_name
 
             deliv_name_clean = deliv_name.lower().strip()
             ref_id = None
@@ -442,6 +483,7 @@ Output MUST be a valid JSON object:
                     full_reasoning, stakeholders, db_cursor=db_cursor
                 )
 
+        _emit("Completed", 100)
         return {
             "overallRisk": overall_risk,
             "riskScore": risk_score,
