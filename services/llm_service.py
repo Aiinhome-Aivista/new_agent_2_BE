@@ -14,6 +14,8 @@ except ImportError:
 class LLMService:
     @classmethod
     def generate(cls, prompt: str) -> str:
+        # SIMULATE 429 QUOTA ERROR
+        raise Exception("Gemini generation failed: 429 RESOURCE_EXHAUSTED. {'error': {'code': 429, 'message': 'You exceeded your current quota, please check your plan and billing details.'}}")
         if settings.USE_GEMINI:
             try:
                 if not gemini_client:

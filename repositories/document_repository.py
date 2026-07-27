@@ -22,7 +22,7 @@ class DocumentRepository:
     @staticmethod
     def get_documents_by_project(db: mysql.connector.connection.MySQLConnection, project_id: int) -> List[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT id, document_name, document_type, processing_status, uploaded_at FROM documents WHERE project_id = %s", (project_id,))
+        cursor.execute("SELECT id, document_name, document_type, processing_status, processing_error, uploaded_at FROM documents WHERE project_id = %s", (project_id,))
         docs = cursor.fetchall()
         cursor.close()
         return docs
