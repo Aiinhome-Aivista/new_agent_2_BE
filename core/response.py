@@ -75,6 +75,10 @@ class APIStandardResponseMiddleware(BaseHTTPMiddleware):
         if data is not None:
             standard_content["data"] = data
         standard_content["message"] = message
+        if "detail" in original_data:
+            standard_content["detail"] = original_data["detail"]
+        elif not success:
+            standard_content["detail"] = message
         standard_content["success"] = success
         standard_content["status"] = status_str
         standard_content["statuscode"] = response.status_code
