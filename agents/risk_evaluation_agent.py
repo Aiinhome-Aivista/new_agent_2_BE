@@ -411,10 +411,48 @@ Output MUST be a valid JSON object:
             project_id, document_id, risk_score, overall_risk, summary,
             json.dumps(recommendations), json.dumps(sub_agent_results)
         ))
+        
+        risk_eval_id = db_cursor.lastrowid
 
         # Fetch stakeholders for alerts
         db_cursor.execute("SELECT email, role FROM stakeholders WHERE project_id = %s", (project_id,))
         stakeholders = db_cursor.fetchall()
+        
+        # Determine baseline version for progress tracking
+        db_cursor.execute("SELECT version FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
+        bv_row = db_cursor.fetchone()
+        baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
+
+        # Evaluate Deliverable Progress (Execution Status)
+        _emit("Evaluating Deliverable Progress", 95)
+        try:
+            from agents.risk_evaluator_subagents import DeliverableTimelineEvaluationAgent
+            from repositories.baseline_repository import BaselineRepository
+            progress_records = DeliverableTimelineEvaluationAgent.evaluate_progress(
+                approved_baseline_items=scope_items, 
+                document_text=document_text, 
+                risk_eval_output=sub_agent_results
+            )
+            for pr in progress_records:
+                BaselineRepository.insert_deliverable_progress(
+                    db=db_cursor._connection, 
+                    project_id=project_id,
+                    scope_item_id=pr.get("scope_item_id"),
+                    source_document_id=document_id,
+                    risk_evaluation_id=risk_eval_id,
+                    baseline_version=baseline_version,
+                    status_code=pr.get("progress_status", "UNKNOWN"),
+                    progress_percentage=pr.get("progress_percentage"),
+                    execution_summary=pr.get("execution_summary", ""),
+                    dependencies=pr.get("dependencies", []),
+                    confidence=pr.get("confidence", 1.0),
+                    evidence_text=pr.get("evidence_text", "")
+                )
+            db_cursor._connection.commit()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Error evaluating deliverable progress: {e}")
 
         # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):

@@ -170,6 +170,18 @@ class BaselineRepository:
             return None
         cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (baseline["id"],))
         items = cursor.fetchall()
+        
+        for item in items:
+            cursor.execute("""
+                SELECT dp.*, psc.label as status_label, doc.document_name, doc.document_type
+                FROM deliverable_progress dp
+                LEFT JOIN progress_status_config psc ON dp.status_code = psc.status_code
+                LEFT JOIN documents doc ON dp.source_document_id = doc.id
+                WHERE dp.scope_item_id = %s
+                ORDER BY dp.id DESC LIMIT 1
+            """, (item["id"],))
+            item["latest_progress"] = cursor.fetchone()
+            
         cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (baseline["id"],))
         deliverables = cursor.fetchall()
         cursor.close()
@@ -270,3 +282,35 @@ class BaselineRepository:
             (completion_status, item_id, project_id)
         )
         cursor.close()
+
+    @staticmethod
+    def insert_deliverable_progress(
+        db: mysql.connector.connection.MySQLConnection, 
+        project_id: int, 
+        scope_item_id: int, 
+        source_document_id: int, 
+        risk_evaluation_id: int,
+        baseline_version: int,
+        status_code: str, 
+        progress_percentage: Optional[int], 
+        execution_summary: str,
+        dependencies: list,
+        confidence: float,
+        evidence_text: str
+    ) -> None:
+        import json
+        cursor = db.cursor()
+        sql = """
+            INSERT INTO deliverable_progress (
+                project_id, scope_item_id, source_document_id, risk_evaluation_id, baseline_version,
+                status_code, progress_percentage, execution_summary, dependencies, confidence, evidence_text
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(sql, (
+            project_id, scope_item_id, source_document_id, risk_evaluation_id, baseline_version,
+            status_code, progress_percentage, execution_summary, json.dumps(dependencies) if dependencies else "[]", 
+            confidence, evidence_text
+        ))
+        cursor.close()
+

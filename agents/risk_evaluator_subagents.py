@@ -187,3 +187,65 @@ Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER
         return []
 
 
+class DeliverableTimelineEvaluationAgent:
+    @classmethod
+    def evaluate_progress(cls, approved_baseline_items: list, document_text: str, risk_eval_output: list) -> list:
+        """
+        Extracts deliverable progress from the MoM/Status Report.
+        Must strictly adhere to the rule of NEVER inventing percentages.
+        Consolidates multiple references into a single progress record per baseline item.
+        """
+        if not approved_baseline_items:
+            return []
+
+        baseline_block = ""
+        for item in approved_baseline_items:
+            baseline_block += f"- ID: {item.get('id', 'Unknown')} | Deliverable: {item.get('name', 'Unknown')}\n"
+
+        risk_block = ""
+        import json
+        try:
+            risk_block = json.dumps(risk_eval_output, indent=2)
+        except Exception:
+            risk_block = str(risk_eval_output)
+
+        prompt = f"""You are the Deliverable Timeline Evaluation Agent.
+Your job is to extract project execution progress for specific approved baseline deliverables based on the provided document (MoM/Status Report).
+
+=== APPROVED BASELINE DELIVERABLES ===
+{baseline_block}
+
+=== RISK EVALUATION OUTPUT ===
+{risk_block}
+
+=== DOCUMENT TEXT ===
+{document_text}
+
+CRITICAL RULES:
+1. One progress record per approved baseline deliverable ONLY. Do not create duplicates for the same deliverable.
+2. If multiple document statements refer to the same deliverable, consolidate them into a single "execution_summary" and single progress record.
+3. NEVER invent or infer progress percentages. 
+   - Allowed: Document says "60%" -> You output 60.
+   - Allowed: Document says "Completed" -> You output null for percentage, but "COMPLETED" for status.
+   - NOT Allowed: Document says "Completed" -> Output 100%. (Unless the text explicitly says 100%).
+4. Map the progress_status strictly to one of: NOT_STARTED, IN_PROGRESS, BLOCKED, COMPLETED, DELAYED, RESCHEDULED, AT_RISK, PENDING.
+5. Identify any "dependencies" (formerly blockers) if the item is blocked or delayed (e.g., VPN, API credentials, infrastructure).
+
+Output MUST be a valid JSON object with the following schema:
+{{
+  "progress_records": [
+    {{
+      "scope_item_id": 123, // The ID of the baseline item from the input
+      "progress_status": "COMPLETED",
+      "progress_percentage": 60, // integer between 0-100 or null
+      "execution_summary": "Development completed and handed over to QA.",
+      "dependencies": ["VPN Connectivity", "API Credentials"], // List of strings or empty list
+      "confidence": 0.95, // 0.0 - 1.0
+      "evidence_text": "Exact quote from document supporting this status."
+    }}
+  ]
+}}
+"""
+        result = LLMService.generate_json(prompt)
+        return result.get("progress_records", [])
+
