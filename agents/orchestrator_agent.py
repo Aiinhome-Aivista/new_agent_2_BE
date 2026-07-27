@@ -1,6 +1,88 @@
 from agents.status_ingestion_agent import StatusIngestionAgent
 from agents.risk_evaluation_agent import RiskEvaluationAgent
 from typing import Callable, Optional
+import datetime
+import re
+
+def clean_date_value(val):
+    if not val:
+        return None
+    val_str = str(val).strip()
+    if val_str.upper() in ["N/A", "NONE", "NULL", "UNKNOWN", "PENDING", "", "TBD"]:
+        return None
+    
+    # Split to get just the first word if it has noise, e.g. "2026-10-15 or later"
+    val_str = val_str.split()[0]
+    
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%d-%m-%Y", "%d/%m/%Y"):
+        try:
+            return datetime.datetime.strptime(val_str, fmt).date().strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+            
+    match = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', val_str)
+    if match:
+        try:
+            return f"{match.group(1)}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        except ValueError:
+            pass
+            
+    return None
+
+def clean_decimal_value(val):
+    if val is None:
+        return None
+    val_str = str(val).strip().replace('%', '')
+    if val_str.upper() in ["N/A", "NONE", "NULL", "UNKNOWN", ""]:
+        return None
+    try:
+        match = re.search(r'[-+]?\d*\.\d+|\d+', val_str)
+        if match:
+            return float(match.group(0))
+    except ValueError:
+        pass
+    return None
+
+def clean_status_value(val):
+    if not val:
+        return "UNKNOWN"
+    val_str = str(val).upper().strip().replace(' ', '_')
+    allowed = {"NOT_STARTED", "PLANNED", "IN_PROGRESS", "COMPLETED", "BLOCKED", "DELAYED", "UNKNOWN"}
+    if val_str in allowed:
+        return val_str
+    mappings = {
+        "INPROGRESS": "IN_PROGRESS",
+        "NOTSTARTED": "NOT_STARTED",
+        "ON_HOLD": "BLOCKED",
+        "ONHOLD": "BLOCKED",
+        "ACTIVE": "IN_PROGRESS",
+        "STARTED": "IN_PROGRESS",
+        "COMPLETED": "COMPLETED",
+        "DONE": "COMPLETED",
+        "FINISHED": "COMPLETED",
+    }
+    return mappings.get(val_str, "UNKNOWN")
+
+def clean_confidence_value(val):
+    if val is None:
+        return 0.5
+    val_str = str(val).strip().replace('%', '')
+    try:
+        word_map = {
+            "HIGH": 0.9,
+            "MEDIUM": 0.7,
+            "LOW": 0.4,
+            "CRITICAL": 0.95
+        }
+        if val_str.upper() in word_map:
+            return word_map[val_str.upper()]
+        
+        num = float(val_str)
+        if num > 1.0:
+            num = num / 100.0
+        return min(max(num, 0.0), 1.0)
+    except ValueError:
+        return 0.5
 
 class OrchestratorAgent:
     @classmethod
@@ -61,11 +143,17 @@ class OrchestratorAgent:
             sql = """INSERT INTO project_activities 
                      (project_id, document_id, activity_name, description, activity_status, progress_percentage, requested_by, owner, mentioned_deadline, source_page, source_section, evidence_text, confidence)
                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+            
+            cleaned_deadline = clean_date_value(item.get("mentioned_deadline"))
+            cleaned_progress = clean_decimal_value(item.get("progress_percentage"))
+            cleaned_status = clean_status_value(item.get("activity_status"))
+            cleaned_confidence = clean_confidence_value(item.get("confidence"))
+            
             db_cursor.execute(sql, (
                 project_id, document_id, name, item.get("description", ""),
-                item.get("activity_status", "UNKNOWN"), item.get("progress_percentage"), item.get("requested_by"),
-                item.get("owner"), item.get("mentioned_deadline"), item.get("source_page"),
-                item.get("source_section"), item.get("evidence_text", ""), item.get("confidence", 0.5)
+                cleaned_status, cleaned_progress, item.get("requested_by"),
+                item.get("owner"), cleaned_deadline, item.get("source_page"),
+                item.get("source_section"), item.get("evidence_text", ""), cleaned_confidence
             ))
             activity_id = db_cursor.lastrowid
             activity_map[name.lower().strip()] = activity_id
@@ -83,4 +171,15 @@ class OrchestratorAgent:
             request_id = db_cursor.lastrowid
             request_map[name.lower().strip()] = request_id
 
+        # Commit immediately to release S-locks on the documents table
+        # so that emit/progress updates don't hit Lock Wait Timeout during slow LLM calls.
+        try:
+            if hasattr(db_cursor, "connection") and db_cursor.connection:
+                db_cursor.connection.commit()
+            else:
+                db_cursor.execute("COMMIT")
+        except Exception as e:
+            print(f"Warning: failed to commit persisted ingestion data: {e}")
+
         return activity_map, request_map
+
