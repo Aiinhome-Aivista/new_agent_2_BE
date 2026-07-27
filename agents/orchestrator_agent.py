@@ -44,6 +44,7 @@ class OrchestratorAgent:
             )
         except Exception as e:
             print(f"Warning: Multi-Agent risk evaluation failed. Termination handled gracefully. Error: {e}")
+            raise e
 
     @classmethod
     def _persist_ingested_data(cls, project_id: int, document_id: int, extracted_data: dict, db_cursor):
