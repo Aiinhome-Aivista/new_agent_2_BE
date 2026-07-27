@@ -19,22 +19,23 @@ class LLMService:
                 if not gemini_client:
                     raise RuntimeError("Gemini client is not initialized.")
                 
-                # Simple retry logic for 429 Rate Limits
+                # Simple retry logic for 429 Rate Limits and 503 Temporary Spikes
                 import time
-                max_retries = 2
+                max_retries = 4
                 for attempt in range(max_retries):
                     try:
                         response = gemini_client.models.generate_content(
-                            model='gemini-3.5-flash',
+                            model=settings.GEMINI_MODEL,
                             contents=prompt
                         )
                         return response.text
                     except Exception as e:
                         err_str = str(e)
-                        # Only retry on per-minute rate limit, not daily quota exhaustion
-                        if "429" in err_str and "GenerateRequestsPerDayPerProjectPerModel" not in err_str and attempt < max_retries - 1:
-                            wait = 30
-                            print(f"Gemini RPM limit hit. Waiting {wait}s (Attempt {attempt + 1}/{max_retries})...")
+                        is_client_error = any(code in err_str for code in ["400", "401", "403"]) or "GenerateRequestsPerDayPerProjectPerModel" in err_str
+                        
+                        if not is_client_error and attempt < max_retries - 1:
+                            wait = 30 if "429" in err_str else 5
+                            print(f"Gemini error encountered: {err_str}. Waiting {wait}s before retry (Attempt {attempt + 1}/{max_retries})...")
                             time.sleep(wait)
                         else:
                             raise e

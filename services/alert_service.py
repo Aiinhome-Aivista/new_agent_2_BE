@@ -17,7 +17,7 @@ class AlertService:
             
         try:
             msg = MIMEMultipart()
-            msg['From'] = settings.SMTP_EMAIL or "acse@example.com"
+            msg['From'] = settings.SMTP_EMAIL or "acse@support.com"
             msg['To'] = to_email
             msg['Subject'] = subject
             

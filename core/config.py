@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     
     USE_GEMINI: bool = False
     GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3.5-flash"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     CHROMA_PATH: str = "data/chroma_db"

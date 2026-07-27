@@ -89,6 +89,10 @@ def stream_monitoring(
                 yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": "Document not found"})}\n\n'
                 return
 
+            if doc["processing_status"] == "PROCESSING":
+                yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": "Document is already being processed"})}\n\n'
+                return
+
             if doc["document_type"] not in ["STATUS_REPORT", "MOM"]:
                 yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": "Only STATUS_REPORT and MOM can be processed"})}\n\n'
                 return
@@ -96,16 +100,29 @@ def stream_monitoring(
             # ── Emit helper ───────────────────────────────────────────────────
             def emit(step: str, progress: int):
                 event = json.dumps({"step": step, "progress": progress, "status": "running"})
-                # Note: yield inside nested function won't work directly.
-                # We use a queue-based approach via a list.
                 pending_events.append(f"data: {event}\n\n")
+                
+                # Save progress status to database in a thread-safe way
+                try:
+                    update_conn = get_db_connection()
+                    if update_conn:
+                        upd_cursor = update_conn.cursor()
+                        upd_cursor.execute(
+                            "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
+                            (progress, step, document_id)
+                        )
+                        update_conn.commit()
+                        upd_cursor.close()
+                        update_conn.close()
+                except Exception as ex:
+                    print(f"Failed to update progress in DB: {ex}")
 
             pending_events = []
 
             # Mark as PROCESSING
             upd = conn.cursor()
             upd.execute(
-                "UPDATE documents SET processing_status = 'PROCESSING' WHERE id = %s",
+                "UPDATE documents SET processing_status = 'PROCESSING', processing_progress = 5, processing_step = 'Loading Project Baseline', processing_started_at = NOW() WHERE id = %s",
                 (document_id,)
             )
             conn.commit()
@@ -130,8 +147,13 @@ def stream_monitoring(
             pipeline_done = [False]
 
             def run_pipeline():
+                thread_conn = get_db_connection()
+                if not thread_conn:
+                    print("!!! Background pipeline failed to establish db connection !!!")
+                    pipeline_done[0] = True
+                    return
                 try:
-                    cursor = conn.cursor(dictionary=True)
+                    cursor = thread_conn.cursor(dictionary=True)
                     OrchestratorAgent.run_workflow(
                         project_id=project_id,
                         document_id=document_id,
@@ -139,28 +161,42 @@ def stream_monitoring(
                         db_cursor=cursor,
                         emit=emit,
                     )
-                    upd2 = conn.cursor()
+                    upd2 = thread_conn.cursor()
                     upd2.execute(
-                        "UPDATE documents SET processing_status = 'COMPLETED' WHERE id = %s",
+                        "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, processing_step = 'Completed' WHERE id = %s",
                         (document_id,)
                     )
-                    conn.commit()
+                    thread_conn.commit()
                     upd2.close()
                     cursor.close()
                 except Exception as e:
+                    import traceback
+                    print("!!! Pipeline execution failed !!!")
+                    traceback.print_exc()
                     pipeline_error[0] = str(e)
                     try:
-                        conn.rollback()
-                        fail = conn.cursor()
-                        fail.execute(
-                            "UPDATE documents SET processing_status = 'FAILED', processing_error = %s WHERE id = %s",
-                            (str(e)[:500], document_id)
-                        )
-                        conn.commit()
-                        fail.close()
+                        thread_conn.rollback()
                     except Exception:
                         pass
+                    try:
+                        err_conn = get_db_connection()
+                        if err_conn:
+                            err_cursor = err_conn.cursor()
+                            err_cursor.execute(
+                                "UPDATE documents SET processing_status = 'FAILED', processing_error = %s, processing_progress = 0, processing_step = 'Failed' WHERE id = %s",
+                                (str(e)[:500], document_id)
+                            )
+                            err_conn.commit()
+                            err_cursor.close()
+                            err_conn.close()
+                    except Exception as db_ex:
+                        print("!!! Database update during failure handler failed !!!")
+                        traceback.print_exc()
                 finally:
+                    try:
+                        thread_conn.close()
+                    except Exception:
+                        pass
                     pipeline_done[0] = True
 
             thread = threading.Thread(target=run_pipeline, daemon=True)
@@ -246,14 +282,33 @@ def process_monitoring(project_id: int, document_id: int, current_user: dict = D
 @router.get("/progress")
 def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
-    if not document_id:
-        return {"success": True, "data": None}
     
-    doc = DocumentRepository.get_document(db, document_id, project_id)
-    if not doc or doc["processing_status"] == "UPLOADED":
-        return {"success": True, "data": None}
+    if document_id:
+        # Get document and compute elapsed seconds since processing started
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT *, TIMESTAMPDIFF(SECOND, processing_started_at, NOW()) AS elapsed_seconds FROM documents WHERE id = %s AND project_id = %s",
+            (document_id, project_id)
+        )
+        doc = cursor.fetchone()
+        cursor.close()
+        if not doc:
+            return {"success": True, "data": None}
+    else:
+        # Find any document that is currently PROCESSING in this project and compute elapsed seconds
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT *, TIMESTAMPDIFF(SECOND, processing_started_at, NOW()) AS elapsed_seconds FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' LIMIT 1",
+            (project_id,)
+        )
+        doc = cursor.fetchone()
+        cursor.close()
+        if not doc:
+            return {"success": True, "data": None}
+        document_id = doc["id"]
         
     status_map = {
+        "UPLOADED": "pending",
         "PROCESSING": "running",
         "COMPLETED": "completed",
         "FAILED": "failed"
@@ -262,7 +317,12 @@ def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, 
     return {
         "success": True,
         "data": {
+            "document_id": document_id,
+            "document_name": doc["document_name"],
             "status": status_map.get(doc["processing_status"], "running"),
+            "progress": doc.get("processing_progress", 0) if doc.get("processing_progress") is not None else 0,
+            "step": doc.get("processing_step", "") if doc.get("processing_step") is not None else "",
+            "elapsed_seconds": doc.get("elapsed_seconds", 0) if doc.get("elapsed_seconds") is not None else 0,
             "error": doc.get("processing_error")
         }
     }
