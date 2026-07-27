@@ -300,7 +300,7 @@ def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, 
         # Find any document that is currently PROCESSING in this project and compute elapsed seconds
         cursor = db.cursor(dictionary=True)
         cursor.execute(
-            "SELECT *, TIMESTAMPDIFF(SECOND, processing_started_at, NOW()) AS elapsed_seconds FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' LIMIT 1",
+            "SELECT *, TIMESTAMPDIFF(SECOND, processing_started_at, NOW()) AS elapsed_seconds FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' AND (processing_started_at >= NOW() - INTERVAL 15 MINUTE OR processing_started_at IS NULL) ORDER BY id DESC LIMIT 1",
             (project_id,)
         )
         doc = cursor.fetchone()
@@ -321,6 +321,7 @@ def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, 
         "data": {
             "document_id": document_id,
             "document_name": doc["document_name"],
+            "document_type": doc.get("document_type", ""),
             "status": status_map.get(doc["processing_status"], "running"),
             "progress": doc.get("processing_progress", 0) if doc.get("processing_progress") is not None else 0,
             "step": doc.get("processing_step", "") if doc.get("processing_step") is not None else "",
