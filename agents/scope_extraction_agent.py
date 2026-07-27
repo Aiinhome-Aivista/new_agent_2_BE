@@ -90,7 +90,35 @@ Implicit Scope Inference Rules:
 2. If the text says "The client is responsible for..." or "Assuming the client provides...", classify as OUT_OF_SCOPE (Client Responsibility).
 3. If the text lists assumptions like "Assuming no data migration is needed", extract "Data Migration" and classify as OUT_OF_SCOPE.
 
+Evidence Rules:
+1. Evidence MUST be taken ONLY from the section where the item was actually extracted.
+2. NEVER cite unrelated document sections in the evidence text (e.g., do not cite 'Out of Scope' for an IN_SCOPE item).
+3. The explanation must always be internally consistent with the final classification.
+
 Document Text:
 {document_text}
 """
-        return LLMService.generate_json(prompt)
+        result = LLMService.generate_json(prompt)
+        
+        # Deterministic Validation: Sanitize contradictory evidence metadata
+        if isinstance(result, dict) and "scope_items" in result:
+            for item in result["scope_items"]:
+                stype = item.get("scope_type", "")
+                evidence = (item.get("evidence_text") or "").lower()
+                section = (item.get("source_section") or "").lower()
+                
+                # Check for contradictory evidence in IN_SCOPE items
+                if stype == "IN_SCOPE":
+                    if "out of scope" in evidence or "out of scope" in section or "client responsibility" in evidence or "customer responsibility" in evidence:
+                        item["evidence_text"] = "Extracted from document as an in-scope deliverable."
+                        if "out of scope" in section:
+                            item["source_section"] = "General"
+                            
+                # Check for contradictory evidence in OUT_OF_SCOPE items
+                elif stype == "OUT_OF_SCOPE":
+                    if "in scope" in evidence or "vendor responsibility" in evidence or "firm is responsible" in evidence:
+                        item["evidence_text"] = "Extracted from document as out of scope or a client assumption/responsibility."
+                        if "in scope" in section:
+                            item["source_section"] = "General"
+
+        return result

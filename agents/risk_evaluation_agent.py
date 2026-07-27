@@ -38,36 +38,13 @@ def _strip_date_from_title(title: str) -> str:
 def _resolve_tracker_title(activity_name: str, matched_baseline_item: str,
                            in_scope_items: list, all_baseline_items: list = None) -> tuple:
     """
-    Implements the Tracker Title Priority rule:
-      1. Matched IN_SCOPE baseline item name  → (canonical_name, True)
-      2. Matched OUT_OF_SCOPE baseline item   → (canonical_name, False)
-      3. Normalized activity name             → (activity_name, False)
-
-    Uses all_baseline_items to resolve canonical names for OUT_OF_SCOPE entries.
+    Implements the Tracker Title Priority rule by delegating to NormalizationService.
     Returns (canonical_title, is_confirmed_in_scope)
     """
-    all_items = (all_baseline_items or []) + (in_scope_items or [])
-
-    if matched_baseline_item:
-        norm_match = _normalize(matched_baseline_item)
-
-        # Priority 1: check IN_SCOPE items first
-        for si in in_scope_items:
-            si_norm = _normalize(si["name"])
-            if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
-                return _strip_date_from_title(si["name"]), True
-
-        # Priority 2: check ALL baseline items (including OUT_OF_SCOPE exclusions)
-        for si in all_items:
-            si_norm = _normalize(si["name"])
-            if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
-                return _strip_date_from_title(si["name"]), False
-
-        # Priority 2 fallback: use whatever the LLM said (already normalized)
-        return _strip_date_from_title(matched_baseline_item), False
-
-    # Priority 3: no baseline match — use normalized activity name
-    return _strip_date_from_title(activity_name), False
+    from services.normalization_service import NormalizationService
+    return NormalizationService.resolve_canonical_entity(
+        activity_name, matched_baseline_item, in_scope_items, all_baseline_items
+    )
 
 
 def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
@@ -313,6 +290,15 @@ class RiskEvaluationAgent:
                 activity_name, matched_baseline_name, scope_items, all_baseline_items
             )
 
+            # Look up the original contract sentence for evidence
+            original_contract_sentence = ""
+            for si in all_baseline_items:
+                si_norm = _normalize(si["name"])
+                c_norm = _normalize(canonical_title)
+                if si_norm == c_norm or si_norm in c_norm or c_norm in si_norm:
+                    original_contract_sentence = si.get("name", "")
+                    break
+
             # CRITICAL: If item is confirmed IN_SCOPE, it can NEVER be SCOPE_CREEP.
             if is_confirmed_in_scope and risk_cat == "SCOPE_CREEP":
                 print(f"  [Override] '{activity_name}' is IN approved baseline — overriding SCOPE_CREEP to NONE")
@@ -339,6 +325,7 @@ class RiskEvaluationAgent:
                 breakdown=score_breakdown,
                 mom_evidence=source_sentence,
                 llm_reasoning=reasoning,
+                original_contract_sentence=original_contract_sentence,
             )
 
             if risk_cat == "SCOPE_CREEP":
@@ -433,18 +420,7 @@ Output MUST be a valid JSON object:
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline
 
-            # Look in ALL baseline items (not just IN_SCOPE) for canonical wording + ID
-            matched_scope_id = None
-            matched_scope_name = None
-            for si in all_baseline_items:
-                si_norm = _normalize(si["name"])
-                oos_norm = _normalize(oos_name)
-                if si_norm == oos_norm or si_norm in oos_norm or oos_norm in si_norm:
-                    matched_scope_id = si["id"]
-                    matched_scope_name = si["name"]  # Exact baseline wording
-                    break
-
-            card_title = matched_scope_name if matched_scope_name else oos_name
+            card_title = oos_name
 
             oos_name_clean = oos_name.lower().strip()
             ref_id = None
@@ -478,16 +454,7 @@ Output MUST be a valid JSON object:
         for deliv in timeline_result.get("deliverables", []):
             deliv_name = deliv.get('deliverable', 'Unknown')  # Already canonical from pipeline
 
-            # Resolve against ALL baseline items for canonical baseline wording
-            matched_scope_name = None
-            for si in all_baseline_items:
-                si_norm = _normalize(si["name"])
-                deliv_norm = _normalize(deliv_name)
-                if si_norm == deliv_norm or si_norm in deliv_norm or deliv_norm in si_norm:
-                    matched_scope_name = si["name"]
-                    break
-
-            card_title = matched_scope_name if matched_scope_name else deliv_name
+            card_title = deliv_name
 
             deliv_name_clean = deliv_name.lower().strip()
             ref_id = None
