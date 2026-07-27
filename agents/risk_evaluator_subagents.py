@@ -76,17 +76,24 @@ class BatchActivityRiskAgent:
     @classmethod
     def evaluate_batch(cls, activities_with_contexts: list) -> list:
         """
-        STEP 4: Batch risk evaluation.
+        PHASE 1: Batch risk diagnosis.
         Evaluates ALL ambiguous activities in a SINGLE LLM call.
-        Each activity gets its own compact context built from ChromaDB + MySQL.
-        
+
+        The LLM's job here is DIAGNOSIS ONLY — it identifies:
+          - What category of risk exists (SCOPE_CREEP / DELAY / DEPENDENCY / BLOCKED / NONE)
+          - Which diagnostic signals are present (deadline_missed, customer_dependency, etc.)
+          - What the business impact level is (LOW / MEDIUM / HIGH)
+          - How confident it is (0.0–1.0)
+
+        The LLM does NOT produce a numeric score.
+        Scoring happens in Phase 2 (RiskScoringEngine) using deterministic weighted rules.
+
         KEY RULE — Tracker Title Priority:
         1. If a matched_baseline_item exists in the approved IN_SCOPE baseline → use that as title.
         2. If it matches an OUT_OF_SCOPE/excluded item → use that as title.
         3. Only if NO baseline match exists → use the normalized activity name as title.
-        
+
         CRITICAL: An approved IN_SCOPE baseline item can NEVER be classified as SCOPE_CREEP.
-        If the baseline context shows the item is IN the approved scope, classify as NONE or DELAY/DEPENDENCY.
         """
         if not activities_with_contexts:
             return []
@@ -101,9 +108,12 @@ Baseline Context:
 {item['context']}
 """
 
-        prompt = f"""You are the Activity Risk Evaluation Agent.
+        prompt = f"""You are the Activity Risk Diagnosis Agent (Phase 1).
 The Risk Tracker is a contractual monitoring system. Every item must represent a contractual
 deliverable or scope request — not an activity log entry.
+
+Your job is DIAGNOSIS ONLY. You identify what kind of risk exists and which signals are present.
+You do NOT calculate numeric scores — that happens deterministically after your output.
 
 Evaluate each of the following activities using ONLY their provided baseline context.
 
@@ -111,32 +121,60 @@ Evaluate each of the following activities using ONLY their provided baseline con
 
 RULES:
 1. TRACKER TITLE PRIORITY (in order):
-   a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item". Category CANNOT be SCOPE_CREEP.
-   b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name. Category is SCOPE_CREEP.
-   c. If NO baseline match exists → use the normalized activity name. Category is SCOPE_CREEP.
-   
-2. RISK CATEGORIES:
+   a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item". risk_category CANNOT be SCOPE_CREEP.
+   b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name. risk_category is SCOPE_CREEP.
+   c. If NO baseline match exists → use the normalized activity name. risk_category is SCOPE_CREEP.
+
+2. RISK CATEGORIES (pick ONE per activity):
    - SCOPE_CREEP: Activity has NO approved IN_SCOPE baseline match (new request or excluded item).
-   - DELAY: Deliverable is behind schedule or past its deadline.
-   - DEPENDENCY: Blocked waiting for client/third party (customer responsibility items).
-   - BLOCKED: Explicitly blocked.
-   - NONE: On-track and within approved scope.
+   - DELAY: Deliverable is behind schedule or has missed its contractual deadline.
+   - DEPENDENCY: Blocked waiting for client/third party obligation (VPN, API creds, infra).
+   - BLOCKED: Explicitly blocked by a technical or organizational issue.
+   - NONE: On-track and within approved scope with no blockers.
 
-3. NEVER classify an approved IN_SCOPE baseline item as SCOPE_CREEP.
+3. DIAGNOSTIC SIGNALS — for each activity, identify which signals are TRUE:
+   - deadline_missed: The contractual or mentioned deadline has passed or is at immediate risk.
+   - customer_dependency: A customer obligation (VPN, API credentials, infrastructure, access) is pending.
+   - technical_dependency: An internal technical dependency is blocking progress.
+   - progress_behind: Stated or implied progress is behind expected pace.
+   - milestone_slipping: A named project milestone (UAT, Go Live, delivery) is slipping.
+   - missing_deliverable: A contractual deliverable has no evidence of progress at all.
 
-4. TRACKER IDENTITY: The matched_baseline_item must be the canonical baseline name, not the MoM wording.
+4. NEVER classify an approved IN_SCOPE baseline item as SCOPE_CREEP.
+
+5. TRACKER IDENTITY: matched_baseline_item must be the canonical baseline name, not the MoM wording.
    The same baseline item must produce the same tracker title across different MoMs.
-   - "CRM Integration development completed" → matched_baseline_item: "CRM Integration"
-   - "CRM module delivered" → matched_baseline_item: "CRM Integration" (same item!)
+
+6. CANONICAL TITLES: matched_baseline_item must be the SHORT business entity name.
+   - Use: "VPN Connectivity", NOT "Customer shall provide VPN connectivity"
+   - Use: "Azure AD SSO", NOT "The Vendor shall configure Azure AD SSO by 25 April 2026"
+   - Use: "API Credentials", NOT "Customer shall provide API credentials"
+   The original contractual sentence belongs in "reasoning" only.
+
+7. BUSINESS IMPACT:
+   - HIGH: Blocks a core contractual deliverable, threatens project viability.
+   - MEDIUM: Causes schedule risk or partial scope impact.
+   - LOW: Minor or easily recoverable issue.
+
+8. CONFIDENCE: 0.0–1.0 — how strongly does the baseline context support your diagnosis?
 
 Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
 [
   {{
     "activity": "Activity name as given",
-    "matched_baseline_item": "Canonical baseline scope item name, or null if no match",
+    "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
     "risk_category": "SCOPE_CREEP|DELAY|DEPENDENCY|BLOCKED|NONE",
-    "risk_level": "LOW|MEDIUM|HIGH|CRITICAL",
-    "reasoning": "Short explanation citing the baseline context."
+    "signals": {{
+      "deadline_missed": false,
+      "customer_dependency": false,
+      "technical_dependency": false,
+      "progress_behind": false,
+      "milestone_slipping": false,
+      "missing_deliverable": false
+    }},
+    "business_impact": "LOW|MEDIUM|HIGH",
+    "confidence": 0.85,
+    "reasoning": "Short explanation citing the baseline context. Use the original MoM sentence as evidence here."
   }}
 ]
 """
@@ -147,3 +185,5 @@ Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER
             if key in result:
                 return result[key]
         return []
+
+

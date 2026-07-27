@@ -4,7 +4,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
+from core.risk_config_tables import create_risk_config_tables
 from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag
+
+# Initialize config tables on startup (idempotent — CREATE TABLE IF NOT EXISTS)
+create_risk_config_tables()
+
 app = FastAPI(
     title=settings.APP_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
