@@ -1,5 +1,6 @@
 # pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+# pyrefly: ignore [missing-import]
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
@@ -102,14 +103,10 @@ def stream_monitoring(
 
             pending_events = []
 
-            # Mark as PROCESSING
-            upd = conn.cursor()
-            upd.execute(
-                "UPDATE documents SET processing_status = 'PROCESSING' WHERE id = %s",
-                (document_id,)
-            )
-            conn.commit()
-            upd.close()
+            # ── IMPORTANT: Do NOT update document processing_status here ────────
+            # The document processing_status reflects the VectorDB ingestion (play button).
+            # Risk calculation is a separate independent operation.
+            # Touching it here would overwrite the upload status with risk status.
 
             # ── Initial event ─────────────────────────────────────────────────
             yield f'data: {json.dumps({"step": "Loading Project Baseline", "progress": 5, "status": "running"})}\n\n'
@@ -151,13 +148,17 @@ def stream_monitoring(
                     pipeline_error[0] = str(e)
                     try:
                         conn.rollback()
-                        fail = conn.cursor()
-                        fail.execute(
-                            "UPDATE documents SET processing_status = 'FAILED', processing_error = %s WHERE id = %s",
-                            (str(e)[:500], document_id)
+                        # IMPORTANT: Do NOT set processing_status = 'FAILED' here.
+                        # That field belongs to the document upload/VectorDB ingestion step.
+                        # Resetting to UPLOADED so the document upload section is unaffected.
+                        # The risk evaluation error is communicated via SSE to the frontend.
+                        reset = conn.cursor()
+                        reset.execute(
+                            "UPDATE documents SET processing_status = 'UPLOADED' WHERE id = %s AND processing_status NOT IN ('COMPLETED')",
+                            (document_id,)
                         )
                         conn.commit()
-                        fail.close()
+                        reset.close()
                     except Exception:
                         pass
                 finally:
