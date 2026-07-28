@@ -1,7 +1,10 @@
 import json
+import re
 from typing import Callable, Optional
 from services.llm_service import LLMService
 from services.project_knowledge_service import ProjectKnowledgeService
+from services.risk_config_service import RiskConfigurationService
+from services.risk_scoring_engine import RiskScoringEngine
 from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivityRiskAgent
 from agents.tracker_audit_agent import TrackerAuditAgent
 from agents.alerting_agent import AlertingAgent
@@ -17,8 +20,7 @@ def _normalize(text: str) -> str:
     words = text.lower().strip().split()
     return " ".join(w for w in words if w not in stop_words)
 
-
-import re
+# (re already imported at top)
 
 def _strip_date_from_title(title: str) -> str:
     """
@@ -143,7 +145,15 @@ class RiskEvaluationAgent:
             if emit:
                 emit(step, pct)
 
-        # Fetch IN_SCOPE items for risk evaluation and title resolution
+        # ── Load config from DB via caching service (Phase 2 inputs) ──────────
+        # These come from risk_parameter_config, risk_threshold_config, etc.
+        # Config changes take effect immediately without deployment.
+        risk_params    = RiskConfigurationService.get_parameters(db_cursor)
+        risk_thresholds = RiskConfigurationService.get_thresholds(db_cursor)
+        risk_rules     = RiskConfigurationService.get_rules(db_cursor)
+        impact_matrix  = RiskConfigurationService.get_impact_matrix(db_cursor)
+        alert_rules    = RiskConfigurationService.get_alert_rules(db_cursor)
+
         _emit("Loading Project Baseline", 10)
         scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
 
@@ -272,9 +282,15 @@ class RiskEvaluationAgent:
         for i, result in enumerate(llm_risk_results):
             activity_name = result.get("activity", "Unknown")
             risk_cat = result.get("risk_category", "NONE")
-            risk_lvl = result.get("risk_level", "LOW")
             reasoning = result.get("reasoning", "")
             matched_baseline_name = result.get("matched_baseline_item")
+
+            # Phase 1 multi-dimensional signals from LLM
+            signals = result.get("signals", {})
+            if not isinstance(signals, dict):
+                signals = {}
+            confidence   = float(result.get("confidence", 0.7))
+            business_impact = result.get("business_impact", "LOW")
 
             # Fallback: use the pre-resolved canonical_title from the extraction phase
             pre_resolved = activities_with_contexts[i].get("canonical_title") if i < len(activities_with_contexts) else None
@@ -298,26 +314,42 @@ class RiskEvaluationAgent:
             )
 
             # CRITICAL: If item is confirmed IN_SCOPE, it can NEVER be SCOPE_CREEP.
-            # However, DELAY, DEPENDENCY, and BLOCKED are still valid for IN_SCOPE items.
-            # Example: "CRM Integration delayed" → IN_SCOPE + DELAY (correct)
-            #          "CRM Integration is new scope" → IN_SCOPE + SCOPE_CREEP → overridden to NONE (correct)
             if is_confirmed_in_scope and risk_cat == "SCOPE_CREEP":
-                print(f"  [Override] '{activity_name}' is IN approved baseline — overriding SCOPE_CREEP to NONE (DELAY/DEP/BLOCKED still valid)")
+                print(f"  [Override] '{activity_name}' is IN approved baseline — overriding SCOPE_CREEP to NONE")
                 risk_cat = "NONE"
-                risk_lvl = "LOW"
 
-            # Build full evidence string (MoM sentence + LLM reasoning)
-            full_evidence = f"MoM Evidence: {source_sentence}" if source_sentence else ""
-            if reasoning:
-                full_evidence = f"{full_evidence}\nAnalysis: {reasoning}".strip()
+            # ── PHASE 2: Deterministic Weighted Scoring ───────────────────────
+            # LLM (Phase 1) diagnosed WHAT risk exists and which signals are present.
+            # RiskScoringEngine (Phase 2) calculates HOW SEVERE deterministically.
+            item_risk_score, score_breakdown = RiskScoringEngine.calculate(
+                risk_category=risk_cat,
+                signals=signals,
+                confidence=confidence,
+                business_impact=business_impact,
+                params=risk_params,
+                impact_matrix=impact_matrix,
+                rules=risk_rules,
+            )
+            item_risk_level = RiskConfigurationService.classify_severity(item_risk_score, risk_thresholds)
+
+            # Evidence-backed reasoning with full score breakdown
+            full_evidence = RiskScoringEngine.format_reasoning(
+                score=item_risk_score,
+                severity=item_risk_level,
+                breakdown=score_breakdown,
+                mom_evidence=source_sentence,
+                llm_reasoning=reasoning,
+            )
 
             if risk_cat == "SCOPE_CREEP":
                 out_of_scope_activities.append({
                     "activity": canonical_title,
-                    "classification": "OUT_OF_SCOPE" if risk_lvl in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
+                    "classification": "OUT_OF_SCOPE" if item_risk_level in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
                     "reason": full_evidence,
                     "similar_deliverable": matched_baseline_name or canonical_title,
-                    "confidence": 90
+                    "confidence": int(confidence * 100),
+                    "risk_score": item_risk_score,
+                    "risk_level": item_risk_level,
                 })
             elif risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
                 timeline_deliverables.append({
@@ -325,16 +357,18 @@ class RiskEvaluationAgent:
                     "expected_date": "Unknown",
                     "current_status": "Delayed" if risk_cat == "DELAY" else "Blocked",
                     "delay_days": 0,
-                    "blockers": [full_evidence],
+                    "blockers": [source_sentence] if source_sentence else [],
                     "dependency_status": risk_cat,
-                    "risk": risk_lvl
+                    "risk": item_risk_level,
+                    "risk_score": item_risk_score,
+                    "reasoning": full_evidence,
                 })
             else:
                 in_scope_activities.append({
                     "activity": canonical_title,
                     "classification": "IN_SCOPE",
                     "deliverable": canonical_title,
-                    "confidence": 90
+                    "confidence": int(confidence * 100),
                 })
 
         in_scope_result = {"activities": in_scope_activities}
@@ -399,8 +433,7 @@ Output MUST be a valid JSON object:
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline
 
-            # The canonical title is already resolved — just find matching scope item ID
-            # Look in ALL baseline items (not just IN_SCOPE) so OUT_OF_SCOPE exclusions are found
+            # Look in ALL baseline items (not just IN_SCOPE) for canonical wording + ID
             matched_scope_id = None
             matched_scope_name = None
             for si in all_baseline_items:
@@ -408,10 +441,9 @@ Output MUST be a valid JSON object:
                 oos_norm = _normalize(oos_name)
                 if si_norm == oos_norm or si_norm in oos_norm or oos_norm in si_norm:
                     matched_scope_id = si["id"]
-                    matched_scope_name = si["name"]  # Use exact baseline wording
+                    matched_scope_name = si["name"]  # Exact baseline wording
                     break
 
-            # card_title: prefer the exact baseline wording, else use the already-canonical oos_name
             card_title = matched_scope_name if matched_scope_name else oos_name
 
             oos_name_clean = oos_name.lower().strip()
@@ -421,12 +453,11 @@ Output MUST be a valid JSON object:
                     ref_id = act_id
                     break
 
-            confidence_val = oos_item.get('confidence', 90) / 100.0
-            reasoning = f"{oos_item.get('reason', '')} (Confidence: {oos_item.get('confidence', 90)}%)"
-            full_reasoning = f"Activity: {oos_name}\n{reasoning}"
-            item_risk_score = 80 if oos_item.get('classification') == 'OUT_OF_SCOPE' else 50
-            item_risk_level = 'HIGH' if oos_item.get('classification') == 'OUT_OF_SCOPE' else 'MEDIUM'
-            card_title = matched_scope_name if matched_scope_name else oos_name
+            # Phase 2 scores already calculated — read directly from the item
+            item_risk_score = oos_item.get('risk_score', 50)
+            item_risk_level = oos_item.get('risk_level', 'MEDIUM')
+            confidence_val  = oos_item.get('confidence', 70) / 100.0
+            full_reasoning  = oos_item.get('reason', f'Activity: {oos_name}')
 
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, 'ACTIVITY',
@@ -435,7 +466,9 @@ Output MUST be a valid JSON object:
                 title=card_title, reference_id=ref_id
             )
 
-            if item_risk_score >= 70:
+            # Use alert threshold from DB config (not hardcoded 70)
+            oos_alert_rule = alert_rules.get(item_risk_level, {})
+            if oos_alert_rule.get('send_email') and item_risk_score >= oos_alert_rule.get('min_score_threshold', 70):
                 AlertingAgent.dispatch_alert(
                     project_id, f"Scope Creep Risk: {card_title}",
                     full_reasoning, stakeholders, db_cursor=db_cursor
@@ -454,7 +487,6 @@ Output MUST be a valid JSON object:
                     matched_scope_name = si["name"]
                     break
 
-            # card_title: prefer exact baseline wording
             card_title = matched_scope_name if matched_scope_name else deliv_name
 
             deliv_name_clean = deliv_name.lower().strip()
@@ -464,11 +496,10 @@ Output MUST be a valid JSON object:
                     ref_id = act_id
                     break
 
-            reasoning = f"Status: {deliv.get('current_status')}. Blockers: {', '.join(deliv.get('blockers', []))}"
-            full_reasoning = f"Deliverable: {deliv_name}\n{reasoning}"
-            item_risk_score = 85 if deliv.get('risk') == 'CRITICAL' else 65
-            item_risk_level = deliv.get('risk', 'HIGH')
-            card_title = matched_scope_name if matched_scope_name else deliv_name
+            # Phase 2 scores already calculated — read directly from item
+            item_risk_score = deliv.get('risk_score', 40)
+            item_risk_level = deliv.get('risk', 'MEDIUM')
+            full_reasoning  = deliv.get('reasoning', f"Deliverable: {deliv_name}")
 
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, 'ACTION_ITEM',
@@ -477,7 +508,9 @@ Output MUST be a valid JSON object:
                 title=card_title, reference_id=ref_id
             )
 
-            if item_risk_score >= 70:
+            # Use alert threshold from DB config (not hardcoded 70)
+            delay_alert_rule = alert_rules.get(item_risk_level, {})
+            if delay_alert_rule.get('send_email') and item_risk_score >= delay_alert_rule.get('min_score_threshold', 70):
                 AlertingAgent.dispatch_alert(
                     project_id, f"Delay Risk: {card_title}",
                     full_reasoning, stakeholders, db_cursor=db_cursor

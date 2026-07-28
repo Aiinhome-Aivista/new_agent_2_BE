@@ -29,8 +29,17 @@ def truncate_all_except_users():
         tables = [row[0] for row in cursor.fetchall()]
         
         cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+        preserve_tables = [
+            'users', 
+            'master_document_types',
+            'risk_parameter_config',
+            'risk_threshold_config',
+            'business_rule_config',
+            'impact_matrix',
+            'alert_rule_config'
+        ]
         for table in tables:
-            if table.lower() not in ['users', 'master_document_types']:
+            if table.lower() not in preserve_tables:
                 print(f"Truncating table: {table}")
                 cursor.execute(f"TRUNCATE TABLE {table}")
         cursor.execute("SET FOREIGN_KEY_CHECKS = 1")

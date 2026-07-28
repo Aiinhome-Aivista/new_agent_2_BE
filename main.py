@@ -4,7 +4,12 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
+from core.risk_config_tables import create_risk_config_tables
 from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag
+
+# Initialize config tables on startup (idempotent — CREATE TABLE IF NOT EXISTS)
+create_risk_config_tables()
+
 app = FastAPI(
     title=settings.APP_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
@@ -53,4 +58,38 @@ def startup_event():
 @app.get("/")
 def root():
     return {"message": "Welcome to Autonomous Contract Scope Evaluator (ACSE) API"}
+
+@app.on_event("startup")
+def run_migrations_started_at():
+    print("Running database migration for started_at column...")
+    from core.database import get_db_connection
+    conn = get_db_connection()
+    if not conn:
+        print("Migration: Failed to connect.")
+        return
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SHOW COLUMNS FROM documents LIKE 'processing_started_at'")
+        col_exists = cursor.fetchone()
+        if not col_exists:
+            print("Migration: Adding 'processing_started_at' column...")
+            cursor.execute("ALTER TABLE documents ADD COLUMN processing_started_at TIMESTAMP NULL DEFAULT NULL")
+            conn.commit()
+            print("Migration: Column added.")
+        else:
+            print("Migration: Column already exists.")
+            
+        # Clear stuck processing states
+        print("Migration: Resetting stuck PROCESSING documents...")
+        cursor.execute("UPDATE documents SET processing_status = 'FAILED', processing_error = 'Server restarted or process crashed', processing_progress = 0, processing_step = 'Failed' WHERE processing_status = 'PROCESSING'")
+        conn.commit()
+        print("Migration: Reset complete.")
+        
+        cursor.close()
+    except Exception as e:
+        print(f"Migration error: {e}")
+    finally:
+        conn.close()
+
+
 

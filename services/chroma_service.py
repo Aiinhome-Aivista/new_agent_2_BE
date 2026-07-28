@@ -2,24 +2,30 @@ import chromadb
 from chromadb.config import Settings as ChromaSettings
 from core.config import settings
 import os
+import threading
 
 class ChromaService:
     _client = None
     _collection = None
+    _lock = threading.RLock()
 
     @classmethod
     def get_client(cls):
         if cls._client is None:
-            db_path = os.path.abspath(settings.CHROMA_PATH)
-            os.makedirs(db_path, exist_ok=True)
-            cls._client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))
+            with cls._lock:
+                if cls._client is None:
+                    db_path = os.path.abspath(settings.CHROMA_PATH)
+                    os.makedirs(db_path, exist_ok=True)
+                    cls._client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))
         return cls._client
 
     @classmethod
     def get_collection(cls):
         if cls._collection is None:
-            client = cls.get_client()
-            cls._collection = client.get_or_create_collection(name="acse_documents")
+            with cls._lock:
+                if cls._collection is None:
+                    client = cls.get_client()
+                    cls._collection = client.get_or_create_collection(name="acse_documents")
         return cls._collection
 
     @classmethod
