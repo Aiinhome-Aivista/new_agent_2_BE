@@ -87,3 +87,13 @@ class TrackerRepository:
         item = cursor.fetchone()
         cursor.close()
         return item
+
+    @staticmethod
+    def reactivate_item(db: mysql.connector.connection.MySQLConnection, item_id: int) -> None:
+        cursor = db.cursor()
+        cursor.execute("""
+            UPDATE tracker_items 
+            SET resolution = NULL, status = 'OPEN', resolved_by = NULL, resolved_at = NULL 
+            WHERE id = %s
+        """, (item_id,))
+        cursor.close()
