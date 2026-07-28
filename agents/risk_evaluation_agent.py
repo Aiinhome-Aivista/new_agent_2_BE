@@ -38,36 +38,13 @@ def _strip_date_from_title(title: str) -> str:
 def _resolve_tracker_title(activity_name: str, matched_baseline_item: str,
                            in_scope_items: list, all_baseline_items: list = None) -> tuple:
     """
-    Implements the Tracker Title Priority rule:
-      1. Matched IN_SCOPE baseline item name  → (canonical_name, True)
-      2. Matched OUT_OF_SCOPE baseline item   → (canonical_name, False)
-      3. Normalized activity name             → (activity_name, False)
-
-    Uses all_baseline_items to resolve canonical names for OUT_OF_SCOPE entries.
+    Implements the Tracker Title Priority rule by delegating to NormalizationService.
     Returns (canonical_title, is_confirmed_in_scope)
     """
-    all_items = (all_baseline_items or []) + (in_scope_items or [])
-
-    if matched_baseline_item:
-        norm_match = _normalize(matched_baseline_item)
-
-        # Priority 1: check IN_SCOPE items first
-        for si in in_scope_items:
-            si_norm = _normalize(si["name"])
-            if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
-                return _strip_date_from_title(si["name"]), True
-
-        # Priority 2: check ALL baseline items (including OUT_OF_SCOPE exclusions)
-        for si in all_items:
-            si_norm = _normalize(si["name"])
-            if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
-                return _strip_date_from_title(si["name"]), False
-
-        # Priority 2 fallback: use whatever the LLM said (already normalized)
-        return _strip_date_from_title(matched_baseline_item), False
-
-    # Priority 3: no baseline match — use normalized activity name
-    return _strip_date_from_title(activity_name), False
+    from services.normalization_service import NormalizationService
+    return NormalizationService.resolve_canonical_entity(
+        activity_name, matched_baseline_item, in_scope_items, all_baseline_items
+    )
 
 
 def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
@@ -313,6 +290,15 @@ class RiskEvaluationAgent:
                 activity_name, matched_baseline_name, scope_items, all_baseline_items
             )
 
+            # Look up the original contract sentence for evidence
+            original_contract_sentence = ""
+            for si in all_baseline_items:
+                si_norm = _normalize(si["name"])
+                c_norm = _normalize(canonical_title)
+                if si_norm == c_norm or si_norm in c_norm or c_norm in si_norm:
+                    original_contract_sentence = si.get("name", "")
+                    break
+
             # CRITICAL: If item is confirmed IN_SCOPE, it can NEVER be SCOPE_CREEP.
             if is_confirmed_in_scope and risk_cat == "SCOPE_CREEP":
                 print(f"  [Override] '{activity_name}' is IN approved baseline — overriding SCOPE_CREEP to NONE")
@@ -339,6 +325,7 @@ class RiskEvaluationAgent:
                 breakdown=score_breakdown,
                 mom_evidence=source_sentence,
                 llm_reasoning=reasoning,
+                original_contract_sentence=original_contract_sentence,
             )
 
             if risk_cat == "SCOPE_CREEP":
@@ -424,27 +411,54 @@ Output MUST be a valid JSON object:
             project_id, document_id, risk_score, overall_risk, summary,
             json.dumps(recommendations), json.dumps(sub_agent_results)
         ))
+        
+        risk_eval_id = db_cursor.lastrowid
 
         # Fetch stakeholders for alerts
         db_cursor.execute("SELECT email, role FROM stakeholders WHERE project_id = %s", (project_id,))
         stakeholders = db_cursor.fetchall()
+        
+        # Determine baseline version for progress tracking
+        db_cursor.execute("SELECT version FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
+        bv_row = db_cursor.fetchone()
+        baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
+
+        # Evaluate Deliverable Progress (Execution Status)
+        _emit("Evaluating Deliverable Progress", 95)
+        try:
+            from agents.risk_evaluator_subagents import DeliverableTimelineEvaluationAgent
+            from repositories.baseline_repository import BaselineRepository
+            progress_records = DeliverableTimelineEvaluationAgent.evaluate_progress(
+                approved_baseline_items=scope_items, 
+                document_text=document_text, 
+                risk_eval_output=sub_agent_results
+            )
+            for pr in progress_records:
+                BaselineRepository.insert_deliverable_progress(
+                    db=db_cursor._connection, 
+                    project_id=project_id,
+                    scope_item_id=pr.get("scope_item_id"),
+                    source_document_id=document_id,
+                    risk_evaluation_id=risk_eval_id,
+                    baseline_version=baseline_version,
+                    status_code=pr.get("progress_status", "UNKNOWN"),
+                    progress_percentage=pr.get("progress_percentage"),
+                    execution_summary=pr.get("execution_summary", ""),
+                    dependencies=pr.get("dependencies", []),
+                    confidence=pr.get("confidence", 1.0),
+                    evidence_text=pr.get("evidence_text", "")
+                )
+            db_cursor._connection.commit()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Error evaluating deliverable progress: {e}")
 
         # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline
 
-            # Look in ALL baseline items (not just IN_SCOPE) for canonical wording + ID
-            matched_scope_id = None
-            matched_scope_name = None
-            for si in all_baseline_items:
-                si_norm = _normalize(si["name"])
-                oos_norm = _normalize(oos_name)
-                if si_norm == oos_norm or si_norm in oos_norm or oos_norm in si_norm:
-                    matched_scope_id = si["id"]
-                    matched_scope_name = si["name"]  # Exact baseline wording
-                    break
-
-            card_title = matched_scope_name if matched_scope_name else oos_name
+            card_title = oos_name
 
             oos_name_clean = oos_name.lower().strip()
             ref_id = None
@@ -478,16 +492,7 @@ Output MUST be a valid JSON object:
         for deliv in timeline_result.get("deliverables", []):
             deliv_name = deliv.get('deliverable', 'Unknown')  # Already canonical from pipeline
 
-            # Resolve against ALL baseline items for canonical baseline wording
-            matched_scope_name = None
-            for si in all_baseline_items:
-                si_norm = _normalize(si["name"])
-                deliv_norm = _normalize(deliv_name)
-                if si_norm == deliv_norm or si_norm in deliv_norm or deliv_norm in si_norm:
-                    matched_scope_name = si["name"]
-                    break
-
-            card_title = matched_scope_name if matched_scope_name else deliv_name
+            card_title = deliv_name
 
             deliv_name_clean = deliv_name.lower().strip()
             ref_id = None

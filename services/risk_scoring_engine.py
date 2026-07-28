@@ -150,22 +150,10 @@ class RiskScoringEngine:
         breakdown: list,
         mom_evidence: str,
         llm_reasoning: str,
+        original_contract_sentence: str = None
     ) -> str:
         """
         Formats the full evidence-backed reasoning string stored in tracker_items.reasoning.
-
-        Example output:
-            Risk Score: 60  |  Severity: HIGH
-
-            Contributing Factors:
-            ✓ Deadline exceeded (+20)
-            ✓ Customer dependency pending (+10)
-            ✓ Milestone slipping (+10)
-            ✓ Evidence confidence (90%) (+4)
-            ✓ Business impact High (+5)
-
-            MoM Evidence: Azure AD SSO config delayed pending vendor credentials.
-            Analysis: The baseline confirms Azure AD SSO is an approved deliverable...
         """
         lines = [
             f"Risk Score: {score}  |  Severity: {severity}",
@@ -177,10 +165,20 @@ class RiskScoringEngine:
         else:
             lines.append("  (No risk signals detected)")
 
-        if mom_evidence:
+        lines.append("")
+        
+        if original_contract_sentence:
+            lines.append("Original Contract:")
+            lines.append(original_contract_sentence)
             lines.append("")
-            lines.append(f"MoM Evidence: {mom_evidence}")
-        if llm_reasoning:
-            lines.append(f"Analysis: {llm_reasoning}")
 
-        return "\n".join(lines)
+        if llm_reasoning:
+            lines.append("Reasoning:")
+            lines.append(llm_reasoning)
+            lines.append("")
+            
+        if mom_evidence:
+            lines.append("Evidence:")
+            lines.append(mom_evidence)
+
+        return "\n".join(lines).strip()
