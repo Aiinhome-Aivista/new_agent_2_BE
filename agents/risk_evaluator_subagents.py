@@ -74,7 +74,7 @@ Output MUST be valid JSON — return unique normalized activities only (deduplic
 
 class BatchActivityRiskAgent:
     @classmethod
-    def evaluate_batch(cls, activities_with_contexts: list) -> list:
+    def evaluate_batch(cls, activities_with_contexts: list, milestone_progress_block: str = "") -> list:
         """
         PHASE 1: Batch risk diagnosis.
         Evaluates ALL ambiguous activities in a SINGLE LLM call.
@@ -116,6 +116,8 @@ Your job is DIAGNOSIS ONLY. You identify what kind of risk exists and which sign
 You do NOT calculate numeric scores — that happens deterministically after your output.
 
 Evaluate each of the following activities using ONLY their provided baseline context.
+
+{milestone_progress_block}
 
 {activities_block}
 

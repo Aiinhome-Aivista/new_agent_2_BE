@@ -90,3 +90,55 @@ class ProjectKnowledgeService:
             context_lines.append("No baseline context found for this activity.")
 
         return "\n".join(context_lines)
+
+    @staticmethod
+    def calculate_milestone_progress(db_cursor, project_id: int) -> str:
+        """
+        Calculates deterministic progress based on weighted milestone mapping.
+        """
+        try:
+            # Find the active baseline for the project
+            db_cursor.execute("SELECT id FROM baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY version DESC LIMIT 1", (project_id,))
+            baseline = db_cursor.fetchone()
+            if not baseline:
+                # Fallback to latest draft if no approved baseline exists
+                db_cursor.execute("SELECT id FROM baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
+                baseline = db_cursor.fetchone()
+            
+            if not baseline:
+                return "Milestone Progress: 0% (No baseline found)"
+
+            # Assuming baseline is a dict or tuple. If tuple, get by index 0. If dict, get 'id'
+            baseline_id = baseline["id"] if isinstance(baseline, dict) else baseline[0]
+
+            # Calculate total weight and completed weight from scope_milestone_mapping
+            query = """
+                SELECT 
+                    SUM(smm.weight) as total_weight,
+                    SUM(CASE WHEN si.status = 'COMPLETED' THEN smm.weight ELSE 0 END) as completed_weight
+                FROM scope_milestone_mapping smm
+                JOIN project_milestones pm ON smm.milestone_id = pm.id
+                JOIN scope_items si ON smm.scope_item_id = si.id
+                WHERE pm.baseline_id = %s
+            """
+            db_cursor.execute(query, (baseline_id,))
+            result = db_cursor.fetchone()
+
+            if not result:
+                return "Milestone Progress: 0% (No milestones mapped)"
+
+            # Support both dict and tuple formats based on cursor type
+            total_weight = result['total_weight'] if isinstance(result, dict) else result[0]
+            completed_weight = result['completed_weight'] if isinstance(result, dict) else result[1]
+
+            if total_weight is None or total_weight == 0:
+                return "Milestone Progress: 0% (No milestones mapped)"
+
+            total = float(total_weight)
+            completed = float(completed_weight or 0.0)
+            percentage = int((completed / total) * 100)
+
+            return f"Milestone Progress: {percentage}% (Completed weight: {completed:.1f} / {total:.1f})"
+        except Exception as e:
+            return f"Milestone Progress: Error calculating progress ({str(e)})"
+

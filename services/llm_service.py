@@ -31,18 +31,18 @@ class LLMService:
                         return response.text
                     except Exception as e:
                         err_str = str(e)
-                        is_client_error = any(code in err_str for code in ["400", "401", "403"]) or "GenerateRequestsPerDayPerProjectPerModel" in err_str
+                        is_client_error = any(code in err_str for code in ["400", "401", "403"])
                         
                         if not is_client_error and attempt < max_retries - 1:
                             wait = 30 if "429" in err_str else 5
                             print(f"Gemini error encountered: {err_str}. Waiting {wait}s before retry (Attempt {attempt + 1}/{max_retries})...")
                             time.sleep(wait)
                         else:
-                            raise e
+                            print(f"Gemini failed permanently (Quota/Client Error). Falling back to secondary LLM: {settings.LLM_MODEL}")
+                            break # Break out of the retry loop to trigger fallback
                             
             except Exception as e:
-                print(f"Gemini LLM Error: {e}")
-                raise RuntimeError(f"Gemini generation failed: {e}")
+                print(f"Gemini LLM Error: {e}. Falling back to secondary LLM.")
 
         payload = {
             "model": settings.LLM_MODEL,

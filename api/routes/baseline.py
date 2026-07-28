@@ -75,12 +75,7 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         
         # Pipeline Step 3: Classification
         emit("Classifying Scope Items", 50)
-        import concurrent.futures
-        classified_candidates = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            def classify(candidate):
-                return ScopeClassifier.classify_candidate(project_id, candidate)
-            classified_candidates = list(executor.map(classify, raw_candidates))
+        classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
             
         # Pipeline Step 4: Fuzzy Deduplication
         emit("Deduplicating Candidates", 70)

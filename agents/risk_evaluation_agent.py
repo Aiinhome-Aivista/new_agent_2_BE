@@ -246,7 +246,12 @@ class RiskEvaluationAgent:
         llm_risk_results = []
         if activities_with_contexts:
             print(f"  [LLM] Batch-evaluating {len(activities_with_contexts)} ambiguous activities...")
-            llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts)
+            
+            # Retrieve milestone progress block to inject into the LLM prompt
+            milestone_progress_block = ProjectKnowledgeService.calculate_milestone_progress(db_cursor, project_id)
+            print(f"  [Info] Injected into prompt: {milestone_progress_block}")
+            
+            llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, milestone_progress_block)
 
         # ===========================================================
         # STEP 6: Categorize all results

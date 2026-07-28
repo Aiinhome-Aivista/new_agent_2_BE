@@ -16,6 +16,7 @@ class MilestoneDeadlineExtractor:
         Enriches scope items with milestone and deadline information.
         Must run AFTER deduplication.
         """
+        llm_batch = []
         for candidate in candidates:
             evidence = candidate.get("evidence_text", "")
             desc = candidate.get("description", "")
@@ -72,17 +73,75 @@ class MilestoneDeadlineExtractor:
             needs_llm = any(kw in combined_text.lower() for kw in keywords) or any(mk.lower() in combined_text.lower() for mk in cls.MILESTONE_KEYWORDS)
             
             if needs_llm:
-                llm_res = cls._extract_via_llm(candidate["name"], combined_text)
-                if llm_res.get("has_schedule"):
-                    candidate["deadline_text"] = llm_res.get("deadline_text")
-                    candidate["deadline"] = cls._normalize_date(candidate["deadline_text"])
-                    candidate["milestone"] = llm_res.get("milestone")
-                    candidate["extraction_method"] = "LLM"
-                    candidate["extraction_confidence"] = 0.85
-                else:
-                    # Explicitly stated no schedule
-                    candidate["extraction_method"] = "LLM"
-                    candidate["extraction_confidence"] = 0.90
+                llm_batch.append({
+                    "candidate": candidate,
+                    "item_name": candidate["name"],
+                    "evidence": combined_text
+                })
+
+        # Process LLM queries in batches of 10
+        import json
+        BATCH_SIZE = 10
+        for i in range(0, len(llm_batch), BATCH_SIZE):
+            batch_slice = llm_batch[i:i+BATCH_SIZE]
+            print(f"[LLM] Extracting milestones for batch of {len(batch_slice)} candidates...")
+            
+            items_for_prompt = []
+            for idx, item in enumerate(batch_slice):
+                items_for_prompt.append({
+                    "id": str(idx),
+                    "item_name": item["item_name"],
+                    "evidence": item["evidence"]
+                })
+                
+            prompt = f"""
+You are an expert contract scheduling extractor.
+Analyze the following array of scope items and their evidence text to extract Milestone and Deadline information.
+
+Items to analyze:
+{json.dumps(items_for_prompt, indent=2)}
+
+Rules for EACH item:
+1. Only extract if explicitly mentioned.
+2. If no deadline/milestone is mentioned, set has_schedule to false.
+3. If deadline is mentioned, return the EXACT original text (e.g., "15 Apr", "End of June").
+4. If a milestone name is mentioned (e.g. "UAT", "Go Live"), extract it. If the item itself is the milestone, use the item name.
+
+Output strictly as a JSON ARRAY of objects, matching the input "id".
+Schema Example:
+[
+  {{
+    "id": "0",
+    "has_schedule": true,
+    "milestone": "UAT",
+    "deadline_text": "15 Apr"
+  }}
+]
+"""
+            try:
+                batch_results = LLMService.generate_json(prompt)
+                if not isinstance(batch_results, list):
+                    batch_results = [batch_results]
+                    
+                result_map = {str(res.get("id", "")): res for res in batch_results}
+                for idx, item in enumerate(batch_slice):
+                    candidate_ref = item["candidate"]
+                    res = result_map.get(str(idx), {})
+                    if res.get("has_schedule"):
+                        candidate_ref["deadline_text"] = res.get("deadline_text")
+                        candidate_ref["deadline"] = cls._normalize_date(candidate_ref["deadline_text"])
+                        candidate_ref["milestone"] = res.get("milestone")
+                        candidate_ref["extraction_method"] = "LLM"
+                        candidate_ref["extraction_confidence"] = 0.85
+                    else:
+                        candidate_ref["extraction_method"] = "LLM"
+                        candidate_ref["extraction_confidence"] = 0.90
+            except Exception as e:
+                print(f"Failed to extract milestones for batch {i}: {e}")
+                for item in batch_slice:
+                    candidate_ref = item["candidate"]
+                    candidate_ref["extraction_method"] = "LLM_FAILED"
+                    candidate_ref["extraction_confidence"] = 0.0
 
         return candidates
 
