@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 import mysql.connector
 from typing import List, Dict, Any, Optional
 
@@ -270,3 +271,27 @@ class BaselineRepository:
             (completion_status, item_id, project_id)
         )
         cursor.close()
+
+    @staticmethod
+    def update_scope_item_details(
+        db: mysql.connector.connection.MySQLConnection,
+        item_id: int,
+        project_id: int,
+        completion_status: Optional[str] = None,
+        deadline: Optional[str] = None
+    ) -> None:
+        cursor = db.cursor()
+        updates = []
+        params = []
+        if completion_status is not None:
+            updates.append("completion_status = %s")
+            params.append(completion_status)
+        if deadline is not None:
+            updates.append("deadline = %s")
+            params.append(deadline)
+        if updates:
+            params.extend([item_id, project_id])
+            sql = f"UPDATE scope_items SET {', '.join(updates)} WHERE id = %s AND project_id = %s"
+            cursor.execute(sql, tuple(params))
+        cursor.close()
+

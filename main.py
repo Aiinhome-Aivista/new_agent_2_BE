@@ -42,6 +42,15 @@ app.include_router(tracker.router, prefix=f"{settings.API_PREFIX}/projects/{{pro
 app.include_router(rag.router, prefix=f"{settings.API_PREFIX}/projects/{{project_id}}/rag", tags=["rag"])
 app.include_router(dashboard.router, prefix=f"{settings.API_PREFIX}/dashboard", tags=["dashboard"])
 
+@app.on_event("startup")
+def startup_event():
+    try:
+        from services.followup_scheduler import start_scheduler
+        start_scheduler()
+    except Exception as e:
+        print(f"Failed to start followup scheduler: {e}")
+
 @app.get("/")
 def root():
     return {"message": "Welcome to Autonomous Contract Scope Evaluator (ACSE) API"}
+
