@@ -17,7 +17,11 @@ from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
 from services.normalization_service import NormalizationService
+# pyrefly: ignore [missing-import]
 import mysql.connector
+from repositories.document_repository import DocumentRepository
+import json
+from fastapi import Query
 import threading
 
 router = APIRouter()
@@ -437,7 +441,8 @@ def delete_scope_item(
     return {"success": True, "message": "Scope item deleted successfully"}
 
 class ScopeItemCompletionUpdate(BaseModel):
-    completion_status: str
+    completion_status: Optional[str] = None
+    deadline: Optional[str] = None
 
 @router.patch("/items/{item_id}/completion")
 def update_scope_item_completion(
@@ -453,10 +458,58 @@ def update_scope_item_completion(
     if not item:
         raise HTTPException(status_code=404, detail="Scope item not found")
         
-    if data.completion_status not in ["ACTIVE", "COMPLETED", "CANCELLED"]:
+    if data.completion_status is not None and data.completion_status not in ["ACTIVE", "COMPLETED", "CANCELLED"]:
         raise HTTPException(status_code=400, detail="Invalid completion status")
-        
-    BaselineRepository.update_scope_item_completion(db, item_id, project_id, data.completion_status)
+
+    # Fetch old state for the audit log
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT name, completion_status, deadline FROM scope_items WHERE id = %s", (item_id,))
+    old_item = cursor.fetchone()
+    cursor.close()
+
+    # Perform repository update
+    BaselineRepository.update_scope_item_details(
+        db, 
+        item_id, 
+        project_id, 
+        data.completion_status, 
+        data.deadline
+    )
+
+    # Log audit event
+    details = {
+        "item_id": item_id,
+        "item_name": old_item["name"] if old_item else "",
+        "old_status": old_item["completion_status"] if old_item else None,
+        "new_status": data.completion_status if data.completion_status is not None else (old_item["completion_status"] if old_item else None),
+        "old_deadline": str(old_item["deadline"]) if old_item and old_item["deadline"] else None,
+        "new_deadline": data.deadline if data.deadline is not None else (str(old_item["deadline"]) if old_item and old_item["deadline"] else None)
+    }
+    DocumentRepository.log_audit(
+        db=db,
+        project_id=project_id,
+        agent_name="Web UI",
+        action="UPDATE_SCOPE_ITEM",
+        entity_type="SCOPE_ITEM",
+        entity_id=item_id,
+        details_json=json.dumps(details)
+    )
+
     db.commit()
     
-    return {"success": True, "message": f"Scope item marked as {data.completion_status}"}
+    return {"success": True, "message": "Scope item updated successfully"}
+
+@router.post("/followup/trigger")
+def trigger_followup_reminders(
+    project_id: int,
+    target_date: Optional[str] = Query(None, description="ISO Date format YYYY-MM-DD to check deliverables due on that day"),
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    from services.followup_scheduler import run_followup_checks
+    
+    res = run_followup_checks(target_date)
+    return res
+
