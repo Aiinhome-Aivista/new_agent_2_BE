@@ -101,12 +101,18 @@ class DocumentService:
             all_chunks = []
             chunk_idx = 0
             for split in header_splits:
+                # Prepend header titles back to chunk text so section detectors find section headings
+                header_titles = [f"# {v}" for k, v in split.metadata.items() if v]
+                header_prefix = "\n".join(header_titles) if header_titles else ""
+                
                 sub_chunks = chunk_text(split.page_content)
                 for chunk in sub_chunks:
+                    full_text = f"{header_prefix}\n\n{chunk}" if header_prefix else chunk
                     all_chunks.append({
                         "page_number": None,
-                        "text": chunk,
-                        "chunk_index": chunk_idx
+                        "text": full_text.strip(),
+                        "chunk_index": chunk_idx,
+                        "metadata": split.metadata
                     })
                     chunk_idx += 1
             if all_chunks:

@@ -7,14 +7,14 @@ class ScopeSectionDetector:
     """
     
     SECTION_PATTERNS = {
-        "Scope of Work": r"(?i)^(?:[0-9]+\.?\s*)?(?:Scope|Scope of Work|Project Scope|Engagement Scope|In Scope)",
-        "Deliverables": r"(?i)^(?:[0-9]+\.?\s*)?(?:Deliverables|Key Deliverables|Project Deliverables)",
-        "Responsibilities": r"(?i)^(?:[0-9]+\.?\s*)?(?:Responsibilities|Our Responsibilities|Vendor Responsibilities)",
-        "Client Responsibilities": r"(?i)^(?:[0-9]+\.?\s*)?(?:Client Responsibilities|Your Responsibilities)",
-        "Out of Scope": r"(?i)^(?:[0-9]+\.?\s*)?(?:Out of Scope|Exclusions|Not Included)",
-        "Assumptions": r"(?i)^(?:[0-9]+\.?\s*)?(?:Assumptions|Key Assumptions|Project Assumptions|Commercial assumptions)",
-        "Dependencies": r"(?i)^(?:[0-9]+\.?\s*)?(?:Dependencies|Project Dependencies)",
-        "Milestones": r"(?i)^(?:[0-9]+\.?\s*)?(?:Milestones|Project Milestones.*|Timeline)"
+        "Scope of Work": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Scope|Scope of Work|Project Scope|Engagement Scope|In Scope|Scope & Deliverables)",
+        "Deliverables": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Deliverables|Key Deliverables|Project Deliverables|Outputs)",
+        "Responsibilities": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Responsibilities|Our Responsibilities|Vendor Responsibilities)",
+        "Client Responsibilities": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Client Responsibilities|Your Responsibilities)",
+        "Out of Scope": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Out of Scope|Exclusions|Not Included|Out-of-Scope)",
+        "Assumptions": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Assumptions|Key Assumptions|Project Assumptions|Commercial assumptions)",
+        "Dependencies": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Dependencies|Project Dependencies)",
+        "Milestones": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Milestones|Project Milestones.*|Timeline|Schedule)"
     }
 
     @classmethod
@@ -28,18 +28,35 @@ class ScopeSectionDetector:
         
         for chunk in chunks:
             text = chunk.get("text", "")
-            lines = text.split("\n")
+            metadata = chunk.get("metadata") or {}
             
+            # Check metadata first if present
+            meta_section = None
+            for meta_val in metadata.values():
+                if meta_val and isinstance(meta_val, str):
+                    clean_meta = meta_val.strip()
+                    for section_name, pattern in cls.SECTION_PATTERNS.items():
+                        if re.search(pattern, clean_meta):
+                            meta_section = section_name
+                            break
+                if meta_section:
+                    break
+            
+            if meta_section:
+                current_section = meta_section
+
+            lines = text.split("\n")
             current_subchunk_lines = []
             
             for line in lines:
                 clean_line = line.strip()
                 
                 # Check if this line is a section header
-                if 0 < len(clean_line) < 100:
+                if 0 < len(clean_line) < 120:
+                    clean_header = re.sub(r'^[#\*\-\s\d\.\:]+', '', clean_line).strip()
                     matched_section = None
                     for section_name, pattern in cls.SECTION_PATTERNS.items():
-                        if re.search(pattern, clean_line):
+                        if re.search(pattern, clean_line) or (clean_header and re.search(pattern, clean_header)):
                             matched_section = section_name
                             break
                             
@@ -67,3 +84,4 @@ class ScopeSectionDetector:
                 })
                 
         return new_chunks
+

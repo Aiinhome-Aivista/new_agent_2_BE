@@ -54,12 +54,11 @@ class ScopeCandidateExtractor:
             candidates.append(cls._create_candidate(part, chunk, document_id))
 
     @classmethod
-    def extract_candidates(cls, chunks: list[dict], document_id: int) -> list[dict]:
+    def _extract_from_chunks(cls, chunks: list[dict], document_id: int, allow_all_sections: bool = False) -> list[dict]:
         candidates = []
-        
         for chunk in chunks:
             section = chunk.get("section", "General")
-            if section not in cls.TARGET_SECTIONS:
+            if not allow_all_sections and section not in cls.TARGET_SECTIONS:
                 continue
                 
             text = chunk.get("text", "")
@@ -93,12 +92,9 @@ class ScopeCandidateExtractor:
                     
                     if len(item_text) > 2 and not cls._is_heading(item_text) and item_text.lower() != 'phase':
                         reconstructed = f"{item_text} - by {date_text}"
-                        
-                        # Bypass _process_and_add to directly tag pure milestone properties
                         cand = cls._create_candidate(reconstructed, chunk, document_id)
                         cand["is_pure_milestone"] = True
                         
-                        # Infer status
                         status_word = status_text.split('\t')[0].strip().lower()
                         if status_word in ["completed", "complete", "done"]:
                             cand["milestone_status"] = "Completed"
@@ -114,6 +110,18 @@ class ScopeCandidateExtractor:
                 if 10 < len(line) < 150 and not line.endswith(':') and not cls._is_heading(line):
                     cls._process_and_add(candidates, line, chunk, document_id)
 
+        return candidates
+
+    @classmethod
+    def extract_candidates(cls, chunks: list[dict], document_id: int) -> list[dict]:
+        # First pass: Target sections only
+        candidates = cls._extract_from_chunks(chunks, document_id, allow_all_sections=False)
+        
+        # Second pass (fallback): If no candidates found, scan all chunks (including "General")
+        if not candidates:
+            print("Notice: Target section candidate extraction yielded 0 items. Running fallback scan across all chunks...")
+            candidates = cls._extract_from_chunks(chunks, document_id, allow_all_sections=True)
+            
         return candidates
         
     @staticmethod
