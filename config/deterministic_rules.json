@@ -2,19 +2,26 @@
   "explicit_exclusions": [
     "excluded",
     "out of scope",
+    "out-of-scope",
     "not included",
     "outside this engagement",
     "outside the scope",
     "will not provide",
     "does not include",
-    "vendor is not responsible"
+    "vendor is not responsible",
+    "not in scope",
+    "not covered"
   ],
   "customer_responsibilities": [
     "customer shall",
     "client shall",
     "customer responsibility",
     "provided by customer",
-    "client responsibility"
+    "client responsibility",
+    "client will provide",
+    "customer will provide",
+    "client is responsible",
+    "customer is responsible"
   ],
   "vendor_responsibilities": [
     "vendor shall",
@@ -32,7 +39,13 @@
     "deployment",
     "knowledge transfer",
     "training",
-    "uat"
+    "uat",
+    "we will design",
+    "we will develop",
+    "we shall",
+    "our team will",
+    "firm will",
+    "consultant will"
   ],
   "in_scope_sections": [
     "Scope",
@@ -40,7 +53,12 @@
     "Deliverables",
     "Vendor Responsibilities",
     "Vendor Scope",
-    "Project Scope"
+    "Project Scope",
+    "Responsibilities",
+    "Services",
+    "Activities",
+    "Work Products",
+    "Outputs"
   ],
   "out_scope_sections": [
     "Exclusions",
@@ -50,6 +68,9 @@
     "Customer Responsibilities",
     "Dependencies",
     "Assumptions",
-    "Commercial Assumptions"
+    "Commercial Assumptions",
+    "Limitations",
+    "Preconditions",
+    "Restrictions"
   ]
 }

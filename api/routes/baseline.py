@@ -4,6 +4,9 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os
 import difflib
+import logging
+
+logger = logging.getLogger(__name__)
 from core.database import get_db, get_db_connection
 from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 from services.document_service import DocumentService
@@ -17,23 +20,29 @@ from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
 from services.normalization_service import NormalizationService
+from services.deliverable_extractor import DeliverableExtractor
+from services.stakeholder_extractor import StakeholderExtractor
 # pyrefly: ignore [missing-import]
 import mysql.connector
 from repositories.document_repository import DocumentRepository
-import json
+from services.document_tree_builder import DocumentTreeBuilder
+from services.section_dispatcher import SectionDispatcher
+from services.entity_resolver import EntityResolver
 from fastapi import Query
 import threading
 
 router = APIRouter()
 
 def run_baseline_pipeline(project_id: int, document_id: int):
+    logger.info(f"Starting baseline pipeline for Project {project_id}, Document {document_id}")
     # Establish a fresh connection for the thread
     thread_conn = get_db_connection()
     if not thread_conn:
-        print("!!! Background baseline pipeline failed to connect !!!")
+        logger.error(f"Background baseline pipeline failed to connect for Project {project_id}")
         return
         
     def emit(step: str, progress: int):
+        logger.info(f"Pipeline Step [{progress}%]: {step}")
         try:
             update_conn = get_db_connection()
             if update_conn:
@@ -46,7 +55,7 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                 upd_cursor.close()
                 update_conn.close()
         except Exception as ex:
-            print(f"Failed to update baseline progress in DB: {ex}")
+            logger.error(f"Failed to update baseline progress in DB: {ex}")
 
     try:
         # Mark as PROCESSING and set start time
@@ -60,49 +69,85 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         
         doc = BaselineRepository.get_document(thread_conn, document_id, project_id)
         if not doc:
+            logger.error(f"Document {document_id} not found in project {project_id}")
             raise RuntimeError("Document not found")
             
         ext = os.path.splitext(doc["storage_key"])[1].lower()
+        logger.info(f"Parsing document {doc['storage_key']} with extension {ext}")
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        logger.info(f"Document parsed into {len(chunks)} chunks.")
         
-        # Pipeline Step 1: Detect Sections
-        emit("Detecting Scope Sections", 15)
-        chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
+        # Pipeline Step 1: Detect Document Tree
+        emit("Detecting Document Tree", 15)
+        doc_tree = DocumentTreeBuilder.build_tree(chunks)
         
-        # Pipeline Step 2: Extract Candidates
-        emit("Extracting Scope Candidates", 30)
-        raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
+        # Pipeline Step 2: Semantic Section Classification
+        emit("Classifying Sections", 25)
+        doc_tree = ScopeSectionDetector.classify_tree(doc_tree)
         
-        # Pipeline Step 3: Classification
-        emit("Classifying Scope Items", 50)
-        import concurrent.futures
-        classified_candidates = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            def classify(candidate):
-                return ScopeClassifier.classify_candidate(project_id, candidate)
-            classified_candidates = list(executor.map(classify, raw_candidates))
+        # Pipeline Step 3: Section Dispatcher (Parallel Extractor Execution)
+        emit("Extracting Entities (Parallel)", 50)
+        raw_entities = SectionDispatcher.dispatch(doc_tree)
+        logger.info(f"Extracted {len(raw_entities)} raw entities across sections.")
+        
+        # Pipeline Step 4 & 5: Entity Resolver (Deduplication & Relationships)
+        emit("Resolving Entity Relationships", 70)
+        resolved_entities = EntityResolver.resolve_and_merge(raw_entities)
+        logger.info(f"Resolved to {len(resolved_entities)} unique entities after deduplication.")
+        
+        # Pipeline Step 6: LLM Validation & Normalization
+        emit("Validating Entities", 85)
+        import time
+        
+        def validate(entity):
+            time.sleep(4) # Throttle to 15 RPM (1 req / 4s) to avoid Free Tier rate limits
+            validated = ScopeClassifier.validate_entity(entity)
             
-        # Pipeline Step 4: Fuzzy Deduplication
-        emit("Deduplicating Candidates", 70)
-        deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
-        
-        # Pipeline Step 5: Milestone & Deadline Extraction
-        emit("Extracting Milestones & Deadlines", 85)
-        enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
-        
-        # Pipeline Step 6: Normalization and Diffing/Saving
-        emit("Saving Baseline Draft", 95)
-        for item in enriched_candidates:
-            item["scope_item_normalized"] = NormalizationService.normalize_scope_item(item.get("name"))
-            item["milestone_normalized"] = NormalizationService.normalize_milestone(item.get("milestone"), item.get("scope_item_normalized"))
-            item["deadline_original"] = item.get("deadline_text")
-            item["deadline_normalized"] = item.get("deadline")
+            if not validated.get("is_valid", False) or validated.get("confidence", 1.0) < 0.5:
+                # Keep low confidence entities but flag them
+                validated["status_change_tag"] = "REVIEW_REQUIRED"
+                
+            # Normalize
+            name = validated.get("name", "Unknown")
+            validated["scope_item_normalized"] = NormalizationService.normalize_scope_item(name)
+            validated["milestone_normalized"] = NormalizationService.normalize_milestone(validated.get("deadline"), validated.get("scope_item_normalized"))
+            validated["deadline_original"] = validated.get("deadline")
+            validated["deadline_normalized"] = validated.get("deadline")
+            return validated
             
+        validated_entities = []
+        for v_ent in resolved_entities:
+            validated = validate(v_ent)
+            if validated:
+                validated_entities.append(validated)
+                    
+        # Group back into legacy format for database saving
+        scope_items = [e for e in validated_entities if e.get("type") in ["FUNCTIONAL_SCOPE", "TECH_STACK", "CLIENT_DEPENDENCY", "ACTOR"]]
+        deliverables = [e for e in validated_entities if e.get("type") == "DELIVERABLE"]
+        milestones = [e for e in validated_entities if e.get("type") == "MILESTONE"]
+        stakeholders = [e for e in validated_entities if e.get("type") == "STAKEHOLDER"]
+        
         extracted_data = {
-            "scope_items": enriched_candidates,
-            "deliverables": [],
-            "stakeholders": []
+            "scope_items": scope_items,
+            "deliverables": deliverables,
+            "stakeholders": stakeholders
         }
+        logger.info(f"Extraction yield: {len(scope_items)} scope items, {len(deliverables)} deliverables, {len(stakeholders)} stakeholders.")
+        
+        # Legacy Fallback if deterministic extraction failed
+        if len(extracted_data.get("scope_items", [])) < 1 and len(extracted_data.get("deliverables", [])) < 1:
+            logger.warning("[Fallback] Low confidence extraction. Falling back to ScopeExtractionAgent.")
+            emit("LLM Fallback Extraction", 96)
+            
+            full_text = "\n".join([c.get("text", "") for c in chunks])
+            fallback_data = ScopeExtractionAgent.extract_scope(full_text)
+            if fallback_data:
+                for item in fallback_data.get("scope_items", []):
+                    item["source_document_id"] = document_id
+                    item["scope_item_normalized"] = NormalizationService.normalize_scope_item(item.get("name"))
+                for item in fallback_data.get("deliverables", []):
+                    item["source_document_id"] = document_id
+                extracted_data = fallback_data
         
         existing_draft = BaselineRepository.get_draft_baseline(thread_conn, project_id)
         if existing_draft:
@@ -112,7 +157,10 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         else:
             max_v = BaselineRepository.get_max_baseline_version(thread_conn, project_id)
             next_version = max_v + 1
-            baseline_id = BaselineRepository.create_baseline(thread_conn, project_id, next_version, document_id)
+            baseline_id = BaselineRepository.create_baseline(
+                thread_conn, project_id, next_version, document_id, 
+                parser_version='2.0', layout_version='2.0', extractor_version='3.0', llm_prompt_version='2.0'
+            )
             latest_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id)
             if latest_approved:
                 app_baseline_id = latest_approved["id"]
@@ -123,9 +171,25 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         has_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id) is not None
         existing_scope_items = BaselineRepository.get_scope_items_for_diff(thread_conn, baseline_id)
         
+        # Fetch entity type mapping
+        cursor_type = thread_conn.cursor(dictionary=True)
+        cursor_type.execute("SELECT id, name FROM entity_types")
+        entity_type_map = {row["name"]: row["id"] for row in cursor_type.fetchall()}
+        cursor_type.close()
+        
         for item in extracted_data.get("scope_items", []):
             item_name = item.get("name", "Unknown")
-            item_type = item.get("scope_type", "UNCERTAIN")
+            entity_type_name = item.get("type", "FUNCTIONAL_SCOPE")
+            
+            # Map back to legacy ENUM ('IN_SCOPE', 'OUT_OF_SCOPE', 'UNCERTAIN', 'ASSUMPTION')
+            if entity_type_name == "OUT_OF_SCOPE":
+                legacy_scope_type = "OUT_OF_SCOPE"
+            elif entity_type_name == "ASSUMPTIONS":
+                legacy_scope_type = "ASSUMPTION"
+            elif entity_type_name in ["FUNCTIONAL_SCOPE", "DELIVERABLE", "MILESTONE", "TECH_STACK", "CLIENT_DEPENDENCY", "ACTOR"]:
+                legacy_scope_type = "IN_SCOPE"
+            else:
+                legacy_scope_type = "UNCERTAIN"
             
             existing_item = None
             best_ratio = 0.0
@@ -138,9 +202,12 @@ def run_baseline_pipeline(project_id: int, document_id: int):
             if existing_item:
                 tags = []
                 old_type = existing_item["scope_type"]
+                entity_type_name = item.get("type", "FUNCTIONAL_SCOPE")
+                entity_type_id = entity_type_map.get(entity_type_name)
+                
                 if has_approved:
-                    if old_type != item_type:
-                        tags.append(f"Changed from {old_type} to {item_type}")
+                    if old_type != legacy_scope_type:
+                        tags.append(f"Changed from {old_type} to {legacy_scope_type}")
                     old_deadline = existing_item.get("deadline_text")
                     new_deadline = item.get("deadline_text")
                     if old_deadline != new_deadline:
@@ -164,7 +231,7 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     db=thread_conn,
                     item_id=existing_item["id"],
                     description=item.get("description", ""),
-                    scope_type=item_type,
+                    scope_type=legacy_scope_type,
                     source_document_id=document_id,
                     source_page=item.get("source_page"),
                     source_section=item.get("source_section"),
@@ -179,16 +246,19 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     scope_item_normalized=item.get("scope_item_normalized"),
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
-                    deadline_normalized=item.get("deadline_normalized")
+                    deadline_normalized=item.get("deadline_normalized"),
+                    entity_type_id=entity_type_id
                 )
             else:
+                entity_type_id = entity_type_map.get(entity_type_name)
+                
                 BaselineRepository.insert_scope_item_extracted(
                     db=thread_conn,
                     baseline_id=baseline_id,
                     project_id=project_id,
                     name=item_name,
                     description=item.get("description", ""),
-                    scope_type=item_type,
+                    scope_type=legacy_scope_type,
                     source_document_id=document_id,
                     source_page=item.get("source_page"),
                     source_section=item.get("source_section"),
@@ -202,7 +272,9 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     scope_item_normalized=item.get("scope_item_normalized"),
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
-                    deadline_normalized=item.get("deadline_normalized")
+                    deadline_normalized=item.get("deadline_normalized"),
+                    entity_type_id=entity_type_id,
+                    status_change_tag=item.get("status_change_tag")
                 )
                 
         # UPSERT deliverables
@@ -254,6 +326,7 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         BaselineRepository.update_project_monitoring_status(thread_conn, project_id, 'BASELINE_PENDING_REVIEW')
         
         # Mark as COMPLETED
+        logger.info("Pipeline completed successfully. Updating status to COMPLETED.")
         upd2 = thread_conn.cursor()
         upd2.execute(
             "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, processing_step = 'Completed' WHERE id = %s",
@@ -264,8 +337,7 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         
     except Exception as e:
         import traceback
-        print("!!! Baseline pipeline execution failed !!!")
-        traceback.print_exc()
+        logger.error(f"!!! Baseline pipeline execution failed for Project {project_id}, Document {document_id} !!!", exc_info=True)
         try:
             thread_conn.rollback()
         except Exception:
@@ -282,9 +354,10 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                 err_cursor.close()
                 err_conn.close()
         except Exception as db_ex:
-            traceback.print_exc()
+            logger.error("Failed to update documents table with FAILED status", exc_info=True)
     finally:
         thread_conn.close()
+        logger.info(f"Pipeline thread finished for Project {project_id}")
 
 @router.post("/extract")
 def extract_baseline(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):

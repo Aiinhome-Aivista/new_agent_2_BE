@@ -1,144 +1,68 @@
 import json
-from services.hybrid_retrieval_service import HybridRetrievalService
+import logging
 from services.llm_service import LLMService
-from services.scope_deterministic_classifier import ScopeDeterministicClassifier
-import difflib
+
+logger = logging.getLogger(__name__)
+
 class ScopeClassifier:
     """
-    Uses Hybrid Retrieval to find supporting evidence for a candidate item,
-    and then uses a small LLM prompt to classify it.
+    Phase 5: LLM Validation & Confidence Scoring
+    Validates the entity extracted by specialized extractors, resolves ambiguity, and assigns confidence.
     """
     
     @classmethod
-    def classify_candidate(cls, project_id: int, candidate: dict) -> dict:
-        # Retrieve supporting evidence for the candidate using hybrid search
-        search_query = candidate["name"] + " " + candidate["description"]
-        # Only search EL and IFA to determine scope explicitly
-        retrieved_chunks = HybridRetrievalService.retrieve(project_id, search_query, document_types=["EL", "IFA"])
+    def validate_entity(cls, entity: dict) -> dict:
+        entity_type = entity.get("type", "UNKNOWN")
+        raw_text = entity.get("raw_text", "")
         
-        # Issue 4 & 5: Filter and Rank chunks
-        filtered_chunks = []
-        bad_sections = {"Out of Scope", "Assumptions", "Client Responsibilities", "Customer Responsibilities"}
-        for chunk in retrieved_chunks:
-            meta = chunk.get("metadata", {}) or {}
-            chunk_section = meta.get("section", "General")
-            
-            cand_section = candidate.get("section", "General")
-            if chunk_section in bad_sections and cand_section not in bad_sections:
-                continue
-            if cand_section in bad_sections and chunk_section not in bad_sections:
-                continue
-            filtered_chunks.append(chunk)
-            
-        candidate_name_lower = candidate["name"].lower()
-        candidate_idx = candidate.get("chunk_index", 0)
-        
-        # Issue 3: Filter chunks to ONLY same sentence/paragraph (idx distance <= 1), 
-        # same section, or nearest neighbor.
-        strictly_filtered_chunks = []
-        for chunk in filtered_chunks:
-            chunk_section = chunk.get("metadata", {}).get("section", "General")
-            chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
-            text = chunk.get("text", "").lower()
-            
-            # Keep if scope item is in the text (same sentence/paragraph)
-            if candidate_name_lower in text:
-                strictly_filtered_chunks.append(chunk)
-                continue
-                
-            # Keep if same section and it's near (nearest neighbor / distance <= 3)
-            distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
-            if chunk_section == candidate.get("section", "General") and distance <= 3:
-                strictly_filtered_chunks.append(chunk)
-                continue
-                
-        def rank_score(chunk):
-            text = chunk.get("text", "").lower()
-            chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
-            
-            score = 0
-            if candidate_name_lower in text:
-                score += 1000
-            
-            distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
-            score -= distance
-            return score
-            
-        strictly_filtered_chunks.sort(key=rank_score, reverse=True)
-        
-        # Take the top 3 most relevant chunks to keep the context window small, deduplicating them first
-        evidence_texts = []
-        seen_texts = []
-        for chunk in strictly_filtered_chunks:
-            text = chunk['text']
-            is_duplicate = False
-            for seen in seen_texts:
-                if difflib.SequenceMatcher(None, text.lower(), seen.lower()).ratio() > 0.85:
-                    is_duplicate = True
-                    break
-            if not is_duplicate:
-                seen_texts.append(text)
-                evidence_texts.append(f"Evidence {len(evidence_texts)+1}:\n{text}")
-            
-            if len(evidence_texts) >= 3:
-                break
-            
-        combined_evidence = "\n\n".join(evidence_texts)
-        if not combined_evidence:
-            combined_evidence = "No specific supporting evidence found in the contract."
-
-        # Deterministic Classification Step
-        deterministic_result = ScopeDeterministicClassifier.classify(candidate, combined_evidence)
-        if deterministic_result.get("confidence", 0.0) >= 0.95:
-            print(f"[Deterministic] '{candidate['name']}' -> {deterministic_result['scope_type']} (Reason: {deterministic_result['evidence_text']})")
-            candidate["scope_type"] = deterministic_result["scope_type"]
-            candidate["confidence"] = deterministic_result["confidence"]
-            candidate["evidence_text"] = deterministic_result["evidence_text"]
-            return candidate
-            
-        print(f"[LLM Fallback] '{candidate['name']}' was ambiguous. Calling LLM...")
-            
         prompt = f"""
-You are an expert contract analyst. Your task is to classify ONE specific candidate scope item based ONLY on the provided supporting evidence retrieved from the contract.
+You are an expert contract analyst. Your task is to validate and score a single extracted entity from a contract.
 
-Candidate Item:
-- Name: {candidate["name"]}
-- Raw Description: {candidate["description"]}
-- Found in Section: {candidate["section"]}
-
-Supporting Evidence from Contract:
-{combined_evidence}
+Entity Type: {entity_type}
+Extracted Text: {raw_text}
+Found in Section: {entity.get("source_section", "Unknown")}
 
 Task:
-Classify this candidate as "IN_SCOPE", "OUT_OF_SCOPE", or "UNCERTAIN".
-- If the evidence clearly states the vendor provides it, choose IN_SCOPE.
-- If the evidence states it's excluded, or it's the client's responsibility, or it's an assumption, choose OUT_OF_SCOPE.
-- If there is not enough evidence to be sure, choose UNCERTAIN.
+1. Validate if this text truly belongs to the {entity_type} category.
+2. Provide a clean, concise name for the entity (max 10 words).
+3. Assign a confidence score (0.0 to 1.0) based on how clearly the text represents the entity type.
+4. Extract a 1-sentence "evidence" quote strictly from the Extracted Text itself. DO NOT use the section header or page header as evidence.
 
 Output your result strictly as JSON:
 {{
-  "scope_type": "IN_SCOPE", 
+  "is_valid": true,
+  "cleaned_name": "<concise name>",
   "confidence": 0.9, 
-  "evidence_text": "<Brief 1-sentence reasoning quoting the evidence>"
+  "evidence_text": "<Brief 1-sentence quote exactly from Extracted Text>"
 }}
 """
         
         try:
             result = LLMService.generate_json(prompt)
-            # Merge classification results into the candidate dictionary
-            candidate["scope_type"] = result.get("scope_type", "UNCERTAIN")
-            candidate["confidence"] = result.get("confidence", 0.5)
-            candidate["evidence_text"] = result.get("evidence_text", "No reasoning provided.")
-        except Exception as e:
-            print(f"Failed to classify candidate {candidate['name']}: {e}")
-            if deterministic_result.get("scope_type") != "UNCERTAIN":
-                print(f"[Failsafe] Falling back to deterministic low-confidence result for '{candidate['name']}'.")
-                candidate["scope_type"] = deterministic_result["scope_type"]
-                candidate["confidence"] = deterministic_result["confidence"]
-                candidate["evidence_text"] = deterministic_result["evidence_text"]
-            else:
-                candidate["scope_type"] = "UNCERTAIN"
-                candidate["confidence"] = 0.0
-                candidate["evidence_text"] = "LLM classification failed."
+            entity["is_valid"] = result.get("is_valid", True)
+            if not entity.get("name"):
+                entity["name"] = result.get("cleaned_name", raw_text[:50])
+            if not entity.get("description"):
+                entity["description"] = raw_text
             
-        return candidate
+            # Blend existing confidence with LLM confidence
+            existing_conf = entity.get("confidence", 0.5)
+            llm_conf = result.get("confidence", 0.5)
+            final_conf = (existing_conf + llm_conf) / 2.0
+            entity["confidence"] = final_conf
+            
+            # Apply explicit confidence threshold
+            if final_conf < 0.70:
+                entity["status"] = "REVIEW_REQUIRED"
+            
+            entity["evidence_text"] = result.get("evidence_text", "Extracted via structural rules.")
+        except Exception as e:
+            logger.error(f"Failed to validate entity {raw_text[:30]}: {e}", exc_info=True)
+            entity["is_valid"] = True
+            entity["name"] = entity.get("name", raw_text[:50])
+            entity["description"] = entity.get("description", raw_text)
+            entity["evidence_text"] = "LLM validation failed, fallback to structural extraction."
+            if entity.get("confidence", 0.5) < 0.70:
+                entity["status"] = "REVIEW_REQUIRED"
+            
+        return entity

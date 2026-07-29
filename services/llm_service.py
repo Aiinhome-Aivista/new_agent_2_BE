@@ -11,6 +11,9 @@ try:
 except ImportError:
     gemini_client = None
 
+import logging
+logger = logging.getLogger(__name__)
+
 class LLMService:
     @classmethod
     def generate(cls, prompt: str) -> str:
@@ -35,13 +38,13 @@ class LLMService:
                         
                         if not is_client_error and attempt < max_retries - 1:
                             wait = 30 if "429" in err_str else 5
-                            print(f"Gemini error encountered: {err_str}. Waiting {wait}s before retry (Attempt {attempt + 1}/{max_retries})...")
+                            logger.warning(f"Gemini error encountered: {err_str}. Waiting {wait}s before retry (Attempt {attempt + 1}/{max_retries})...")
                             time.sleep(wait)
                         else:
                             raise e
                             
             except Exception as e:
-                print(f"Gemini LLM Error: {e}")
+                logger.error(f"Gemini LLM Error: {e}", exc_info=True)
                 raise RuntimeError(f"Gemini generation failed: {e}")
 
         payload = {
@@ -60,7 +63,7 @@ class LLMService:
             data = response.json()
             return data.get("response", "")
         except Exception as e:
-            print(f"LLM Error: {e}")
+            logger.error(f"LLM Error: {e}", exc_info=True)
             raise RuntimeError(f"LLM generation failed: {e}")
 
     @classmethod
@@ -94,7 +97,7 @@ class LLMService:
             return cls.extract_json(raw_response)
         except (json.JSONDecodeError, ValueError) as e:
             if retry_count > 0:
-                print(f"JSON parsing failed, retrying. Error: {e}")
+                logger.warning(f"JSON parsing failed, retrying. Error: {e}")
                 correction_prompt = f"The following text was supposed to be valid JSON but failed to parse. Please output ONLY the corrected valid JSON and nothing else.\n\nInvalid Text:\n{raw_response}\n\nError:\n{e}"
                 try:
                     corrected_response = cls.generate(correction_prompt)
