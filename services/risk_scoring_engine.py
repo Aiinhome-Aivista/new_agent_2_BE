@@ -32,15 +32,18 @@ class RiskScoringEngine:
 
     @classmethod
     def calculate(
-        cls,
-        risk_category: str,
-        signals: dict,
-        confidence: float,
-        business_impact: str,
-        params: dict,
-        impact_matrix: dict,
-        rules: dict,
-    ) -> tuple:
+        cls, 
+        risk_category: str, 
+        signals: dict, 
+        confidence: float, 
+        business_impact: str, 
+        params: dict, 
+        impact_matrix: dict, 
+        rules: list, 
+        dependent_count: int = 0,
+        blocked_milestones: list = None,
+        dependency_config: list = None
+    ) -> tuple[int, list]:
         """
         Calculate the weighted risk score from diagnostic signals.
 
@@ -54,6 +57,7 @@ class RiskScoringEngine:
             params:          From RiskConfigurationService.get_parameters()
             impact_matrix:   From RiskConfigurationService.get_impact_matrix()
             rules:           From RiskConfigurationService.get_rules()
+            dependent_count: How many other items are blocked by this item (0 = no impact)
 
         Returns:
             (score: int 0–100, breakdown: list[str])
@@ -138,6 +142,24 @@ class RiskScoringEngine:
             if impact_add > 0:
                 score += impact_add
                 breakdown.append(f"✓ Business impact {impact_key.title()} (+{impact_add})")
+
+        # ── DEPENDENCY_IMPACT (Cascade Risk) ─────────────────────────────────
+        if blocked_milestones is None: blocked_milestones = []
+        if dependency_config is None: dependency_config = []
+        dependent_count = len(blocked_milestones)
+        
+        if dependent_count > 0 and risk_category != "NONE":
+            # Get points from config
+            dep_score = 0
+            for cfg in dependency_config:
+                if dependent_count >= cfg['blocked_count_threshold']:
+                    dep_score = cfg['risk_points']
+                    break
+                    
+            if dep_score > 0:
+                score += dep_score
+                blocked_word = "milestone" if dependent_count == 1 else "milestones"
+                breakdown.append(f"✓ Blocking {dependent_count} dependent {blocked_word}: {', '.join(blocked_milestones)} — cascade risk (+{dep_score})")
 
         final_score = min(score, 100)
         return final_score, breakdown

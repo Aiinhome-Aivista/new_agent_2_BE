@@ -22,6 +22,11 @@ import threading
 
 
 class RiskConfigurationService:
+    @staticmethod
+    def get_dependency_risk_config(db_cursor):
+        db_cursor.execute('SELECT blocked_count_threshold, risk_points FROM dependency_risk_config ORDER BY blocked_count_threshold DESC')
+        return db_cursor.fetchall()
+
     """
     Loads all risk configuration from DB tables and caches in memory.
     Thread-safe via a simple lock.

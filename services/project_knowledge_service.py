@@ -98,11 +98,11 @@ class ProjectKnowledgeService:
         """
         try:
             # Find the active baseline for the project
-            db_cursor.execute("SELECT id FROM baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY version DESC LIMIT 1", (project_id,))
+            db_cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY version DESC LIMIT 1", (project_id,))
             baseline = db_cursor.fetchone()
             if not baseline:
                 # Fallback to latest draft if no approved baseline exists
-                db_cursor.execute("SELECT id FROM baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
+                db_cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s ORDER BY version DESC LIMIT 1", (project_id,))
                 baseline = db_cursor.fetchone()
             
             if not baseline:
@@ -115,7 +115,7 @@ class ProjectKnowledgeService:
             query = """
                 SELECT 
                     SUM(smm.weight) as total_weight,
-                    SUM(CASE WHEN si.status = 'COMPLETED' THEN smm.weight ELSE 0 END) as completed_weight
+                    SUM(CASE WHEN pm.status = 'COMPLETED' THEN smm.weight ELSE 0 END) as completed_weight
                 FROM scope_milestone_mapping smm
                 JOIN project_milestones pm ON smm.milestone_id = pm.id
                 JOIN scope_items si ON smm.scope_item_id = si.id
@@ -141,4 +141,29 @@ class ProjectKnowledgeService:
             return f"Milestone Progress: {percentage}% (Completed weight: {completed:.1f} / {total:.1f})"
         except Exception as e:
             return f"Milestone Progress: Error calculating progress ({str(e)})"
+
+    @staticmethod
+    def get_dependency_context_block(dependency_graph: dict) -> str:
+        """
+        Formats the dependency graph into a concise block for LLM prompt injection.
+        Only includes items that are incomplete AND blocking at least one other item.
+        """
+        if not dependency_graph:
+            return ""
+
+        blocker_lines = []
+        for item_id, info in dependency_graph.items():
+            if info.get("is_incomplete") and info.get("dependent_count", 0) > 0:
+                blocked_names = ", ".join(info["blocked_items"])
+                impact = "HIGH IMPACT" if info["dependent_count"] >= 2 else "MEDIUM IMPACT"
+                blocker_lines.append(
+                    f"- {info['name']} [{info['status']}] blocks: {blocked_names} ({impact})"
+                )
+
+        if not blocker_lines:
+            return ""
+
+        lines = ["=== DEPENDENCY RISK CONTEXT ==="]
+        lines.extend(blocker_lines)
+        return "\n".join(lines)
 

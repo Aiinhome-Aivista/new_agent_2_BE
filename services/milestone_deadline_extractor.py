@@ -40,7 +40,7 @@ class MilestoneDeadlineExtractor:
                 has_mk = any(mk.lower() in sentence.lower() for mk in cls.MILESTONE_KEYWORDS)
                 
                 # If we have multiple sentences and this one is totally unrelated, skip it
-                if len(sentences) > 1 and not (has_item or has_mk):
+                if len(sentences) > 1 and not (has_item or has_mk or " | " in sentence):
                     continue
                     
                 for pattern in cls.DATE_PATTERNS:
@@ -170,17 +170,31 @@ Schema Example:
             year, month, day = match.groups()
             return f"{year}-{int(month):02d}-{int(day):02d}"
 
-        # 15 April 2026
-        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
-                  "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
-        
-        # If year is missing in text, we DO NOT normalize. "Never guess missing year."
-        if not re.search(r"\d{4}", text):
-            return None
+        # 15 April 2026 or 15 Apr 2026
+        match = re.search(r"(?i)(\d{1,2})\s+([a-z]+)\s+(\d{4})", text)
+        if match:
+            months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+                      "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            day, month_str, year = match.groups()
+            month_str_lower = month_str.lower()
+            month_idx = -1
             
-        # Example for explicit parsing of like 15 April 2026 if regex above failed
-        # Since dateutil might not be installed, we just return None for complex strings.
-        # Strict formats were handled above.
+            # Check full months
+            for i, m in enumerate(months[:12]):
+                if m.startswith(month_str_lower):
+                    month_idx = i + 1
+                    break
+                    
+            if month_idx == -1:
+                # Check short months
+                for i, m in enumerate(months[12:]):
+                    if month_str_lower.startswith(m):
+                        month_idx = i + 1
+                        break
+                        
+            if month_idx != -1:
+                return f"{year}-{month_idx:02d}-{int(day):02d}"
+                
         return None
 
     @classmethod

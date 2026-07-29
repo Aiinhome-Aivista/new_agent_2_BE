@@ -73,6 +73,16 @@ def get_project(project_id: int, current_user: dict = Depends(get_current_user),
     project = ProjectRepository.get_project_by_id(db, project_id)
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+        
+    if project.get("latest_sub_agent_results"):
+        import json
+        try:
+            results = json.loads(project["latest_sub_agent_results"])
+            project["highestActionPriority"] = results.get("highestActionPriority")
+        except:
+            pass
+        del project["latest_sub_agent_results"]
+        
     return {"success": True, "data": project}
 
 class ProjectUserAdd(BaseModel):

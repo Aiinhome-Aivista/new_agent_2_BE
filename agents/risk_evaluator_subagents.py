@@ -129,10 +129,11 @@ RULES:
 
 2. RISK CATEGORIES (pick ONE per activity):
    - SCOPE_CREEP: Activity has NO approved IN_SCOPE baseline match (new request or excluded item).
-   - DELAY: Deliverable is behind schedule or has missed its contractual deadline.
-   - DEPENDENCY: Blocked waiting for client/third party obligation (VPN, API creds, infra).
-   - BLOCKED: Explicitly blocked by a technical or organizational issue.
+   - DELAY: Deliverable is behind schedule or has missed its contractual deadline. (Do NOT use this for pending customer obligations).
+   - DEPENDENCY: The activity is blocked waiting for client/third party obligation (VPN, API creds, infra), OR it represents the customer obligation itself. Any deliverable waiting on the customer MUST be DEPENDENCY.
+   - BLOCKED: Explicitly blocked by a technical or organizational issue (e.g. one deliverable waiting on another).
    - NONE: On-track and within approved scope with no blockers.
+   - IGNORE: It is merely a workflow step, activity update, or status evidence (e.g. 'QA Validation', 'Security Review') and DOES NOT represent a contractual deliverable. Do not flag as Scope Creep.
 
 3. DIAGNOSTIC SIGNALS — for each activity, identify which signals are TRUE:
    - deadline_missed: The contractual or mentioned deadline has passed or is at immediate risk.
@@ -144,10 +145,14 @@ RULES:
 
 4. NEVER classify an approved IN_SCOPE baseline item as SCOPE_CREEP.
 
-5. TRACKER IDENTITY: matched_baseline_item must be the canonical baseline name, not the MoM wording.
+5. BLOCKED EXPLANATIONS: If an item is BLOCKED, explicitly name what is blocking it in your reasoning (e.g. 'Blocked By API Credentials').
+
+6. PARTIAL COMPLETION & BLOCKED DELIVERABLES: If a deliverable (e.g. CRM Integration) is partially complete or cannot continue due to a blocker (e.g. waiting on API credentials), you MUST classify the deliverable itself as BLOCKED or DEPENDENCY. Do NOT classify it as NONE just because the blocker is listed as a separate activity. Both the deliverable AND the blocker must be flagged.
+
+7. TRACKER IDENTITY: matched_baseline_item must be the canonical baseline name, not the MoM wording.
    The same baseline item must produce the same tracker title across different MoMs.
 
-6. CANONICAL TITLES: matched_baseline_item must be the SHORT business entity name.
+8. CANONICAL TITLES: matched_baseline_item must be the SHORT business entity name.
    - Use: "VPN Connectivity", NOT "Customer shall provide VPN connectivity"
    - Use: "Azure AD SSO", NOT "The Vendor shall configure Azure AD SSO by 25 April 2026"
    - Use: "API Credentials", NOT "Customer shall provide API credentials"

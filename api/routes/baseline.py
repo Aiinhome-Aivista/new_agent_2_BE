@@ -17,6 +17,9 @@ from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
 from services.normalization_service import NormalizationService
+from services.milestone_dependency_extractor import MilestoneDependencyExtractor
+from services.milestone_dependency_service import MilestoneDependencyService
+
 # pyrefly: ignore [missing-import]
 import mysql.connector
 from repositories.document_repository import DocumentRepository
@@ -34,19 +37,18 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         return
         
     def emit(step: str, progress: int):
+        print(f"DEBUG: Starting emit for {step}")
         try:
-            update_conn = get_db_connection()
-            if update_conn:
-                upd_cursor = update_conn.cursor()
-                upd_cursor.execute(
-                    "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
-                    (progress, step, document_id)
-                )
-                update_conn.commit()
-                upd_cursor.close()
-                update_conn.close()
+            upd_cursor = thread_conn.cursor()
+            upd_cursor.execute(
+                "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
+                (progress, step, document_id)
+            )
+            thread_conn.commit()
+            upd_cursor.close()
+            print(f"DEBUG: Successfully emitted {step}")
         except Exception as ex:
-            print(f"Failed to update baseline progress in DB: {ex}")
+            print(f"Failed to update baseline progress in DB for {step}: {ex}")
 
     try:
         # Mark as PROCESSING and set start time
@@ -100,15 +102,22 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         }
         
         existing_draft = BaselineRepository.get_draft_baseline(thread_conn, project_id)
+        latest_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id)
+
         if existing_draft:
             baseline_id = existing_draft["id"]
             BaselineRepository.update_baseline_source_document(thread_conn, baseline_id, document_id)
+            BaselineRepository.delete_scope_items_by_baseline(thread_conn, baseline_id)
+            BaselineRepository.delete_deliverables_by_baseline(thread_conn, baseline_id)
             BaselineRepository.delete_stakeholders_by_project(thread_conn, project_id)
+            if latest_approved:
+                app_baseline_id = latest_approved["id"]
+                BaselineRepository.copy_scope_items(thread_conn, app_baseline_id, baseline_id)
+                BaselineRepository.copy_deliverables(thread_conn, app_baseline_id, baseline_id)
         else:
             max_v = BaselineRepository.get_max_baseline_version(thread_conn, project_id)
             next_version = max_v + 1
             baseline_id = BaselineRepository.create_baseline(thread_conn, project_id, next_version, document_id)
-            latest_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id)
             if latest_approved:
                 app_baseline_id = latest_approved["id"]
                 BaselineRepository.copy_scope_items(thread_conn, app_baseline_id, baseline_id)
@@ -121,6 +130,9 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         for item in extracted_data.get("scope_items", []):
             item_name = item.get("name", "Unknown")
             item_type = item.get("scope_type", "UNCERTAIN")
+            
+            if item.get("is_pure_milestone", False):
+                item_type = "MILESTONE_ONLY"
             
             existing_item = None
             best_ratio = 0.0
@@ -176,8 +188,10 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     deadline_original=item.get("deadline_original"),
                     deadline_normalized=item.get("deadline_normalized")
                 )
+                item_id = existing_item["id"]
+                item["_db_id"] = item_id
             else:
-                BaselineRepository.insert_scope_item_extracted(
+                item_id = BaselineRepository.insert_scope_item_extracted(
                     db=thread_conn,
                     baseline_id=baseline_id,
                     project_id=project_id,
@@ -199,7 +213,84 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     deadline_original=item.get("deadline_original"),
                     deadline_normalized=item.get("deadline_normalized")
                 )
+                item["_db_id"] = item_id
+        
+        # Commit DB changes to release any locks on `documents` table 
+        # so `emit` (which gets a new connection) does not deadlock.
+        thread_conn.commit()
+        
+        # Process Milestones & Dependencies
+        emit("Building Milestone Dependencies", 97)
+        # Clear existing draft milestones/mappings/dependencies (if any)
+        # We will clear project_milestones for the draft baseline. But actually, project_milestones are tied to project_id.
+        # Let's delete project_milestones for this project_id and baseline_id.
+        cursor = thread_conn.cursor()
+        cursor.execute("DELETE FROM project_milestones WHERE project_id = %s AND baseline_id = %s", (project_id, baseline_id))
+        
+        # 1. Extract distinct milestones
+        milestone_dict = {} # normalized_name -> dict
+        for item in extracted_data.get("scope_items", []):
+            m_norm = item.get("milestone_normalized")
+            m_orig = item.get("milestone")
+            if m_norm:
+                if m_norm not in milestone_dict:
+                    milestone_dict[m_norm] = {
+                        "name": m_orig,
+                        "planned_date": item.get("deadline_normalized"),
+                        "status": item.get("milestone_status", "Planned"),
+                        "scope_item_ids": []
+                    }
+                if item.get("_db_id"):
+                    milestone_dict[m_norm]["scope_item_ids"].append(item["_db_id"])
+                    
+        # 2. Sort milestones chronologically and insert into project_milestones
+        def get_date_val(item):
+            d = item[1].get("planned_date")
+            return d if d else "9999-12-31"
+            
+        sorted_milestones = sorted(milestone_dict.items(), key=get_date_val)
+        
+        seq = 1
+        name_to_id = {}
+        for m_norm, m_data in sorted_milestones:
+            m_id = BaselineRepository.create_project_milestone(
+                thread_conn, project_id, baseline_id, m_data["name"], seq, m_data["status"], m_data["planned_date"]
+            )
+            name_to_id[m_norm] = m_id
+            seq += 1
+            for scope_id in m_data["scope_item_ids"]:
+                BaselineRepository.create_scope_milestone_mapping(thread_conn, scope_id, m_id)
                 
+        # 3. Extract dependencies
+        extracted_deps = MilestoneDependencyExtractor.extract_dependencies(extracted_data.get("scope_items", []), doc["document_text"] if "document_text" in doc else "")
+        
+        edges = []
+        for dep in extracted_deps:
+            parent_name = NormalizationService.normalize_milestone(dep["parent_milestone"], None)
+            child_name = NormalizationService.normalize_milestone(dep["child_milestone"], None)
+            if parent_name in name_to_id and child_name in name_to_id:
+                edges.append((name_to_id[parent_name], name_to_id[child_name]))
+                
+        # 4. Validate DAG
+        dag_valid = True
+        try:
+            if edges:
+                MilestoneDependencyService.validate_dag(edges)
+        except ValueError:
+            dag_valid = False
+            
+        if dag_valid and edges:
+            for p, c in edges:
+                cursor.execute(
+                    "INSERT INTO milestone_dependencies (project_id, parent_milestone_id, child_milestone_id, dependency_type) VALUES (%s, %s, %s, 'FINISH_TO_START')",
+                    (project_id, p, c)
+                )
+        else:
+            # Fallback to sequential
+            MilestoneDependencyService.generate_sequential_dependencies(cursor, project_id)
+            
+        cursor.close()
+        
         # UPSERT deliverables
         existing_deliverables = BaselineRepository.get_deliverables_for_diff(thread_conn, baseline_id)
         for item in extracted_data.get("deliverables", []):

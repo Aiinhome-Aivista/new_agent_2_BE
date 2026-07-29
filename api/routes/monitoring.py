@@ -99,26 +99,7 @@ def stream_monitoring(
                 yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": "Only STATUS_REPORT and MOM can be processed"})}\n\n'
                 return
 
-            # ── Emit helper ───────────────────────────────────────────────────
-            def emit(step: str, progress: int):
-                event = json.dumps({"step": step, "progress": progress, "status": "running"})
-                pending_events.append(f"data: {event}\n\n")
-                
-                # Save progress status to database in a thread-safe way
-                try:
-                    update_conn = get_db_connection()
-                    if update_conn:
-                        upd_cursor = update_conn.cursor()
-                        upd_cursor.execute(
-                            "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
-                            (progress, step, document_id)
-                        )
-                        update_conn.commit()
-                        upd_cursor.close()
-                        update_conn.close()
-                except Exception as ex:
-                    print(f"Failed to update progress in DB: {ex}")
-
+            # removed old emit function from here
             pending_events = []
 
             # Mark as PROCESSING
@@ -154,6 +135,20 @@ def stream_monitoring(
                     print("!!! Background pipeline failed to establish db connection !!!")
                     pipeline_done[0] = True
                     return
+                def thread_emit(step: str, progress: int):
+                    event = json.dumps({"step": step, "progress": progress, "status": "running"})
+                    pending_events.append(f"data: {event}\\n\\n")
+                    try:
+                        upd_cursor = thread_conn.cursor()
+                        upd_cursor.execute(
+                            "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
+                            (progress, step, document_id)
+                        )
+                        thread_conn.commit()
+                        upd_cursor.close()
+                    except Exception as ex:
+                        print(f"Failed to update progress in DB: {ex}")
+
                 try:
                     cursor = thread_conn.cursor(dictionary=True)
                     OrchestratorAgent.run_workflow(
@@ -161,7 +156,7 @@ def stream_monitoring(
                         document_id=document_id,
                         text=text,
                         db_cursor=cursor,
-                        emit=emit,
+                        emit=thread_emit,
                     )
                     upd2 = thread_conn.cursor()
                     upd2.execute(

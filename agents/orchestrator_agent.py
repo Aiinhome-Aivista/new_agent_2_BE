@@ -137,6 +137,11 @@ class OrchestratorAgent:
         activity_map = {}
         request_map = {}
 
+        # --- 0. Clean up old data for this document ---
+        db_cursor.execute("DELETE FROM project_activities WHERE document_id = %s", (document_id,))
+        db_cursor.execute("DELETE FROM tracker_items WHERE source_document_id = %s", (document_id,))
+        db_cursor.execute("DELETE FROM new_requests WHERE document_id = %s", (document_id,))
+        
         # --- 1. Process Activities ---
         for item in extracted_data.get("activities", []):
             name = item.get("activity_name", "Unknown")

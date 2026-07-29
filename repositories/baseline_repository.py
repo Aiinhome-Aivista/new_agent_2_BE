@@ -32,6 +32,18 @@ class BaselineRepository:
         cursor.close()
 
     @staticmethod
+    def delete_scope_items_by_baseline(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> None:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM scope_items WHERE baseline_id = %s", (baseline_id,))
+        cursor.close()
+
+    @staticmethod
+    def delete_deliverables_by_baseline(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> None:
+        cursor = db.cursor()
+        cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s", (baseline_id,))
+        cursor.close()
+
+    @staticmethod
     def get_max_baseline_version(db: mysql.connector.connection.MySQLConnection, project_id: int) -> int:
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT MAX(version) as max_v FROM scope_baselines WHERE project_id = %s", (project_id,))
@@ -75,6 +87,27 @@ class BaselineRepository:
         """, (target_baseline_id, source_baseline_id))
         cursor.close()
 
+
+    @staticmethod
+    def create_project_milestone(db, project_id, baseline_id, name, sequence, status='Planned', planned_date=None):
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO project_milestones (project_id, baseline_id, name, sequence, status, planned_date) VALUES (%s, %s, %s, %s, %s, %s)",
+            (project_id, baseline_id, name, sequence, status, planned_date)
+        )
+        milestone_id = cursor.lastrowid
+        cursor.close()
+        return milestone_id
+
+    @staticmethod
+    def create_scope_milestone_mapping(db, scope_item_id, milestone_id, weight=1.0):
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO scope_milestone_mapping (scope_item_id, milestone_id, weight) VALUES (%s, %s, %s)",
+            (scope_item_id, milestone_id, weight)
+        )
+        cursor.close()
+
     @staticmethod
     def get_scope_items_for_diff(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> List[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
@@ -101,7 +134,7 @@ class BaselineRepository:
         cursor.close()
 
     @staticmethod
-    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None) -> None:
+    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None) -> int:
         cursor = db.cursor()
         sql = """INSERT INTO scope_items 
                  (baseline_id, project_id, name, scope_item_normalized, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized, milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method)
@@ -112,7 +145,9 @@ class BaselineRepository:
             source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized,
             milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method
         ))
+        item_id = cursor.lastrowid
         cursor.close()
+        return item_id
 
     @staticmethod
     def get_deliverables_for_diff(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> List[Dict[str, Any]]:
@@ -185,10 +220,24 @@ class BaselineRepository:
             
         cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (baseline["id"],))
         deliverables = cursor.fetchall()
+        
+        cursor.execute("""
+            SELECT pm.*, 
+                   GROUP_CONCAT(DISTINCT md.child_milestone_id) as blocking_ids, 
+                   GROUP_CONCAT(DISTINCT md2.parent_milestone_id) as blocked_by_ids
+            FROM project_milestones pm
+            LEFT JOIN milestone_dependencies md ON pm.id = md.parent_milestone_id
+            LEFT JOIN milestone_dependencies md2 ON pm.id = md2.child_milestone_id
+            WHERE pm.project_id = %s AND pm.baseline_id = %s
+            GROUP BY pm.id
+        """, (project_id, baseline["id"]))
+        milestones = cursor.fetchall()
+        
         cursor.close()
         
         baseline["scope_items"] = items
         baseline["deliverables"] = deliverables
+        baseline["milestones"] = milestones
         return baseline
 
     @staticmethod
@@ -243,6 +292,27 @@ class BaselineRepository:
         item_id = cursor.lastrowid
         cursor.close()
         return item_id
+
+
+    @staticmethod
+    def create_project_milestone(db, project_id, baseline_id, name, sequence, status='Planned', planned_date=None):
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO project_milestones (project_id, baseline_id, name, sequence, status, planned_date) VALUES (%s, %s, %s, %s, %s, %s)",
+            (project_id, baseline_id, name, sequence, status, planned_date)
+        )
+        milestone_id = cursor.lastrowid
+        cursor.close()
+        return milestone_id
+
+    @staticmethod
+    def create_scope_milestone_mapping(db, scope_item_id, milestone_id, weight=1.0):
+        cursor = db.cursor()
+        cursor.execute(
+            "INSERT INTO scope_milestone_mapping (scope_item_id, milestone_id, weight) VALUES (%s, %s, %s)",
+            (scope_item_id, milestone_id, weight)
+        )
+        cursor.close()
 
     @staticmethod
     def get_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int) -> Optional[Dict[str, Any]]:

@@ -48,7 +48,12 @@ class ProjectRepository:
     @staticmethod
     def get_project_by_id(db: mysql.connector.connection.MySQLConnection, project_id: int) -> Optional[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM projects WHERE id = %s", (project_id,))
+        cursor.execute("""
+            SELECT p.*, 
+                (SELECT summary FROM risk_evaluations re WHERE re.project_id = p.id ORDER BY re.id DESC LIMIT 1) as latest_summary,
+                (SELECT sub_agent_results FROM risk_evaluations re WHERE re.project_id = p.id ORDER BY re.id DESC LIMIT 1) as latest_sub_agent_results
+            FROM projects p WHERE p.id = %s
+        """, (project_id,))
         project = cursor.fetchone()
         cursor.close()
         return project

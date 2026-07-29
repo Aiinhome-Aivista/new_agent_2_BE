@@ -7,13 +7,14 @@ class ScopeSectionDetector:
     """
     
     SECTION_PATTERNS = {
-        "Scope of Work": r"(?i)^(?:[0-9]+\.?\s*)?(?:Scope|Scope of Work|Project Scope|Engagement Scope)",
+        "Scope of Work": r"(?i)^(?:[0-9]+\.?\s*)?(?:Scope|Scope of Work|Project Scope|Engagement Scope|In Scope)",
         "Deliverables": r"(?i)^(?:[0-9]+\.?\s*)?(?:Deliverables|Key Deliverables|Project Deliverables)",
         "Responsibilities": r"(?i)^(?:[0-9]+\.?\s*)?(?:Responsibilities|Our Responsibilities|Vendor Responsibilities)",
         "Client Responsibilities": r"(?i)^(?:[0-9]+\.?\s*)?(?:Client Responsibilities|Your Responsibilities)",
         "Out of Scope": r"(?i)^(?:[0-9]+\.?\s*)?(?:Out of Scope|Exclusions|Not Included)",
         "Assumptions": r"(?i)^(?:[0-9]+\.?\s*)?(?:Assumptions|Key Assumptions|Project Assumptions|Commercial assumptions)",
-        "Dependencies": r"(?i)^(?:[0-9]+\.?\s*)?(?:Dependencies|Project Dependencies)"
+        "Dependencies": r"(?i)^(?:[0-9]+\.?\s*)?(?:Dependencies|Project Dependencies)",
+        "Milestones": r"(?i)^(?:[0-9]+\.?\s*)?(?:Milestones|Project Milestones.*|Timeline)"
     }
 
     @classmethod

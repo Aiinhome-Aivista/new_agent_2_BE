@@ -1,6 +1,7 @@
 import os
 # pyrefly: ignore [missing-import]
 import fitz # PyMuPDF
+import docx
 from docx import Document
 from typing import List, Dict, Any
 from core.config import settings
@@ -71,8 +72,20 @@ class DocumentService:
     @staticmethod
     def process_docx(file_path: str) -> List[Dict[str, Any]]:
         doc = Document(file_path)
-        full_text = "\n".join([para.text for para in doc.paragraphs if para.text.strip()])
-        chunks = chunk_text(full_text)
+        full_text = []
+        for element in doc.element.body:
+            if element.tag.endswith('p'):
+                para = docx.text.paragraph.Paragraph(element, doc)
+                if para.text.strip():
+                    full_text.append(para.text)
+            elif element.tag.endswith('tbl'):
+                table = docx.table.Table(element, doc)
+                for row in table.rows:
+                    row_text = "\t".join([cell.text.strip().replace("\n", " ") for cell in row.cells])
+                    if row_text.strip():
+                        full_text.append(row_text)
+                        
+        chunks = chunk_text("\n".join(full_text))
         return [{"page_number": None, "text": chunk, "chunk_index": idx} for idx, chunk in enumerate(chunks)]
 
     @staticmethod

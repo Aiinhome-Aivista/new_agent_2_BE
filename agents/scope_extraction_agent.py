@@ -94,6 +94,7 @@ Evidence Rules:
 1. Evidence MUST be taken ONLY from the section where the item was actually extracted.
 2. NEVER cite unrelated document sections in the evidence text (e.g., do not cite 'Out of Scope' for an IN_SCOPE item).
 3. The explanation must always be internally consistent with the final classification.
+4. NEVER group multiple distinct testing or deployment phases (e.g. SIT, UAT, Production) into a single item. They MUST be extracted as separate, individual scope items and milestones.
 
 Document Text:
 {document_text}

@@ -8,6 +8,7 @@ from services.risk_scoring_engine import RiskScoringEngine
 from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivityRiskAgent
 from agents.tracker_audit_agent import TrackerAuditAgent
 from agents.alerting_agent import AlertingAgent
+from services.milestone_dependency_service import MilestoneDependencyService
 
 # ---------------------------------------------------------------------------
 # DETERMINISTIC MATCHING HELPERS
@@ -130,12 +131,20 @@ class RiskEvaluationAgent:
         risk_rules     = RiskConfigurationService.get_rules(db_cursor)
         impact_matrix  = RiskConfigurationService.get_impact_matrix(db_cursor)
         alert_rules    = RiskConfigurationService.get_alert_rules(db_cursor)
+        dependency_risk_config = RiskConfigurationService.get_dependency_risk_config(db_cursor)
 
         _emit("Loading Project Baseline", 10)
         scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
 
         # Fetch ALL baseline items (IN_SCOPE + OUT_OF_SCOPE) for canonical name resolution.
         all_baseline_items = ProjectKnowledgeService.get_full_baseline(db_cursor, project_id)
+
+        # Build dependency graph ONCE — used for both scoring and LLM context injection.
+        # This reads deliverable_progress.dependencies to find which items block others.
+        dependency_graph = MilestoneDependencyService.build_rich_dependency_graph(db_cursor, project_id)
+        dependency_context_block = ProjectKnowledgeService.get_dependency_context_block(dependency_graph)
+        if dependency_context_block:
+            print(f"  [DependencyRisk] Detected blocking relationships:\n{dependency_context_block}")
 
         # STEP 2: Extract activities once — LLM CALL #1
         _emit("Extracting Activities", 35)
@@ -177,9 +186,9 @@ class RiskEvaluationAgent:
             })
 
         # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
-        # High-confidence matches → IN_SCOPE immediately, skip LLM.
+        # High-confidence matches used to bypass the LLM, but now ALL items go to LLM for risk diagnosis.
         # Ambiguous activities → go to hybrid retrieval + LLM.
-        deterministic_in_scope = []   # Matched with high confidence
+        deterministic_in_scope = []   # Keeping empty for prompt compatibility later
         ambiguous_activities = []      # Need ChromaDB + LLM evaluation
 
         for act_item in cleaned_activities:
@@ -196,18 +205,15 @@ class RiskEvaluationAgent:
                     matched_si, confidence, match_type = matched_si2, confidence2, match_type2
 
             if confidence >= cls.DETERMINISTIC_CONFIDENCE_THRESHOLD or is_already_in_scope:
-                # High-confidence match or pre-resolved IN_SCOPE — mark without LLM
                 resolved_name = matched_si["name"] if matched_si else canonical_title
                 final_title, _ = _resolve_tracker_title(activity_name, resolved_name, scope_items, all_baseline_items)
-                print(f"  [Deterministic] '{activity_name}' → IN_SCOPE as '{final_title}' (confidence: {confidence}%)")
-                deterministic_in_scope.append({
+                print(f"  [Deterministic] '{activity_name}' → mapped as '{final_title}' (confidence: {confidence}%)")
+                ambiguous_activities.append({
                     "activity": activity_name,
-                    "classification": "IN_SCOPE",
-                    "deliverable": final_title,
                     "canonical_title": final_title,
-                    "confidence": confidence,
-                    "match_type": match_type,
-                    "source_sentence": source_sentence
+                    "source_sentence": source_sentence,
+                    "matched_si": matched_si,
+                    "confidence": confidence
                 })
             else:
                 # Ambiguous — needs deeper analysis
@@ -250,18 +256,65 @@ class RiskEvaluationAgent:
             # Retrieve milestone progress block to inject into the LLM prompt
             milestone_progress_block = ProjectKnowledgeService.calculate_milestone_progress(db_cursor, project_id)
             print(f"  [Info] Injected into prompt: {milestone_progress_block}")
+
+            # Combine milestone progress + dependency context for richer LLM awareness
+            combined_context = milestone_progress_block
+            if dependency_context_block:
+                combined_context += "\n\n" + dependency_context_block
             
-            llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, milestone_progress_block)
+            llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, combined_context)
+
 
         # ===========================================================
-        # STEP 6: Categorize all results
+        # STEP 6: Categorize all results & Milestone Level Cascade
         # ===========================================================
+        # Pass 1: Identify Delayed Milestones
+        delayed_milestone_ids = set()
+        
+        db_cursor.execute("SELECT id, name, planned_date, status FROM project_milestones WHERE project_id = %s", (project_id,))
+        milestone_details = {r['id']: r for r in db_cursor.fetchall()}
+        milestone_name_to_id = {r['name'].lower(): r['id'] for r in milestone_details.values()}
+        
+        db_cursor.execute("SELECT m.id as milestone_id, s.name as scope_name FROM scope_items s JOIN scope_milestone_mapping mmap ON s.id = mmap.scope_item_id JOIN project_milestones m ON mmap.milestone_id = m.id WHERE s.project_id = %s", (project_id,))
+        scope_to_milestone_id = {r['scope_name'].lower(): r['milestone_id'] for r in db_cursor.fetchall()}
+
+        for i, result in enumerate(llm_risk_results):
+            risk_cat = result.get("risk_category", "NONE")
+            activity_name = result.get("activity", "Unknown")
+            print(f"  [LLM-Output] {activity_name} -> {risk_cat}")
+            
+            if risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
+                activity_name = result.get("activity", "Unknown")
+                matched_baseline_name = result.get("matched_baseline_item")
+                pre_resolved = activities_with_contexts[i].get("canonical_title") if i < len(activities_with_contexts) else None
+                if not matched_baseline_name and i < len(activities_with_contexts):
+                    si = activities_with_contexts[i].get("matched_si")
+                    if si: matched_baseline_name = si["name"]
+                if not matched_baseline_name and pre_resolved:
+                    matched_baseline_name = pre_resolved
+                    
+                canonical_title, _ = _resolve_tracker_title(
+                    activity_name, matched_baseline_name, scope_items, all_baseline_items
+                )
+                
+                # Find milestone for this scope item
+                c_norm = _normalize(canonical_title)
+                for db_scope_name, m_id in scope_to_milestone_id.items():
+                    db_norm = _normalize(db_scope_name)
+                    if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
+                        delayed_milestone_ids.add(m_id)
+                        break
+
+        # Calculate cascade impact for all delayed milestones
+        cascade_impact = MilestoneDependencyService.calculate_milestone_cascade(db_cursor, project_id, list(delayed_milestone_ids))
+
         out_of_scope_activities = []
         timeline_deliverables = []
         in_scope_activities = list(deterministic_in_scope)  # Start with deterministic matches
 
-        # Process LLM results for ambiguous activities
+        # Pass 2: Scoring
         for i, result in enumerate(llm_risk_results):
+
             activity_name = result.get("activity", "Unknown")
             risk_cat = result.get("risk_category", "NONE")
             reasoning = result.get("reasoning", "")
@@ -312,6 +365,26 @@ class RiskEvaluationAgent:
             # ── PHASE 2: Deterministic Weighted Scoring ───────────────────────
             # LLM (Phase 1) diagnosed WHAT risk exists and which signals are present.
             # RiskScoringEngine (Phase 2) calculates HOW SEVERE deterministically.
+            # DependencyRiskEngine adds extra weight if this item blocks other items.
+# ── PHASE 2: Deterministic Weighted Scoring ───────────────────────
+            # Dependency cascade at milestone level
+            dep_count = 0
+            blocked_by_this = []
+            
+            c_norm = _normalize(canonical_title)
+            m_id = None
+            for db_scope_name, mid in scope_to_milestone_id.items():
+                db_norm = _normalize(db_scope_name)
+                if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
+                    m_id = mid
+                    break
+                    
+            if m_id and m_id in cascade_impact:
+                dep_count = cascade_impact[m_id]["blocked_count"]
+                blocked_by_this = cascade_impact[m_id]["blocked_milestones"]
+                if dep_count > 0:
+                    print(f"  [MilestoneCascade] '{canonical_title}' milestone blocking {dep_count} milestone(s): {blocked_by_this}")
+
             item_risk_score, score_breakdown = RiskScoringEngine.calculate(
                 risk_category=risk_cat,
                 signals=signals,
@@ -320,6 +393,9 @@ class RiskEvaluationAgent:
                 params=risk_params,
                 impact_matrix=impact_matrix,
                 rules=risk_rules,
+                dependent_count=dep_count,
+                blocked_milestones=blocked_by_this,
+                dependency_config=dependency_risk_config
             )
             item_risk_level = RiskConfigurationService.classify_severity(item_risk_score, risk_thresholds)
 
@@ -333,6 +409,9 @@ class RiskEvaluationAgent:
                 original_contract_sentence=original_contract_sentence,
             )
 
+            if risk_cat == "IGNORE":
+                continue
+
             if risk_cat == "SCOPE_CREEP":
                 out_of_scope_activities.append({
                     "activity": canonical_title,
@@ -344,16 +423,59 @@ class RiskEvaluationAgent:
                     "risk_level": item_risk_level,
                 })
             elif risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
+                # --- Action Priority Calculation ---
+                action_priority_score = 0
+                if m_id and m_id in milestone_details:
+                    # 1. Cascade Weight (+5 per blocked milestone)
+                    action_priority_score += (dep_count * 5)
+                    
+                    # 2. Root Cause Weight (+20 if blocking anything)
+                    if dep_count > 0:
+                        action_priority_score += 20
+                        
+                    # 3. Status Weight
+                    # Use the real-time activity status instead of the baseline status if available
+                    act_status = result.get("activity_status", milestone_details[m_id].get("status", "Planned"))
+                    if isinstance(act_status, str):
+                        act_status = act_status.upper()
+                        if act_status in ["BLOCKED", "DEPENDENCY", "ON_HOLD"]:
+                            action_priority_score += 20
+                        elif act_status in ["DELAYED", "DELAY"]:
+                            action_priority_score += 15
+                        elif act_status in ["IN_PROGRESS", "IN PROGRESS"]:
+                            action_priority_score += 10
+                            
+                    # 4. Date Proximity Weight
+                    p_date_str = milestone_details[m_id].get("planned_date")
+                    if p_date_str:
+                        try:
+                            from datetime import datetime
+                            today = datetime.now().date()
+                            p_date = datetime.strptime(str(p_date_str).split(' ')[0], "%Y-%m-%d").date()
+                            days_diff = abs((today - p_date).days)
+                            if days_diff <= 3:
+                                action_priority_score += 30
+                            elif days_diff <= 7:
+                                action_priority_score += 25
+                            elif days_diff <= 14:
+                                action_priority_score += 15
+                            else:
+                                action_priority_score += 5
+                        except Exception as e:
+                            pass
+
                 timeline_deliverables.append({
                     "deliverable": canonical_title,
-                    "expected_date": "Unknown",
-                    "current_status": "Delayed" if risk_cat == "DELAY" else "Blocked",
+                    "expected_date": str(milestone_details[m_id].get("planned_date", "Unknown")) if m_id and m_id in milestone_details else "Unknown",
+                    "current_status": "Customer Dependency" if risk_cat == "DEPENDENCY" else "Delayed" if risk_cat == "DELAY" else "Blocked",
                     "delay_days": 0,
                     "blockers": [source_sentence] if source_sentence else [],
+                    "confidence": int(confidence * 100),
+                    "action_priority_score": action_priority_score,
                     "dependency_status": risk_cat,
                     "risk": item_risk_level,
                     "risk_score": item_risk_score,
-                    "reasoning": full_evidence,
+                    "reasoning": full_evidence
                 })
             else:
                 in_scope_activities.append({
@@ -387,6 +509,13 @@ Output MUST be a valid JSON object:
    "overallRisk": "HIGH",
    "riskScore": 72,
    "summary": "2 sentence summary of overall project risk status.",
+   "highestActionPriority": {{
+      "activity": "Name of the Delayed/Blocked item with the highest action_priority_score",
+      "status": "In Progress (70%) or similar",
+      "dueDate": "3 Sep (2 days overdue) or similar based on expected_date",
+      "reason": "Bullet points explaining blockers and cascade impact",
+      "recommendedAction": "Specific actionable recommendation to resolve this top priority item"
+   }},
    "recommendations": [
       "One specific actionable recommendation per identified risk."
    ]
@@ -397,12 +526,17 @@ Output MUST be a valid JSON object:
         overall_risk = final_assessment.get("overallRisk", "LOW")
         risk_score = final_assessment.get("riskScore", 0)
         summary = final_assessment.get("summary", "")
+        highest_action_priority = final_assessment.get("highestActionPriority")
+        if highest_action_priority:
+            # We can prepend the top priority to recommendations or keep it in the summary object
+            pass
         recommendations = final_assessment.get("recommendations", [])
 
         sub_agent_results = {
             "in_scope": in_scope_result,
             "out_of_scope": out_of_scope_result,
-            "timeline": timeline_result
+            "timeline": timeline_result,
+            "highestActionPriority": highest_action_priority
         }
 
         # STEP 8: Persist to DB
@@ -511,9 +645,12 @@ Output MUST be a valid JSON object:
             item_risk_level = deliv.get('risk', 'MEDIUM')
             full_reasoning  = deliv.get('reasoning', f"Deliverable: {deliv_name}")
 
+            actual_risk_cat = deliv.get('dependency_status', 'DELAY')
+            item_type = 'BLOCKER' if actual_risk_cat in ['BLOCKED', 'DEPENDENCY'] else 'ACTION_ITEM'
+
             TrackerAuditAgent.persist_tracker_item(
-                db_cursor, project_id, document_id, 'ACTION_ITEM',
-                False, item_risk_score, item_risk_level, 'DELAY',
+                db_cursor, project_id, document_id, item_type,
+                False, item_risk_score, item_risk_level, actual_risk_cat,
                 1.0, full_reasoning, True,
                 title=card_title, reference_id=ref_id
             )
@@ -531,6 +668,7 @@ Output MUST be a valid JSON object:
             "overallRisk": overall_risk,
             "riskScore": risk_score,
             "summary": summary,
+            "highestActionPriority": highest_action_priority,
             "recommendations": recommendations,
             "subAgentResults": sub_agent_results
         }
