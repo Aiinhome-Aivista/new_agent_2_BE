@@ -132,7 +132,7 @@ def run_baseline_pipeline(project_id: int, document_id: int):
             item_type = item.get("scope_type", "UNCERTAIN")
             
             if item.get("is_pure_milestone", False):
-                item_type = "MILESTONE_ONLY"
+                item_type = "IN_SCOPE"
             
             existing_item = None
             best_ratio = 0.0
