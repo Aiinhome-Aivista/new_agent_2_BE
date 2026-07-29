@@ -1,4 +1,6 @@
+# pyrefly: ignore [missing-import]
 from fastapi import Depends, HTTPException, status
+# pyrefly: ignore [missing-import]
 from fastapi.security import OAuth2PasswordBearer
 from typing import List
 import jwt
@@ -34,3 +36,17 @@ def require_roles(allowed_roles: List[str]):
             )
         return current_user
     return role_checker
+
+def verify_project_access(project_id: int, current_user: dict, db):
+    if current_user["role"] in ["ADMIN", "PMO_REVIEWER", "FINANCE_COMMERCIAL"]:
+        return True
+    cursor = db.cursor()
+    cursor.execute("SELECT 1 FROM project_users WHERE project_id = %s AND user_id = %s", (project_id, current_user["id"]))
+    has_access = cursor.fetchone() is not None
+    cursor.close()
+    if not has_access:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You are not assigned to this project"
+        )
+    return True

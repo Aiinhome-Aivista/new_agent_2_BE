@@ -2,10 +2,48 @@ import requests
 import json
 import re
 from core.config import settings
+import os
+
+try:
+    from google import genai
+    if settings.USE_GEMINI and settings.GEMINI_API_KEY:
+        gemini_client = genai.Client(api_key=settings.GEMINI_API_KEY)
+except ImportError:
+    gemini_client = None
 
 class LLMService:
     @classmethod
     def generate(cls, prompt: str) -> str:
+        if settings.USE_GEMINI:
+            try:
+                if not gemini_client:
+                    raise RuntimeError("Gemini client is not initialized.")
+                
+                # Simple retry logic for 429 Rate Limits and 503 Temporary Spikes
+                import time
+                max_retries = 4
+                for attempt in range(max_retries):
+                    try:
+                        response = gemini_client.models.generate_content(
+                            model=settings.GEMINI_MODEL,
+                            contents=prompt
+                        )
+                        return response.text
+                    except Exception as e:
+                        err_str = str(e)
+                        is_client_error = any(code in err_str for code in ["400", "401", "403"])
+                        
+                        if not is_client_error and attempt < max_retries - 1:
+                            wait = 30 if "429" in err_str else 5
+                            print(f"Gemini error encountered: {err_str}. Waiting {wait}s before retry (Attempt {attempt + 1}/{max_retries})...")
+                            time.sleep(wait)
+                        else:
+                            print(f"Gemini failed permanently (Quota/Client Error). Falling back to secondary LLM: {settings.LLM_MODEL}")
+                            break # Break out of the retry loop to trigger fallback
+                            
+            except Exception as e:
+                print(f"Gemini LLM Error: {e}. Falling back to secondary LLM.")
+
         payload = {
             "model": settings.LLM_MODEL,
             "prompt": prompt,

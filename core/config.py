@@ -23,8 +23,11 @@ class Settings(BaseSettings):
     
     LLM_API_URL: str
     LLM_MODEL: str
-    LLM_TIMEOUT: int = 300
+    LLM_TIMEOUT: int = 3600
     
+    USE_GEMINI: bool = False
+    GEMINI_API_KEY: str = ""
+    GEMINI_MODEL: str = "gemini-3.5-flash"
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     CHROMA_PATH: str = "data/chroma_db"
@@ -46,11 +49,10 @@ class Settings(BaseSettings):
     CONTEXT_COMPACTION_ENABLED: bool = True
     CONTEXT_MAX_CHARACTERS: int = 20000
     
-    SMTP_HOST: str = ""
+    SMTP_SERVER: str = ""
     SMTP_PORT: int = 587
-    SMTP_USERNAME: str = ""
+    SMTP_EMAIL: str = ""
     SMTP_PASSWORD: str = ""
-    SMTP_FROM_EMAIL: str = ""
     SMTP_USE_TLS: bool = True
 
     class Config:

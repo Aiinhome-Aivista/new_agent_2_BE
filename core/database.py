@@ -1,5 +1,7 @@
 import mysql.connector
 from mysql.connector import Error
+# pyrefly: ignore [missing-import]
+from fastapi import HTTPException
 from .config import settings
 
 def get_db_connection():
@@ -22,8 +24,6 @@ def get_db_connection():
 def get_db():
     conn = get_db_connection()
     if not conn:
-        # pyrefly: ignore [missing-import]
-        from fastapi import HTTPException
         raise HTTPException(status_code=500, detail="Database connection failed")
     try:
         yield conn

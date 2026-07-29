@@ -33,6 +33,8 @@ monitoring_status ENUM(
 'ACTIVE',
 'PAUSED'
 ) NOT NULL DEFAULT 'DRAFT',
+start_date DATE NULL,
+end_date DATE NULL,
 created_by BIGINT NOT NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -70,12 +72,19 @@ name VARCHAR(150) NOT NULL,
 email VARCHAR(255),
 role VARCHAR(100),
 responsibility TEXT,
+user_id BIGINT NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_stakeholders_project
         FOREIGN KEY (project_id)
         REFERENCES projects(id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_stakeholders_user
+        FOREIGN KEY (user_id)
+        REFERENCES users(id)
+        ON DELETE SET NULL
 );
 
 CREATE TABLE documents (
@@ -150,6 +159,7 @@ status ENUM(
 ) NOT NULL DEFAULT 'DRAFT',
 approved_by BIGINT NULL,
 approved_at DATETIME NULL,
+source_document_id BIGINT NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT uq_baseline_version
@@ -162,7 +172,12 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_baseline_approved_by
         FOREIGN KEY (approved_by)
-        REFERENCES users(id)
+        REFERENCES users(id),
+
+    CONSTRAINT fk_baseline_document
+        FOREIGN KEY (source_document_id)
+        REFERENCES documents(id)
+        ON DELETE SET NULL
 );
 
 CREATE TABLE scope_items (
@@ -170,6 +185,7 @@ id BIGINT PRIMARY KEY AUTO_INCREMENT,
 baseline_id BIGINT NOT NULL,
 project_id BIGINT NOT NULL,
 name VARCHAR(500) NOT NULL,
+scope_item_normalized VARCHAR(500),
 description TEXT,
 scope_type ENUM(
 'IN_SCOPE',
@@ -181,6 +197,10 @@ source_page INT NULL,
 source_section VARCHAR(255),
 evidence_text TEXT NOT NULL,
 confidence DECIMAL(5,4),
+deadline DATE NULL,
+deadline_original VARCHAR(255),
+deadline_normalized DATE NULL,
+milestone_normalized VARCHAR(255),
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_scope_item_baseline
@@ -484,6 +504,78 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         ON DELETE SET NULL
 );
 
+CREATE TABLE risk_evaluations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    project_id BIGINT NOT NULL,
+    document_id BIGINT NOT NULL,
+    evaluation_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    overall_risk_score INT DEFAULT 0,
+    overall_risk_level ENUM('LOW', 'MEDIUM', 'HIGH', 'CRITICAL') DEFAULT 'LOW',
+    summary TEXT,
+    recommendations JSON,
+    sub_agent_results JSON,
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE progress_status_config (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    status_code VARCHAR(50) NOT NULL UNIQUE,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO progress_status_config (status_code, label) VALUES 
+('NOT_STARTED', 'Not Started'),
+('IN_PROGRESS', 'In Progress'),
+('BLOCKED', 'Blocked'),
+('COMPLETED', 'Completed'),
+('DELAYED', 'Delayed'),
+('RESCHEDULED', 'Rescheduled'),
+('AT_RISK', 'At Risk'),
+('PENDING', 'Pending');
+
+CREATE TABLE progress_source_config (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    source_code VARCHAR(50) NOT NULL UNIQUE,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO progress_source_config (source_code, label) VALUES 
+('DOCUMENT', 'Extracted from Document'),
+('USER', 'Manual Update'),
+('SYSTEM', 'System Generated');
+
+CREATE TABLE deliverable_progress (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    project_id BIGINT NOT NULL,
+    scope_item_id BIGINT NOT NULL,
+    source_document_id BIGINT NULL,
+    risk_evaluation_id BIGINT NOT NULL,
+    baseline_version INT NOT NULL,
+    status_code VARCHAR(50) NOT NULL,
+    progress_percentage INT NULL,
+    progress_source VARCHAR(50) NOT NULL DEFAULT 'DOCUMENT',
+    execution_summary TEXT,
+    dependencies JSON,
+    confidence DECIMAL(5,4),
+    evidence_text TEXT,
+    status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (scope_item_id) REFERENCES scope_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_document_id) REFERENCES documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (risk_evaluation_id) REFERENCES risk_evaluations(id) ON DELETE CASCADE,
+    FOREIGN KEY (status_code) REFERENCES progress_status_config(status_code),
+    FOREIGN KEY (progress_source) REFERENCES progress_source_config(source_code)
+);
+
 CREATE INDEX idx_projects_status ON projects(monitoring_status);
 CREATE INDEX idx_documents_project ON documents(project_id);
 CREATE INDEX idx_documents_type ON documents(project_id, document_type);
@@ -498,3 +590,34 @@ CREATE INDEX idx_alerts_project ON alerts(project_id);
 CREATE INDEX idx_workflow_project ON workflow_runs(project_id);
 CREATE INDEX idx_episodic_project ON episodic_memory(project_id, created_at);
 CREATE INDEX idx_audit_project ON audit_logs(project_id, created_at);
+
+DELIMITER //
+
+CREATE PROCEDURE truncate_all_tables_except_users_and_master()
+BEGIN
+    SET FOREIGN_KEY_CHECKS = 0;
+
+    TRUNCATE TABLE alerts;
+    TRUNCATE TABLE audit_logs;
+    TRUNCATE TABLE context_compactions;
+    TRUNCATE TABLE deliverable_progress;
+    TRUNCATE TABLE deliverables;
+    TRUNCATE TABLE document_types;
+    TRUNCATE TABLE documents;
+    TRUNCATE TABLE episodic_memory;
+    TRUNCATE TABLE finding_evidence;
+    TRUNCATE TABLE new_requests;
+    TRUNCATE TABLE project_activities;
+    TRUNCATE TABLE project_users;
+    TRUNCATE TABLE projects;
+    TRUNCATE TABLE risk_findings;
+    TRUNCATE TABLE scope_baselines;
+    TRUNCATE TABLE scope_items;
+    TRUNCATE TABLE stakeholders;
+    TRUNCATE TABLE tracker_items;
+    TRUNCATE TABLE workflow_runs;
+
+    SET FOREIGN_KEY_CHECKS = 1;
+END //
+
+DELIMITER ;

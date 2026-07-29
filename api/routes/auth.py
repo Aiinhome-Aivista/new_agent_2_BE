@@ -1,9 +1,11 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import Any
 from core.database import get_db
 from core.security import verify_password, create_access_token
 from api.dependencies.auth import get_current_user
+from repositories.user_repository import UserRepository
 import mysql.connector
 
 router = APIRouter()
@@ -14,10 +16,7 @@ class LoginRequest(BaseModel):
 
 @router.post("/login")
 def login(login_data: LoginRequest, db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id, name, email, password_hash, role, is_active FROM users WHERE email = %s", (login_data.email,))
-    user = cursor.fetchone()
-    cursor.close()
+    user = UserRepository.get_user_by_email(db, login_data.email)
 
     if not user or not verify_password(login_data.password, user["password_hash"]):
         raise HTTPException(
@@ -52,10 +51,7 @@ def login(login_data: LoginRequest, db: mysql.connector.connection.MySQLConnecti
 
 @router.get("/me")
 def read_users_me(current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT id, name, email, role FROM users WHERE id = %s", (current_user["id"],))
-    user = cursor.fetchone()
-    cursor.close()
+    user = UserRepository.get_user_by_id(db, current_user["id"])
     
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
