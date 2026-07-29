@@ -117,33 +117,33 @@ class BaselineRepository:
         return items
 
     @staticmethod
-    def update_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, status_change_tag: Optional[str], deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None) -> None:
+    def update_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, status_change_tag: Optional[str], deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None, completion_status: Optional[str] = None) -> None:
         cursor = db.cursor()
         sql = """UPDATE scope_items 
                  SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
                      source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s, deadline = %s,
                      milestone = %s, deadline_text = %s, extraction_confidence = %s, extraction_method = %s,
-                     scope_item_normalized = %s, milestone_normalized = %s, deadline_original = %s, deadline_normalized = %s, category = %s
+                     scope_item_normalized = %s, milestone_normalized = %s, deadline_original = %s, deadline_normalized = %s, category = %s, completion_status = COALESCE(%s, completion_status)
                  WHERE id = %s"""
         cursor.execute(sql, (
             description, scope_type, source_document_id, source_page,
             source_section, evidence_text, confidence, status_change_tag, deadline,
             milestone, deadline_text, extraction_confidence, extraction_method,
-            scope_item_normalized, milestone_normalized, deadline_original, deadline_normalized, category, item_id
+            scope_item_normalized, milestone_normalized, deadline_original, deadline_normalized, category, completion_status, item_id
         ))
         cursor.close()
 
     @staticmethod
-    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None) -> int:
+    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None, completion_status: str = 'ACTIVE') -> int:
         cursor = db.cursor()
         sql = """INSERT INTO scope_items 
-                 (baseline_id, project_id, name, scope_item_normalized, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized, milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                 (baseline_id, project_id, name, scope_item_normalized, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized, milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
         cursor.execute(sql, (
             baseline_id, project_id, name, scope_item_normalized, description,
             scope_type, source_document_id, source_page,
             source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized,
-            milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category
+            milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status
         ))
         item_id = cursor.lastrowid
         cursor.close()

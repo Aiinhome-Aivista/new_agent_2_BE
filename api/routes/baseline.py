@@ -139,6 +139,13 @@ def run_baseline_pipeline(project_id: int, document_id: int):
             if not item_category:
                 item_category = "FUNCTIONAL"
 
+            raw_status = item.get("milestone_status", "").upper()
+            completion_status = "ACTIVE"
+            if "COMPLETED" in raw_status or "DONE" in raw_status:
+                completion_status = "COMPLETED"
+            elif "CANCEL" in raw_status:
+                completion_status = "CANCELLED"
+
             existing_item = None
             best_ratio = 0.0
             for db_item in existing_scope_items:
@@ -192,7 +199,8 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
                     deadline_normalized=item.get("deadline_normalized"),
-                    category=item_category
+                    category=item_category,
+                    completion_status=completion_status
                 )
                 item_id = existing_item["id"]
                 item["_db_id"] = item_id
@@ -218,7 +226,8 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
                     deadline_normalized=item.get("deadline_normalized"),
-                    category=item_category
+                    category=item_category,
+                    completion_status=completion_status
                 )
                 item["_db_id"] = item_id
         
@@ -292,10 +301,9 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     "INSERT INTO milestone_dependencies (project_id, parent_milestone_id, child_milestone_id, dependency_type) VALUES (%s, %s, %s, 'FINISH_TO_START')",
                     (project_id, p, c)
                 )
-        else:
-            # Fallback to sequential
-            MilestoneDependencyService.generate_sequential_dependencies(cursor, project_id)
-            
+        # We NO LONGER fallback to sequential dependencies because ELs often don't have them
+        # and generating fake ones ruins the dependency graph for risk evaluation.
+        
         cursor.close()
         
         # UPSERT deliverables
