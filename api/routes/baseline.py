@@ -131,9 +131,14 @@ def run_baseline_pipeline(project_id: int, document_id: int):
             item_name = item.get("name", "Unknown")
             item_type = item.get("scope_type", "UNCERTAIN")
             
+            item_category = item.get("category")
             if item.get("is_pure_milestone", False):
                 item_type = "IN_SCOPE"
+                item_category = "MILESTONE"
             
+            if not item_category:
+                item_category = "FUNCTIONAL"
+
             existing_item = None
             best_ratio = 0.0
             for db_item in existing_scope_items:
@@ -186,7 +191,8 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     scope_item_normalized=item.get("scope_item_normalized"),
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
-                    deadline_normalized=item.get("deadline_normalized")
+                    deadline_normalized=item.get("deadline_normalized"),
+                    category=item_category
                 )
                 item_id = existing_item["id"]
                 item["_db_id"] = item_id
@@ -211,7 +217,8 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     scope_item_normalized=item.get("scope_item_normalized"),
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
-                    deadline_normalized=item.get("deadline_normalized")
+                    deadline_normalized=item.get("deadline_normalized"),
+                    category=item_category
                 )
                 item["_db_id"] = item_id
         
@@ -394,6 +401,15 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
     if active_proc or doc.get("processing_status") == "PROCESSING":
         return {"success": True, "message": "Baseline extraction already in progress for this project", "data": {"baseline_id": None}}
         
+    # Set status to PROCESSING synchronously to prevent race condition with frontend polling
+    cursor = db.cursor()
+    cursor.execute(
+        "UPDATE documents SET processing_status = 'PROCESSING', processing_progress = 5, processing_step = 'Starting extraction...', processing_started_at = NOW() WHERE id = %s",
+        (document_id,)
+    )
+    db.commit()
+    cursor.close()
+
     thread = threading.Thread(
         target=run_baseline_pipeline,
         args=(project_id, document_id),
