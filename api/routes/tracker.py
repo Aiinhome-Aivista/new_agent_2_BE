@@ -50,7 +50,7 @@ def reactivate_tracker_item(project_id: int, item_id: int, current_user: dict = 
     if not item:
         raise HTTPException(status_code=404, detail="Item not found")
         
-    TrackerRepository.reactivate_item(db, item_id)
+    TrackerRepository.reactivate_item(db, item_id, current_user["id"])
     
     # If the tracker item is associated with a scope item (reference_id), mark the scope item as ACTIVE
     if item.get("reference_id"):

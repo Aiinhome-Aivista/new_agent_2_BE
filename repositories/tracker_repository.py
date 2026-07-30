@@ -1,5 +1,6 @@
 import mysql.connector
 from typing import List, Dict, Any, Optional
+import json
 from core.database import get_db_connection
 
 class TrackerRepository:
@@ -30,6 +31,48 @@ class TrackerRepository:
             print(f"Tracker table auto-migration warning: {e}")
 
     @staticmethod
+    def _fetch_and_attach_audit_trails(db: mysql.connector.connection.MySQLConnection, items: List[Dict[str, Any]], project_id: int) -> None:
+        if not items:
+            return
+        
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT a.*
+            FROM audit_logs a
+            WHERE a.project_id = %s AND a.entity_type = 'TRACKER_ITEM'
+            ORDER BY a.created_at ASC
+        """, (project_id,))
+        logs = cursor.fetchall()
+        cursor.close()
+        
+        logs_by_item = {}
+        for log in logs:
+            eid = log["entity_id"]
+            if eid not in logs_by_item:
+                logs_by_item[eid] = []
+            
+            details = {}
+            if log["details_json"]:
+                if isinstance(log["details_json"], dict):
+                    details = log["details_json"]
+                elif isinstance(log["details_json"], str):
+                    try:
+                        details = json.loads(log["details_json"])
+                    except Exception:
+                        pass
+                    
+            logs_by_item[eid].append({
+                "action": log["action"],
+                "agent_name": log["agent_name"],
+                "user_name": details.get("user_name", "System") if isinstance(details, dict) else "System",
+                "created_at": log["created_at"].isoformat() if log["created_at"] else None,
+                "details": details
+            })
+            
+        for item in items:
+            item["audit_trail"] = logs_by_item.get(item["id"], [])
+
+    @staticmethod
     def get_tracker_items(db: mysql.connector.connection.MySQLConnection, project_id: int) -> List[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
         cursor.execute("""
@@ -53,6 +96,9 @@ class TrackerRepository:
         """, (project_id,))
         items = cursor.fetchall()
         cursor.close()
+        
+        TrackerRepository._fetch_and_attach_audit_trails(db, items, project_id)
+        
         return items
 
     @staticmethod
@@ -61,6 +107,10 @@ class TrackerRepository:
         cursor.execute("SELECT * FROM tracker_items WHERE id = %s AND project_id = %s", (item_id, project_id))
         item = cursor.fetchone()
         cursor.close()
+        
+        if item:
+            TrackerRepository._fetch_and_attach_audit_trails(db, [item], project_id)
+            
         return item
 
     @staticmethod
@@ -71,6 +121,23 @@ class TrackerRepository:
             SET resolution = %s, status = %s, resolved_by = %s, resolved_at = NOW() 
             WHERE id = %s
         """, (resolution, status, resolved_by, item_id))
+        
+        cursor.execute("SELECT project_id FROM tracker_items WHERE id = %s", (item_id,))
+        row = cursor.fetchone()
+        project_id = row[0] if row else None
+        
+        if project_id:
+            # Fetch user name for details_json
+            cursor.execute("SELECT name FROM users WHERE id = %s", (resolved_by,))
+            user_row = cursor.fetchone()
+            user_name = user_row[0] if user_row else "User"
+            
+            details = json.dumps({"resolution": resolution, "status": status, "user_name": user_name})
+            cursor.execute("""
+                INSERT INTO audit_logs (project_id, agent_name, action, entity_type, entity_id, details_json)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (project_id, user_name, "RESOLVE_TRACKER_ITEM", "TRACKER_ITEM", item_id, details))
+            
         cursor.close()
 
     @staticmethod
@@ -86,14 +153,37 @@ class TrackerRepository:
         """, (item_id,))
         item = cursor.fetchone()
         cursor.close()
+        
+        if item:
+            TrackerRepository._fetch_and_attach_audit_trails(db, [item], item['project_id'])
+            
         return item
 
     @staticmethod
-    def reactivate_item(db: mysql.connector.connection.MySQLConnection, item_id: int) -> None:
+    def reactivate_item(db: mysql.connector.connection.MySQLConnection, item_id: int, reactivated_by: int = None) -> None:
         cursor = db.cursor()
         cursor.execute("""
             UPDATE tracker_items 
             SET resolution = NULL, status = 'OPEN', resolved_by = NULL, resolved_at = NULL 
             WHERE id = %s
         """, (item_id,))
+        
+        cursor.execute("SELECT project_id FROM tracker_items WHERE id = %s", (item_id,))
+        row = cursor.fetchone()
+        project_id = row[0] if row else None
+        
+        if project_id:
+            user_name = "System"
+            if reactivated_by is not None:
+                cursor.execute("SELECT name FROM users WHERE id = %s", (reactivated_by,))
+                user_row = cursor.fetchone()
+                if user_row:
+                    user_name = user_row[0]
+                    
+            details = json.dumps({"status": "OPEN", "reason": "Manually reactivated", "user_name": user_name})
+            cursor.execute("""
+                INSERT INTO audit_logs (project_id, agent_name, action, entity_type, entity_id, details_json)
+                VALUES (%s, %s, %s, %s, %s, %s)
+            """, (project_id, user_name, "REACTIVATE_TRACKER_ITEM", "TRACKER_ITEM", item_id, details))
+            
         cursor.close()
