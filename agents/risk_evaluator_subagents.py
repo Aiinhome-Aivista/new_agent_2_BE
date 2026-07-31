@@ -24,50 +24,8 @@ class ActivityExtractorAgent:
           - Strip date suffixes from deliverable names (dates are metadata, not titles)
           - Merge semantically equivalent activities into a single business entity
         """
-        prompt = f"""You are the Activity Extractor and Normalizer Agent.
-Your job is to read the following project document (MOM / Status Report) and extract every
-work activity, deliverable update, action item, or scope request mentioned.
-
-=== DOCUMENT ===
-{document_text}
-
-CRITICAL RULES:
-1. The Risk Tracker is a contractual monitoring system. Tracker items represent contractual 
-   deliverables, not activity log entries.
-2. For each activity, produce a NORMALIZED BUSINESS ENTITY name — what the contractual item is,
-   not how it was described in this meeting.
-3. Normalization means:
-   - Strip action verbs: "Evaluate", "Review", "Prepare", "Discuss", "Assess", "Consider"
-   - Strip noise words: "Request", "Proposal", "Assessment", "Activity"
-   - Strip customer preambles: "Customer shall provide", "Client must"
-   - Strip date suffixes: "UAT - 15 May 2026" → "UAT"
-   - Merge semantically identical activities: "Evaluate SAP Integration Request" AND
-     "SAP Integration Request Assessment" both normalize to "SAP Integration"
-4. Preserve the original sentence as source_sentence (this becomes the evidence).
-5. Ignore greetings, attendance lists, signatures, and agenda headings.
-
-Examples of correct normalization:
-- "Evaluate SAP Integration Request" → "SAP Integration"
-- "Review Mobile Applications Request" → "Mobile Applications"
-- "Evaluate Voice Bot Proposal" → "Voice Bot"
-- "CRM Integration Development" → "CRM Integration"
-- "Analytics Dashboard Development" → "Analytics Dashboard"
-- "Customer shall provide VPN connectivity" → "VPN Connectivity"
-- "Customer shall provide API credentials" → "API Credentials"
-- "UAT - 15 May 2026" → "UAT"
-- "Go Live - 30 June 2026" → "Production Deployment (Go Live)"
-
-Output MUST be valid JSON — return unique normalized activities only (deduplicate by entity):
-{{
-  "activities": [
-    {{
-      "activity": "SAP Integration",
-      "source_sentence": "The team discussed evaluating the SAP Integration request.",
-      "confidence": 90
-    }}
-  ]
-}}
-"""
+        from core.prompts import get_activity_extractor_prompt
+        prompt = get_activity_extractor_prompt(document_text)
         result = LLMService.generate_json(prompt)
         return result.get("activities", [])
 
@@ -108,52 +66,8 @@ Baseline Context:
 {item['context']}
 """
 
-        prompt = f"""You are the Activity Fact Extraction Agent (Phase 1).
-The Risk Tracker is a contractual monitoring system. Every item must represent a contractual deliverable or scope request.
-
-Your job is FACT EXTRACTION ONLY. You do NOT calculate execution priority, root cause, cascade impact, or any numeric scores. Those are handled deterministically in the backend.
-
-Evaluate each of the following activities using ONLY their provided baseline context.
-
-{milestone_progress_block}
-
-{activities_block}
-
-RULES:
-1. TRACKER TITLE PRIORITY (in order):
-   a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item".
-   b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name.
-   c. If NO baseline match exists → use the normalized activity name.
-
-2. STATUS EXTRACTION:
-   - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, or UNKNOWN.
-
-3. BLOCKED BY:
-   - If the activity is blocked or waiting on something, list exactly what it is blocked by as an array of strings (e.g., ["API Credentials", "VPN"]).
-   - If not blocked, return an empty array [].
-
-4. PROGRESS:
-   - Extract progress percentage if explicitly mentioned (e.g., 70 for 70%). Otherwise, null.
-
-5. ENTITY TYPE:
-   - Identify what kind of entity this is: MILESTONE, DEPENDENCY, SCOPE_REQUEST, ACTION_ITEM, or RISK.
-
-6. EVIDENCE TEXT:
-   - You MUST provide `evidence_text` for every extracted fact. Every downstream calculation must be traceable back to the original MoM sentence.
-
-Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
-[
-  {{
-    "activity": "Activity name as given",
-    "entity_type": "MILESTONE|DEPENDENCY|SCOPE_REQUEST|ACTION_ITEM|RISK",
-    "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
-    "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|UNKNOWN",
-    "progress": 70,
-    "blocked_by": ["Item 1", "Item 2"],
-    "evidence_text": "Exact quote from document proving this status/blocker."
-  }}
-]
-"""
+        from core.prompts import get_batch_activity_risk_prompt
+        prompt = get_batch_activity_risk_prompt(milestone_progress_block, activities_block)
         result = LLMService.generate_json(prompt)
         if isinstance(result, list):
             return result
@@ -185,43 +99,8 @@ class DeliverableTimelineEvaluationAgent:
         except Exception:
             risk_block = str(risk_eval_output)
 
-        prompt = f"""You are the Deliverable Timeline Evaluation Agent.
-Your job is to extract project execution progress for specific approved baseline deliverables based on the provided document (MoM/Status Report).
-
-=== APPROVED BASELINE DELIVERABLES ===
-{baseline_block}
-
-=== RISK EVALUATION OUTPUT ===
-{risk_block}
-
-=== DOCUMENT TEXT ===
-{document_text}
-
-CRITICAL RULES:
-1. One progress record per approved baseline deliverable ONLY. Do not create duplicates for the same deliverable.
-2. If multiple document statements refer to the same deliverable, consolidate them into a single "execution_summary" and single progress record.
-3. NEVER invent or infer progress percentages. 
-   - Allowed: Document says "60%" -> You output 60.
-   - Allowed: Document says "Completed" -> You output null for percentage, but "COMPLETED" for status.
-   - NOT Allowed: Document says "Completed" -> Output 100%. (Unless the text explicitly says 100%).
-4. Map the progress_status strictly to one of: NOT_STARTED, IN_PROGRESS, BLOCKED, COMPLETED, DELAYED, RESCHEDULED, AT_RISK, PENDING.
-5. Identify any "dependencies" (formerly blockers) if the item is blocked or delayed (e.g., VPN, API credentials, infrastructure).
-
-Output MUST be a valid JSON object with the following schema:
-{{
-  "progress_records": [
-    {{
-      "scope_item_id": 123, // The ID of the baseline item from the input
-      "progress_status": "COMPLETED",
-      "progress_percentage": 60, // integer between 0-100 or null
-      "execution_summary": "Development completed and handed over to QA.",
-      "dependencies": ["VPN Connectivity", "API Credentials"], // List of strings or empty list
-      "confidence": 0.95, // 0.0 - 1.0
-      "evidence_text": "Exact quote from document supporting this status."
-    }}
-  ]
-}}
-"""
+        from core.prompts import get_deliverable_timeline_evaluation_prompt
+        prompt = get_deliverable_timeline_evaluation_prompt(baseline_block, risk_block, document_text)
         result = LLMService.generate_json(prompt)
         return result.get("progress_records", [])
 

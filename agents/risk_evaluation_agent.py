@@ -501,36 +501,13 @@ class RiskEvaluationAgent:
 
         # STEP 7: Aggregation — LLM CALL #3
         _emit("Calculating Risk Score", 80)
-        aggregation_prompt = f"""You are the Risk Aggregation Agent.
-Summarize the following risk evaluation results and compute an overall project risk score.
-
-In-Scope Activities: {len(in_scope_activities)} (including {len(deterministic_in_scope)} confirmed by baseline matching)
-Out-of-Scope / Scope Creep Items: {len(out_of_scope_activities)}
-Delayed / Blocked Deliverables: {len(timeline_deliverables)}
-
-Scope Creep Items:
-{json.dumps(out_of_scope_activities, indent=2)}
-
-Delayed / Blocked Items:
-{json.dumps(timeline_deliverables, indent=2)}
-
-Output MUST be a valid JSON object:
-{{
-   "overallRisk": "HIGH",
-   "riskScore": 72,
-   "summary": "2 sentence summary of overall project risk status.",
-   "highestActionPriority": {{
-      "activity": "Name of the Delayed/Blocked item with the highest action_priority_score",
-      "status": "In Progress (70%) or similar",
-      "dueDate": "3 Sep (2 days overdue) or similar based on expected_date",
-      "reason": "Bullet points explaining blockers and cascade impact",
-      "recommendedAction": "Specific actionable recommendation to resolve this top priority item"
-   }},
-   "recommendations": [
-      "One specific actionable recommendation per identified risk."
-   ]
-}}
-"""
+        from core.prompts import get_risk_aggregation_prompt
+        aggregation_prompt = get_risk_aggregation_prompt(
+            in_scope_count=len(in_scope_activities),
+            deterministic_count=len(deterministic_in_scope),
+            out_of_scope_activities=out_of_scope_activities,
+            timeline_deliverables=timeline_deliverables
+        )
         final_assessment = LLMService.generate_json(aggregation_prompt)
 
         overall_risk = final_assessment.get("overallRisk", "LOW")

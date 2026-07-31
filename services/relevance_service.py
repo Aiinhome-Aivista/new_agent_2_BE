@@ -89,16 +89,8 @@ class RelevanceService:
         Returns:
             A rich ~200-word reference profile text
         """
-        prompt = (
-            f"You are a professional auditor assistant helping to define document classification profiles.\n\n"
-            f"A user has created a new document type called '{type_name}' with this short description:\n"
-            f"\"{short_description}\"\n\n"
-            f"Your task: Write a detailed, keyword-rich reference profile (approximately 150-200 words) that describes "
-            f"what a '{type_name}' document typically contains. Include specific terms, sections, and vocabulary "
-            f"that would commonly appear in this type of document.\n\n"
-            f"Write it as a single flowing paragraph. Do NOT use bullet points, numbering, or markdown formatting. "
-            f"Do NOT include any preamble like 'Here is...' — just output the profile text directly."
-        )
+        from core.prompts import get_relevance_expansion_prompt
+        prompt = get_relevance_expansion_prompt(type_name, short_description)
 
         try:
             expanded = LLMService.generate(prompt)
@@ -149,23 +141,8 @@ class RelevanceService:
         # Send a smaller chunk to the LLM to save tokens
         small_sample = document_text[:3000] 
         
-        prompt = (
-            f"You are a professional auditor assistant.\n"
-            f"We are analyzing a document to see if it is a valid '{document_type}'.\n"
-            f"Our semantic pre-scanner gave it a preliminary confidence score of {embedding_score}/100.\n\n"
-            f"Please read this excerpt and provide the final accurate relevance score:\n"
-            f"\"\"\"\n{small_sample}\n\"\"\"\n\n"
-            f"Scoring guidelines:\n"
-            f"- 80-100: Clearly a valid {type_label} document\n"
-            f"- 50-79: Partially matches {type_label} but missing key elements\n"
-            f"- 20-49: Weak match, mostly unrelated content\n"
-            f"- 0-19: Completely unrelated to {type_label}\n\n"
-            f"Respond ONLY with a valid JSON object matching this schema:\n"
-            f"{{\n"
-            f"  \"score\": <integer between 0 and 100>,\n"
-            f"  \"reasoning\": \"<brief 1-sentence reasoning explaining why it is or isn't a {document_type}>\"\n"
-            f"}}"
-        )
+        from core.prompts import get_relevance_scoring_prompt
+        prompt = get_relevance_scoring_prompt(document_type, type_label, embedding_score, small_sample)
         
         try:
             res_json = LLMService.generate_json(prompt)

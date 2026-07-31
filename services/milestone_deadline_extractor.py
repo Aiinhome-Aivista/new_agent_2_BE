@@ -94,30 +94,8 @@ class MilestoneDeadlineExtractor:
                     "evidence": item["evidence"]
                 })
                 
-            prompt = f"""
-You are an expert contract scheduling extractor.
-Analyze the following array of scope items and their evidence text to extract Milestone and Deadline information.
-
-Items to analyze:
-{json.dumps(items_for_prompt, indent=2)}
-
-Rules for EACH item:
-1. Only extract if explicitly mentioned.
-2. If no deadline/milestone is mentioned, set has_schedule to false.
-3. If deadline is mentioned, return the EXACT original text (e.g., "15 Apr", "End of June").
-4. If a milestone name is mentioned (e.g. "UAT", "Go Live"), extract it. If the item itself is the milestone, use the item name.
-
-Output strictly as a JSON ARRAY of objects, matching the input "id".
-Schema Example:
-[
-  {{
-    "id": "0",
-    "has_schedule": true,
-    "milestone": "UAT",
-    "deadline_text": "15 Apr"
-  }}
-]
-"""
+            from core.prompts import get_batch_deadline_extraction_prompt
+            prompt = get_batch_deadline_extraction_prompt(items_for_prompt)
             try:
                 batch_results = LLMService.generate_json(prompt)
                 if not isinstance(batch_results, list):
@@ -199,26 +177,8 @@ Schema Example:
 
     @classmethod
     def _extract_via_llm(cls, item_name: str, evidence: str) -> dict:
-        prompt = f"""
-You are an expert contract scheduling extractor.
-Analyze the following scope item and its evidence text to extract Milestone and Deadline information.
-
-Scope Item: {item_name}
-Evidence: {evidence}
-
-Rules:
-1. Only extract if explicitly mentioned.
-2. If no deadline/milestone is mentioned, set has_schedule to false.
-3. If deadline is mentioned, return the EXACT original text (e.g., "15 Apr", "End of June").
-4. If a milestone name is mentioned (e.g. "UAT", "Go Live"), extract it. If the item itself is the milestone, use the item name.
-
-Return JSON format:
-{{
-    "has_schedule": boolean,
-    "milestone": string or null,
-    "deadline_text": string or null
-}}
-"""
+        from core.prompts import get_single_deadline_extraction_prompt
+        prompt = get_single_deadline_extraction_prompt(item_name, evidence)
         try:
             res = LLMService.generate_json(prompt)
             return res

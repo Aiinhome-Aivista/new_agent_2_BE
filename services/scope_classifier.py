@@ -112,29 +112,8 @@ class ScopeClassifier:
                     "evidence": item["evidence"]
                 })
             
-            prompt = f"""
-You are an expert contract analyst. Your task is to classify an array of candidate scope items based ONLY on their provided supporting evidence from the contract.
-
-Items to classify:
-{json.dumps(items_for_prompt, indent=2)}
-
-Task:
-For EACH item, classify it as "IN_SCOPE", "OUT_OF_SCOPE", or "UNCERTAIN".
-- If the evidence clearly states the vendor provides it, choose IN_SCOPE.
-- If the evidence states it's excluded, or it's the client's responsibility, or it's an assumption, choose OUT_OF_SCOPE.
-- If there is not enough evidence to be sure, choose UNCERTAIN.
-
-Output your result strictly as a JSON ARRAY of objects, matching the input "id".
-Schema Example:
-[
-  {{
-    "id": "0",
-    "scope_type": "IN_SCOPE", 
-    "confidence": 0.9, 
-    "evidence_text": "<Brief 1-sentence reasoning quoting the evidence>"
-  }}
-]
-"""
+            from core.prompts import get_batch_scope_classifier_prompt
+            prompt = get_batch_scope_classifier_prompt(items_for_prompt)
             try:
                 batch_results = LLMService.generate_json(prompt)
                 if not isinstance(batch_results, list):
@@ -253,30 +232,8 @@ Schema Example:
             
         print(f"[LLM Fallback] '{candidate['name']}' was ambiguous. Calling LLM...")
             
-        prompt = f"""
-You are an expert contract analyst. Your task is to classify ONE specific candidate scope item based ONLY on the provided supporting evidence retrieved from the contract.
-
-Candidate Item:
-- Name: {candidate["name"]}
-- Raw Description: {candidate["description"]}
-- Found in Section: {candidate["section"]}
-
-Supporting Evidence from Contract:
-{combined_evidence}
-
-Task:
-Classify this candidate as "IN_SCOPE", "OUT_OF_SCOPE", or "UNCERTAIN".
-- If the evidence clearly states the vendor provides it, choose IN_SCOPE.
-- If the evidence states it's excluded, or it's the client's responsibility, or it's an assumption, choose OUT_OF_SCOPE.
-- If there is not enough evidence to be sure, choose UNCERTAIN.
-
-Output your result strictly as JSON:
-{{
-  "scope_type": "IN_SCOPE", 
-  "confidence": 0.9, 
-  "evidence_text": "<Brief 1-sentence reasoning quoting the evidence>"
-}}
-"""
+        from core.prompts import get_single_scope_classifier_prompt
+        prompt = get_single_scope_classifier_prompt(candidate, combined_evidence)
         
         try:
             result = LLMService.generate_json(prompt)

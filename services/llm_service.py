@@ -95,7 +95,8 @@ class LLMService:
         except (json.JSONDecodeError, ValueError) as e:
             if retry_count > 0:
                 print(f"JSON parsing failed, retrying. Error: {e}")
-                correction_prompt = f"The following text was supposed to be valid JSON but failed to parse. Please output ONLY the corrected valid JSON and nothing else.\n\nInvalid Text:\n{raw_response}\n\nError:\n{e}"
+                from core.prompts import get_json_correction_prompt
+                correction_prompt = get_json_correction_prompt(raw_response, str(e))
                 try:
                     corrected_response = cls.generate(correction_prompt)
                     return cls.extract_json(corrected_response)
