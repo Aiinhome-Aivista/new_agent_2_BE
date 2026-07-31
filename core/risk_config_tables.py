@@ -11,31 +11,52 @@ def create_risk_config_tables():
     cursor = conn.cursor()
     try:
         # ── 1. Risk Parameter Config (weights per scoring dimension) ────────
+        cursor.execute("DROP TABLE IF EXISTS risk_parameter_config")
         cursor.execute("""
-        CREATE TABLE IF NOT EXISTS risk_parameter_config (
+        CREATE TABLE risk_parameter_config (
             id INT AUTO_INCREMENT PRIMARY KEY,
             parameter_code VARCHAR(50) UNIQUE NOT NULL,
             parameter_name VARCHAR(100) NOT NULL,
             enabled BOOLEAN NOT NULL DEFAULT TRUE,
-            weight INT NOT NULL,
+            weight FLOAT NOT NULL,
+            max_score INT NOT NULL,
+            evaluation_type VARCHAR(20) NOT NULL DEFAULT 'NUMERIC',
             description TEXT
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
         """)
 
-        # Seed default parameters
+        # Seed Execution Priority model parameters
         cursor.execute("""
         INSERT IGNORE INTO risk_parameter_config
-            (parameter_code, parameter_name, enabled, weight, description)
+            (parameter_code, parameter_name, enabled, weight, max_score, evaluation_type, description)
         VALUES
-            ('SCOPE_MATCH',          'Scope Match',           TRUE, 30, 'Is the activity approved by the contract baseline?'),
-            ('TIMELINE',             'Timeline / Deadline',   TRUE, 20, 'Has the contractual deadline been missed?'),
-            ('MILESTONE',            'Milestone Slippage',    TRUE, 10, 'Is a contractual milestone slipping?'),
-            ('CUSTOMER_DEPENDENCY',  'Customer Dependency',   TRUE, 10, 'Is a customer obligation (VPN, API creds, infrastructure) pending?'),
-            ('PROGRESS',             'Progress Behind',       TRUE, 10, 'Is deliverable progress behind schedule?'),
-            ('TECHNICAL_DEPENDENCY', 'Technical Dependency',  TRUE,  5, 'Is work blocked by an internal technical dependency?'),
-            ('MISSING_DELIVERABLE',  'Missing Deliverable',   TRUE,  5, 'Is a contractual deliverable not progressing at all?'),
-            ('CONFIDENCE',           'Evidence Confidence',   TRUE,  5, 'How confident is the AI in its assessment?'),
-            ('BUSINESS_IMPACT',      'Business Impact',       TRUE,  5, 'What is the estimated business severity?')
+            ('EXECUTION_PRIORITY',   'Execution Priority',    TRUE, 1.0, 35, 'NUMERIC', 'Primary execution urgency'),
+            ('CASCADE_IMPACT',       'Cascade Impact',        TRUE, 1.0, 20, 'NUMERIC', 'Number of downstream milestones affected'),
+            ('DATE_PROXIMITY',       'Date Proximity',        TRUE, 1.0, 15, 'NUMERIC', 'Urgency relative to today\\'s date'),
+            ('ROOT_CAUSE',           'Root Cause',            TRUE, 1.0, 15, 'BOOLEAN', 'Primary execution blocker'),
+            ('CUSTOMER_DEPENDENCY',  'Customer Dependency',   TRUE, 1.0, 10, 'BOOLEAN', 'Waiting for customer input'),
+            ('TECHNICAL_DEPENDENCY', 'Technical Dependency',  TRUE, 1.0,  5, 'BOOLEAN', 'Internal technical blocker'),
+            ('BUSINESS_IMPACT',      'Business Impact',       TRUE, 1.0,  5, 'ENUM',    'Business consequence'),
+            ('SCOPE_CREEP',          'Scope Creep',           TRUE, 1.0,  5, 'BOOLEAN', 'Contractual impact'),
+            ('CONFIDENCE',           'Evidence Confidence',   TRUE, 1.0,  2, 'NUMERIC', 'Extraction confidence')
+        """)
+
+        # ── 1.5 Risk Category Priority ───────────────────────────────────────
+        cursor.execute("DROP TABLE IF EXISTS risk_category_priority")
+        cursor.execute("""
+        CREATE TABLE risk_category_priority (
+            category VARCHAR(50) PRIMARY KEY,
+            priority_order INT NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+        INSERT INTO risk_category_priority (category, priority_order) VALUES
+            ('ROOT_CAUSE', 1),
+            ('EXECUTION_BLOCKER', 2),
+            ('CUSTOMER_DEPENDENCY', 3),
+            ('DELAY', 4),
+            ('SCOPE_CREEP', 5)
         """)
 
         # ── 2. Risk Threshold Config (severity bands) ────────────────────────
@@ -55,23 +76,7 @@ def create_risk_config_tables():
             ('CRITICAL', 80, 100)
         """)
 
-        # ── 3. Business Rule Config (enable / disable logic) ─────────────────
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS business_rule_config (
-            rule_code VARCHAR(60) PRIMARY KEY,
-            rule_description TEXT NOT NULL,
-            enabled BOOLEAN NOT NULL DEFAULT TRUE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-        """)
 
-        cursor.execute("""
-        INSERT IGNORE INTO business_rule_config (rule_code, rule_description, enabled) VALUES
-            ('SCOPE_CREEP_BLOCKS_IN_SCOPE',    'IN_SCOPE baseline items can never be SCOPE_CREEP',       TRUE),
-            ('CUSTOMER_DEP_INCREASES_RISK',    'Customer dependency (VPN, API creds) adds to risk score', TRUE),
-            ('DEADLINE_MISSED_INCREASES_RISK', 'Missed contractual deadline adds to risk score',          TRUE),
-            ('MISSING_DELIVERABLE_RISK',       'Missing contractual deliverable triggers elevated risk',  TRUE),
-            ('IGNORE_INTERNAL_TASKS',          'Internal housekeeping / process tasks are not risks',    TRUE)
-        """)
 
         # ── 4. Business Impact Matrix (LLM picks level, rules pick score) ────
         cursor.execute("""
@@ -103,6 +108,34 @@ def create_risk_config_tables():
             ('MEDIUM',   FALSE,  60),
             ('HIGH',     TRUE,   70),
             ('CRITICAL', TRUE,   80)
+        """)
+
+        # ── 6. Category Assignment Rules (Configurable Matrix) ─────────────
+        cursor.execute("DROP TABLE IF EXISTS category_assignment_rules")
+        cursor.execute("""
+        CREATE TABLE category_assignment_rules (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            entity_type VARCHAR(50) NOT NULL,
+            dependency_source VARCHAR(50) DEFAULT NULL,
+            status VARCHAR(50) DEFAULT NULL,
+            result_category VARCHAR(50) NOT NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+        """)
+
+        cursor.execute("""
+        INSERT INTO category_assignment_rules (entity_type, dependency_source, status, result_category) VALUES
+            ('DEPENDENCY', 'CUSTOMER',  'BLOCKED', 'CUSTOMER_DEPENDENCY'),
+            ('DEPENDENCY', 'CUSTOMER',  'DELAYED', 'CUSTOMER_DEPENDENCY'),
+            ('DEPENDENCY', 'CUSTOMER',  'PENDING', 'CUSTOMER_DEPENDENCY'),
+            ('DEPENDENCY', 'TECHNICAL', 'BLOCKED', 'TECHNICAL_DEPENDENCY'),
+            ('DEPENDENCY', 'TECHNICAL', 'DELAYED', 'TECHNICAL_DEPENDENCY'),
+            ('DEPENDENCY', 'TECHNICAL', 'PENDING', 'TECHNICAL_DEPENDENCY'),
+            ('DEPENDENCY', 'PROJECT',   'BLOCKED', 'EXECUTION_BLOCKER'),
+            ('DEPENDENCY', 'EXTERNAL',  'BLOCKED', 'EXECUTION_BLOCKER'),
+            ('MILESTONE',  NULL,        'BLOCKED', 'EXECUTION_BLOCKER'),
+            ('MILESTONE',  NULL,        'DELAYED', 'DELAY'),
+            ('SCOPE_REQUEST', NULL,     'NEW',     'SCOPE_CREEP'),
+            ('SCOPE_REQUEST', NULL,     'IN_PROGRESS', 'SCOPE_CREEP')
         """)
 
         conn.commit()

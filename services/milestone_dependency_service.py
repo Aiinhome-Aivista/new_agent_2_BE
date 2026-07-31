@@ -145,19 +145,28 @@ class MilestoneDependencyService:
         Only links milestones that are not OUT_OF_SCOPE (if applicable) and are actually active.
         """
         db_cursor.execute("""
-            SELECT id, sequence FROM project_milestones 
+            SELECT id, name, sequence FROM project_milestones 
             WHERE project_id = %s 
             ORDER BY sequence ASC
         """, (project_id,))
         milestones = db_cursor.fetchall()
         
-        if len(milestones) < 2:
+        # Filter to only execution phases to avoid linking random deliverables
+        execution_keywords = ["kickoff", "gather", "requirement", "design", "development", "integration", "testing", "sit", "uat", "qa", "deployment", "go-live", "go live", "production", "closure", "transfer"]
+        
+        execution_milestones = []
+        for m in milestones:
+            m_name = (m[1] if isinstance(m, tuple) else m['name']).lower()
+            if any(kw in m_name for kw in execution_keywords):
+                execution_milestones.append(m)
+        
+        if len(execution_milestones) < 2:
             return 0
             
         edges = []
-        for i in range(len(milestones) - 1):
-            parent_id = milestones[i][0] if isinstance(milestones[i], tuple) else milestones[i]['id']
-            child_id = milestones[i+1][0] if isinstance(milestones[i+1], tuple) else milestones[i+1]['id']
+        for i in range(len(execution_milestones) - 1):
+            parent_id = execution_milestones[i][0] if isinstance(execution_milestones[i], tuple) else execution_milestones[i]['id']
+            child_id = execution_milestones[i+1][0] if isinstance(execution_milestones[i+1], tuple) else execution_milestones[i+1]['id']
             edges.append((parent_id, child_id))
             
         # Validate just in case

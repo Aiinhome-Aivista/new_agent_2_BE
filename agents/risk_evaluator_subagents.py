@@ -108,12 +108,10 @@ Baseline Context:
 {item['context']}
 """
 
-        prompt = f"""You are the Activity Risk Diagnosis Agent (Phase 1).
-The Risk Tracker is a contractual monitoring system. Every item must represent a contractual
-deliverable or scope request — not an activity log entry.
+        prompt = f"""You are the Activity Fact Extraction Agent (Phase 1).
+The Risk Tracker is a contractual monitoring system. Every item must represent a contractual deliverable or scope request.
 
-Your job is DIAGNOSIS ONLY. You identify what kind of risk exists and which signals are present.
-You do NOT calculate numeric scores — that happens deterministically after your output.
+Your job is FACT EXTRACTION ONLY. You do NOT calculate execution priority, root cause, cascade impact, or any numeric scores. Those are handled deterministically in the backend.
 
 Evaluate each of the following activities using ONLY their provided baseline context.
 
@@ -123,65 +121,36 @@ Evaluate each of the following activities using ONLY their provided baseline con
 
 RULES:
 1. TRACKER TITLE PRIORITY (in order):
-   a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item". risk_category CANNOT be SCOPE_CREEP.
-   b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name. risk_category is SCOPE_CREEP.
-   c. If NO baseline match exists → use the normalized activity name. risk_category is SCOPE_CREEP.
+   a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item".
+   b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name.
+   c. If NO baseline match exists → use the normalized activity name.
 
-2. RISK CATEGORIES (pick ONE per activity):
-   - SCOPE_CREEP: Activity has NO approved IN_SCOPE baseline match (new request or excluded item).
-   - DELAY: Deliverable is behind schedule or has missed its contractual deadline. (Do NOT use this for pending customer obligations).
-   - DEPENDENCY: The activity is blocked waiting for client/third party obligation (VPN, API creds, infra), OR it represents the customer obligation itself. Any deliverable waiting on the customer MUST be DEPENDENCY.
-   - BLOCKED: Explicitly blocked by a technical or organizational issue (e.g. one deliverable waiting on another).
-   - NONE: On-track and within approved scope with no blockers.
-   - IGNORE: It is merely a workflow step, activity update, or status evidence (e.g. 'QA Validation', 'Security Review') and DOES NOT represent a contractual deliverable. Do not flag as Scope Creep.
+2. STATUS EXTRACTION:
+   - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, or UNKNOWN.
 
-3. DIAGNOSTIC SIGNALS — for each activity, identify which signals are TRUE:
-   - deadline_missed: The contractual or mentioned deadline has passed or is at immediate risk.
-   - customer_dependency: A customer obligation (VPN, API credentials, infrastructure, access) is pending.
-   - technical_dependency: An internal technical dependency is blocking progress.
-   - progress_behind: Stated or implied progress is behind expected pace.
-   - milestone_slipping: A named project milestone (UAT, Go Live, delivery) is slipping.
-   - missing_deliverable: A contractual deliverable has no evidence of progress at all.
+3. BLOCKED BY:
+   - If the activity is blocked or waiting on something, list exactly what it is blocked by as an array of strings (e.g., ["API Credentials", "VPN"]).
+   - If not blocked, return an empty array [].
 
-4. NEVER classify an approved IN_SCOPE baseline item as SCOPE_CREEP.
+4. PROGRESS:
+   - Extract progress percentage if explicitly mentioned (e.g., 70 for 70%). Otherwise, null.
 
-5. BLOCKED EXPLANATIONS: If an item is BLOCKED, explicitly name what is blocking it in your reasoning (e.g. 'Blocked By API Credentials').
+5. ENTITY TYPE:
+   - Identify what kind of entity this is: MILESTONE, DEPENDENCY, SCOPE_REQUEST, ACTION_ITEM, or RISK.
 
-6. PARTIAL COMPLETION & BLOCKED DELIVERABLES: If a deliverable (e.g. CRM Integration) is partially complete or cannot continue due to a blocker (e.g. waiting on API credentials), you MUST classify the deliverable itself as BLOCKED or DEPENDENCY. Do NOT classify it as NONE just because the blocker is listed as a separate activity. Both the deliverable AND the blocker must be flagged.
-
-7. TRACKER IDENTITY: matched_baseline_item must be the canonical baseline name, not the MoM wording.
-   The same baseline item must produce the same tracker title across different MoMs.
-
-8. CANONICAL TITLES: matched_baseline_item must be the SHORT business entity name.
-   - Use: "VPN Connectivity", NOT "Customer shall provide VPN connectivity"
-   - Use: "Azure AD SSO", NOT "The Vendor shall configure Azure AD SSO by 25 April 2026"
-   - Use: "API Credentials", NOT "Customer shall provide API credentials"
-   The original contractual sentence belongs in "reasoning" only.
-
-7. BUSINESS IMPACT:
-   - HIGH: Blocks a core contractual deliverable, threatens project viability.
-   - MEDIUM: Causes schedule risk or partial scope impact.
-   - LOW: Minor or easily recoverable issue.
-
-8. CONFIDENCE: 0.0–1.0 — how strongly does the baseline context support your diagnosis?
+6. EVIDENCE TEXT:
+   - You MUST provide `evidence_text` for every extracted fact. Every downstream calculation must be traceable back to the original MoM sentence.
 
 Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
 [
   {{
     "activity": "Activity name as given",
+    "entity_type": "MILESTONE|DEPENDENCY|SCOPE_REQUEST|ACTION_ITEM|RISK",
     "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
-    "risk_category": "SCOPE_CREEP|DELAY|DEPENDENCY|BLOCKED|NONE",
-    "signals": {{
-      "deadline_missed": false,
-      "customer_dependency": false,
-      "technical_dependency": false,
-      "progress_behind": false,
-      "milestone_slipping": false,
-      "missing_deliverable": false
-    }},
-    "business_impact": "LOW|MEDIUM|HIGH",
-    "confidence": 0.85,
-    "reasoning": "Short explanation citing the baseline context. Use the original MoM sentence as evidence here."
+    "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|UNKNOWN",
+    "progress": 70,
+    "blocked_by": ["Item 1", "Item 2"],
+    "evidence_text": "Exact quote from document proving this status/blocker."
   }}
 ]
 """

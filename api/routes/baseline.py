@@ -301,9 +301,9 @@ def run_baseline_pipeline(project_id: int, document_id: int):
                     "INSERT INTO milestone_dependencies (project_id, parent_milestone_id, child_milestone_id, dependency_type) VALUES (%s, %s, %s, 'FINISH_TO_START')",
                     (project_id, p, c)
                 )
-        # We NO LONGER fallback to sequential dependencies because ELs often don't have them
-        # and generating fake ones ruins the dependency graph for risk evaluation.
-        
+        else:
+            # FALLBACK: If LLM failed to extract a valid DAG, use sequential dependencies
+            MilestoneDependencyService.generate_sequential_dependencies(cursor, project_id)
         cursor.close()
         
         # UPSERT deliverables

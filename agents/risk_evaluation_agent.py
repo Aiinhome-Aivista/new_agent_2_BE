@@ -9,6 +9,8 @@ from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivit
 from agents.tracker_audit_agent import TrackerAuditAgent
 from agents.alerting_agent import AlertingAgent
 from services.milestone_dependency_service import MilestoneDependencyService
+from services.dependency_classification_service import DependencyClassificationService
+from services.category_assignment_engine import CategoryAssignmentEngine
 
 # ---------------------------------------------------------------------------
 # DETERMINISTIC MATCHING HELPERS
@@ -128,10 +130,8 @@ class RiskEvaluationAgent:
         # Config changes take effect immediately without deployment.
         risk_params    = RiskConfigurationService.get_parameters(db_cursor)
         risk_thresholds = RiskConfigurationService.get_thresholds(db_cursor)
-        risk_rules     = RiskConfigurationService.get_rules(db_cursor)
         impact_matrix  = RiskConfigurationService.get_impact_matrix(db_cursor)
         alert_rules    = RiskConfigurationService.get_alert_rules(db_cursor)
-        dependency_risk_config = RiskConfigurationService.get_dependency_risk_config(db_cursor)
 
         _emit("Loading Project Baseline", 10)
         scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
@@ -266,224 +266,234 @@ class RiskEvaluationAgent:
 
 
         # ===========================================================
-        # STEP 6: Categorize all results & Milestone Level Cascade
+        # STEP 6: Deterministic Risk & Execution Priority Analysis
         # ===========================================================
-        # Pass 1: Identify Delayed Milestones
-        delayed_milestone_ids = set()
+        _emit("Calculating Execution Priorities", 70)
+        from services.dependency_analysis_service import DependencyAnalysisService
+        from services.risk_scoring_engine import RiskScoringEngine
+        from services.risk_ranking_engine import RiskRankingEngine
         
+        # 1. Prepare Milestone mappings and graph
         db_cursor.execute("SELECT id, name, planned_date, status FROM project_milestones WHERE project_id = %s", (project_id,))
         milestone_details = {r['id']: r for r in db_cursor.fetchall()}
-        milestone_name_to_id = {r['name'].lower(): r['id'] for r in milestone_details.values()}
         
         db_cursor.execute("SELECT m.id as milestone_id, s.name as scope_name FROM scope_items s JOIN scope_milestone_mapping mmap ON s.id = mmap.scope_item_id JOIN project_milestones m ON mmap.milestone_id = m.id WHERE s.project_id = %s", (project_id,))
         scope_to_milestone_id = {r['scope_name'].lower(): r['milestone_id'] for r in db_cursor.fetchall()}
+        milestone_id_to_name = {m['id']: m['name'] for m in milestone_details.values()}
 
+        # Map canonical titles to milestone IDs
+        def get_milestone_id(canonical_title):
+            c_norm = _normalize(canonical_title)
+            for db_scope_name, m_id in scope_to_milestone_id.items():
+                db_norm = _normalize(db_scope_name)
+                if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
+                    return m_id
+            return None
+
+        # Build status map for dependency analysis
+        milestone_status_map = {}
         for i, result in enumerate(llm_risk_results):
-            risk_cat = result.get("risk_category", "NONE")
             activity_name = result.get("activity", "Unknown")
-            print(f"  [LLM-Output] {activity_name} -> {risk_cat}")
-            
-            if risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
-                activity_name = result.get("activity", "Unknown")
-                matched_baseline_name = result.get("matched_baseline_item")
-                pre_resolved = activities_with_contexts[i].get("canonical_title") if i < len(activities_with_contexts) else None
-                if not matched_baseline_name and i < len(activities_with_contexts):
-                    si = activities_with_contexts[i].get("matched_si")
-                    if si: matched_baseline_name = si["name"]
-                if not matched_baseline_name and pre_resolved:
-                    matched_baseline_name = pre_resolved
-                    
-                canonical_title, _ = _resolve_tracker_title(
-                    activity_name, matched_baseline_name, scope_items, all_baseline_items
-                )
-                
-                # Find milestone for this scope item
-                c_norm = _normalize(canonical_title)
-                for db_scope_name, m_id in scope_to_milestone_id.items():
-                    db_norm = _normalize(db_scope_name)
-                    if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
-                        delayed_milestone_ids.add(m_id)
-                        break
-
-        # Calculate cascade impact for all delayed milestones
-        cascade_impact = MilestoneDependencyService.calculate_milestone_cascade(db_cursor, project_id, list(delayed_milestone_ids))
-
-        out_of_scope_activities = []
-        timeline_deliverables = []
-        in_scope_activities = list(deterministic_in_scope)  # Start with deterministic matches
-
-        # Pass 2: Scoring
-        for i, result in enumerate(llm_risk_results):
-
-            activity_name = result.get("activity", "Unknown")
-            risk_cat = result.get("risk_category", "NONE")
-            reasoning = result.get("reasoning", "")
             matched_baseline_name = result.get("matched_baseline_item")
-
-            # Phase 1 multi-dimensional signals from LLM
-            signals = result.get("signals", {})
-            if not isinstance(signals, dict):
-                signals = {}
-            confidence   = float(result.get("confidence", 0.7))
-            business_impact = result.get("business_impact", "LOW")
-
-            # Fallback: use the pre-resolved canonical_title from the extraction phase
             pre_resolved = activities_with_contexts[i].get("canonical_title") if i < len(activities_with_contexts) else None
-
-            # Fallback chain: LLM match → deterministic partial match → pre-resolved canonical
+            
             if not matched_baseline_name and i < len(activities_with_contexts):
                 si = activities_with_contexts[i].get("matched_si")
-                if si:
-                    matched_baseline_name = si["name"]
+                if si: matched_baseline_name = si["name"]
             if not matched_baseline_name and pre_resolved:
                 matched_baseline_name = pre_resolved
 
-            # Get source_sentence as evidence
-            source_sentence = ""
-            if i < len(activities_with_contexts):
-                source_sentence = activities_with_contexts[i].get("source_sentence", activity_name)
-
-            # TRACKER TITLE PRIORITY: resolve canonical title and confirm if IN_SCOPE
-            canonical_title, is_confirmed_in_scope = _resolve_tracker_title(
+            canonical_title, _ = _resolve_tracker_title(
                 activity_name, matched_baseline_name, scope_items, all_baseline_items
             )
-
-            # Look up the original contract sentence for evidence
-            original_contract_sentence = ""
-            for si in all_baseline_items:
-                si_norm = _normalize(si["name"])
-                c_norm = _normalize(canonical_title)
-                if si_norm == c_norm or si_norm in c_norm or c_norm in si_norm:
-                    original_contract_sentence = si.get("name", "")
-                    break
-
-            # CRITICAL: If item is confirmed IN_SCOPE, it can NEVER be SCOPE_CREEP.
-            if is_confirmed_in_scope and risk_cat == "SCOPE_CREEP":
-                print(f"  [Override] '{activity_name}' is IN approved baseline — overriding SCOPE_CREEP to NONE")
-                risk_cat = "NONE"
-
-            # ── PHASE 2: Deterministic Weighted Scoring ───────────────────────
-            # LLM (Phase 1) diagnosed WHAT risk exists and which signals are present.
-            # RiskScoringEngine (Phase 2) calculates HOW SEVERE deterministically.
-            # DependencyRiskEngine adds extra weight if this item blocks other items.
-# ── PHASE 2: Deterministic Weighted Scoring ───────────────────────
-            # Dependency cascade at milestone level
-            dep_count = 0
-            blocked_by_this = []
+            result["_canonical_title"] = canonical_title
             
-            c_norm = _normalize(canonical_title)
+            m_id = get_milestone_id(canonical_title)
+            if m_id:
+                milestone_status_map[m_id] = result.get("status", "UNKNOWN").upper()
+                
+        # 2. Dependency Analysis (Deterministic)
+        _, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
+        dep_analysis_results = DependencyAnalysisService.analyze_dependencies(milestone_status_map, backward_graph)
+        
+        tracker_items = []
+        out_of_scope_activities = []
+        in_scope_activities = list(deterministic_in_scope)
+        
+        # 3. Execution Priority Analysis & Risk Scoring
+        from datetime import datetime
+        today = datetime.now().date()
+        category_priorities = RiskConfigurationService.get_category_priorities(db_cursor)
+
+        for i, result in enumerate(llm_risk_results):
+            activity_name = result.get("activity", "Unknown")
+            canonical_title = result["_canonical_title"]
+            status = result.get("status", "UNKNOWN").upper()
+            blocked_by = result.get("blocked_by", [])
+            evidence = result.get("evidence_text", "")
+            
+            # Resolve scope matching
+            matched_baseline_name = result.get("matched_baseline_item")
+            _, is_confirmed_in_scope = _resolve_tracker_title(
+                activity_name, matched_baseline_name, scope_items, all_baseline_items
+            )
+            
+            entity_type = result.get("entity_type", "MILESTONE").upper()
+            
+            # Entity Type Override based on Baseline Match
+            # If it explicitly matches an IN_SCOPE item, it's a MILESTONE
+            # If it's explicitly extracted as DEPENDENCY, we keep it as DEPENDENCY
+            if is_confirmed_in_scope and entity_type != "DEPENDENCY":
+                entity_type = "MILESTONE"
+                
+            dependency_source = None
+            if entity_type == "DEPENDENCY" or blocked_by:
+                dependency_source = DependencyClassificationService.classify(activity_name, blocked_by, evidence)
+                
+            # Dependency analysis data
+            m_id = get_milestone_id(canonical_title)
+            dep_data = dep_analysis_results.get(m_id, {})
+            cascade_count = dep_data.get("cascade_count", 0)
+            is_root_cause = dep_data.get("is_root_cause", False)
+
+            # Assign Category
+            category_rules = RiskConfigurationService.get_category_rules(db_cursor)
+            risk_cat = CategoryAssignmentEngine.assign_category(
+                rules=category_rules,
+                entity_type=entity_type,
+                status=status,
+                dependency_source=dependency_source,
+                is_root_cause=is_root_cause,
+                cascade_count=cascade_count
+            )
+            
+            # Map back to old flags for the Scoring Engine
+            is_scope_creep = (risk_cat == "SCOPE_CREEP")
+
+            # Date calculation
+            days_overdue = 0
+            days_until_due = 9999
             m_id = None
+            c_norm = _normalize(canonical_title)
             for db_scope_name, mid in scope_to_milestone_id.items():
                 db_norm = _normalize(db_scope_name)
                 if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
                     m_id = mid
                     break
-                    
-            if m_id and m_id in cascade_impact:
-                dep_count = cascade_impact[m_id]["blocked_count"]
-                blocked_by_this = cascade_impact[m_id]["blocked_milestones"]
-                if dep_count > 0:
-                    print(f"  [MilestoneCascade] '{canonical_title}' milestone blocking {dep_count} milestone(s): {blocked_by_this}")
+            
+            p_date_str = None
+            if m_id and m_id in milestone_details:
+                p_date_str = milestone_details[m_id].get("planned_date")
+                if p_date_str:
+                    try:
+                        p_date = datetime.strptime(str(p_date_str).split(' ')[0], "%Y-%m-%d").date()
+                        if today > p_date:
+                            days_overdue = (today - p_date).days
+                            days_until_due = 0
+                        else:
+                            days_until_due = (p_date - today).days
+                            days_overdue = 0
+                    except Exception:
+                        pass
 
-            item_risk_score, score_breakdown = RiskScoringEngine.calculate(
-                risk_category=risk_cat,
-                signals=signals,
-                confidence=confidence,
-                business_impact=business_impact,
+
+
+            # Execution Priority Scoring
+            score_result = RiskScoringEngine.calculate(
+                status=status,
+                blocked_by=blocked_by,
+                is_root_cause=is_root_cause,
+                cascade_count=cascade_count,
+                days_overdue=days_overdue,
+                days_until_due=days_until_due,
+                is_scope_creep=is_scope_creep,
+                confidence=1.0,
+                business_impact="MEDIUM",
                 params=risk_params,
-                impact_matrix=impact_matrix,
-                rules=risk_rules,
-                dependent_count=dep_count,
-                blocked_milestones=blocked_by_this,
-                dependency_config=dependency_risk_config
+                impact_matrix=impact_matrix
             )
-            item_risk_level = RiskConfigurationService.classify_severity(item_risk_score, risk_thresholds)
+            
+            exec_score = score_result["execution_priority_score"]
+            breakdown = score_result["score_breakdown"]
+            severity = RiskConfigurationService.classify_severity(exec_score, risk_thresholds)
+            
+            original_contract_sentence = ""
+            for si in all_baseline_items:
+                si_norm = _normalize(si["name"])
+                if si_norm == c_norm or si_norm in c_norm or c_norm in si_norm:
+                    original_contract_sentence = si.get("name", "")
+                    break
 
-            # Evidence-backed reasoning with full score breakdown
+            reasoning = result.get("reasoning", "")
             full_evidence = RiskScoringEngine.format_reasoning(
-                score=item_risk_score,
-                severity=item_risk_level,
-                breakdown=score_breakdown,
-                mom_evidence=source_sentence,
+                score=exec_score,
+                severity=severity,
+                breakdown=breakdown,
+                mom_evidence=evidence,
                 llm_reasoning=reasoning,
-                original_contract_sentence=original_contract_sentence,
+                original_contract_sentence=original_contract_sentence
             )
 
-            if risk_cat == "IGNORE":
-                continue
-
-            if risk_cat == "SCOPE_CREEP":
+            # Grouping
+            if is_scope_creep:
                 out_of_scope_activities.append({
                     "activity": canonical_title,
-                    "classification": "OUT_OF_SCOPE" if item_risk_level in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
+                    "entity_type": entity_type,
+                    "classification": "OUT_OF_SCOPE" if severity in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
                     "reason": full_evidence,
-                    "similar_deliverable": matched_baseline_name or canonical_title,
-                    "confidence": int(confidence * 100),
-                    "risk_score": item_risk_score,
-                    "risk_level": item_risk_level,
+                    "similar_deliverable": canonical_title,
+                    "confidence": 100,
+                    "risk_score": exec_score,
+                    "risk_level": severity,
                 })
-            elif risk_cat in ["DELAY", "DEPENDENCY", "BLOCKED"]:
-                # --- Action Priority Calculation ---
-                action_priority_score = 0
-                if m_id and m_id in milestone_details:
-                    # 1. Cascade Weight (+5 per blocked milestone)
-                    action_priority_score += (dep_count * 5)
-                    
-                    # 2. Root Cause Weight (+20 if blocking anything)
-                    if dep_count > 0:
-                        action_priority_score += 20
-                        
-                    # 3. Status Weight
-                    # Use the real-time activity status instead of the baseline status if available
-                    act_status = result.get("activity_status", milestone_details[m_id].get("status", "Planned"))
-                    if isinstance(act_status, str):
-                        act_status = act_status.upper()
-                        if act_status in ["BLOCKED", "DEPENDENCY", "ON_HOLD"]:
-                            action_priority_score += 20
-                        elif act_status in ["DELAYED", "DELAY"]:
-                            action_priority_score += 15
-                        elif act_status in ["IN_PROGRESS", "IN PROGRESS"]:
-                            action_priority_score += 10
-                            
-                    # 4. Date Proximity Weight
-                    p_date_str = milestone_details[m_id].get("planned_date")
-                    if p_date_str:
-                        try:
-                            from datetime import datetime
-                            today = datetime.now().date()
-                            p_date = datetime.strptime(str(p_date_str).split(' ')[0], "%Y-%m-%d").date()
-                            days_diff = abs((today - p_date).days)
-                            if days_diff <= 3:
-                                action_priority_score += 30
-                            elif days_diff <= 7:
-                                action_priority_score += 25
-                            elif days_diff <= 14:
-                                action_priority_score += 15
-                            else:
-                                action_priority_score += 5
-                        except Exception as e:
-                            pass
-
-                timeline_deliverables.append({
+            elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
+                tracker_items.append({
                     "deliverable": canonical_title,
-                    "expected_date": str(milestone_details[m_id].get("planned_date", "Unknown")) if m_id and m_id in milestone_details else "Unknown",
-                    "current_status": "Customer Dependency" if risk_cat == "DEPENDENCY" else "Delayed" if risk_cat == "DELAY" else "Blocked",
-                    "delay_days": 0,
-                    "blockers": [source_sentence] if source_sentence else [],
-                    "confidence": int(confidence * 100),
-                    "action_priority_score": action_priority_score,
+                    "entity_type": entity_type,
+                    "expected_date": str(p_date_str) if p_date_str else "Unknown",
+                    "current_status": status,
+                    "progress": result.get("progress"),
+                    "delay_days": days_overdue,
+                    "blockers": blocked_by,
+                    "confidence": 100,
+                    "execution_priority_score": exec_score,
                     "dependency_status": risk_cat,
-                    "risk": item_risk_level,
-                    "risk_score": item_risk_score,
+                    "category": risk_cat,
+                    "is_root_cause": is_root_cause,
+                    "cascade_count": cascade_count,
+                    "days_overdue": days_overdue,
+                    "days_until_due": days_until_due,
+                    "risk": severity,
+                    "risk_score": exec_score,
                     "reasoning": full_evidence
                 })
+                
+                # DEBUG INJECTION
+                if "CRM" in canonical_title.upper() or "API" in canonical_title.upper():
+                    print(f"=== DEBUG: {canonical_title} ===")
+                    print(f"  entity_type: {entity_type}")
+                    print(f"  dependency_source: {dependency_source}")
+                    print(f"  is_root_cause: {is_root_cause}")
+                    print(f"  cascade_count: {cascade_count}")
+                    print(f"  assigned_category: {risk_cat}")
+                    print(f"  score_breakdown: {breakdown}")
+                    print(f"  final_score: {exec_score}")
+                    print(f"==============================")
+                    
             else:
                 in_scope_activities.append({
                     "activity": canonical_title,
                     "classification": "IN_SCOPE",
                     "deliverable": canonical_title,
-                    "confidence": int(confidence * 100),
+                    "confidence": 100,
                 })
+
+        # 4. Risk Ranking Engine
+        timeline_deliverables = RiskRankingEngine.rank_risks(tracker_items, category_priorities)
+        
+        # Ensure 'action_priority_score' is mapped to execution_priority_score for FE compatibility
+        for item in timeline_deliverables:
+            item["action_priority_score"] = item.get("execution_priority_score", 0)
 
         in_scope_result = {"activities": in_scope_activities}
         out_of_scope_result = {"activities": out_of_scope_activities}

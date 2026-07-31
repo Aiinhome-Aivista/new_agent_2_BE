@@ -1,175 +1,131 @@
 """
 RiskScoringEngine
 =================
-Phase 2: Deterministic weighted scoring.
+Phase 4 of Execution Priority Pipeline.
 
-The LLM (Phase 1) diagnoses WHAT risk exists and which signals are present.
-This engine measures HOW SEVERE the risk is — no LLM involved.
-
-Flow:
-  Phase 1 (LLM)  → risk_category + signals dict + business_impact + confidence
-  Phase 2 (this) → numeric score (0–100) + human-readable breakdown list
-
-The doctor analogy:
-  Phase 1 = Diagnose the disease ("Pneumonia")
-  Phase 2 = Measure severity (temperature, O2, blood pressure → "Severe")
-
-Weights come from risk_parameter_config table (via RiskConfigurationService).
-Rules   come from business_rule_config table (via RiskConfigurationService).
-Impact  comes from impact_matrix table (via RiskConfigurationService).
-
-Changing a weight requires only:
-    UPDATE risk_parameter_config SET weight = 25 WHERE parameter_code = 'TIMELINE';
-No code deployment needed.
+Calculates Execution Priority and Risk Score based on configuration.
 """
 
-
 class RiskScoringEngine:
-    """
-    Deterministic weighted scorer for risk items.
-    All configuration is injected (not read from DB directly).
-    """
-
     @classmethod
     def calculate(
         cls, 
-        risk_category: str, 
-        signals: dict, 
-        confidence: float, 
-        business_impact: str, 
-        params: dict, 
-        impact_matrix: dict, 
-        rules: list, 
-        dependent_count: int = 0,
-        blocked_milestones: list = None,
-        dependency_config: list = None
-    ) -> tuple[int, list]:
+        status: str,
+        blocked_by: list,
+        is_root_cause: bool,
+        cascade_count: int,
+        days_overdue: int,
+        days_until_due: int,
+        is_scope_creep: bool,
+        confidence: float,
+        business_impact: str,
+        params: dict,
+        impact_matrix: dict
+    ) -> dict:
         """
-        Calculate the weighted risk score from diagnostic signals.
-
-        Args:
-            risk_category:   "SCOPE_CREEP" | "DELAY" | "DEPENDENCY" | "BLOCKED" | "NONE"
-            signals:         Dict of boolean flags from Phase 1 LLM output:
-                               deadline_missed, customer_dependency, technical_dependency,
-                               progress_behind, milestone_slipping, missing_deliverable
-            confidence:      Float 0.0–1.0 — LLM's confidence in its assessment
-            business_impact: "LOW" | "MEDIUM" | "HIGH" — LLM's impact estimate
-            params:          From RiskConfigurationService.get_parameters()
-            impact_matrix:   From RiskConfigurationService.get_impact_matrix()
-            rules:           From RiskConfigurationService.get_rules()
-            dependent_count: How many other items are blocked by this item (0 = no impact)
-
-        Returns:
-            (score: int 0–100, breakdown: list[str])
+        Step 1: Calculate parameter scores
+        Step 2: Calculate execution score
+        Step 3: Calculate risk score
         """
-        score = 0
-        breakdown = []
-
-        # ── SCOPE_MATCH (30) ─────────────────────────────────────────────────
-        # Full weight when not in baseline (scope creep).
-        # Partial credit when delay/dependency on an in-scope item.
-        if risk_category == "SCOPE_CREEP":
-            param = params.get("SCOPE_MATCH", {})
-            if param.get("enabled", True):
-                w = param.get("weight", 30)
-                score += w
-                breakdown.append(f"✓ Not in approved baseline (+{w})")
-
-        # ── TIMELINE (20) ────────────────────────────────────────────────────
-        if signals.get("deadline_missed"):
-            param = params.get("TIMELINE", {})
-            if param.get("enabled", True) and rules.get("DEADLINE_MISSED_INCREASES_RISK", True):
-                w = param.get("weight", 20)
-                score += w
-                breakdown.append(f"✓ Deadline exceeded (+{w})")
-
-        # ── MILESTONE (10) ───────────────────────────────────────────────────
-        if signals.get("milestone_slipping"):
-            param = params.get("MILESTONE", {})
-            if param.get("enabled", True):
-                w = param.get("weight", 10)
-                score += w
-                breakdown.append(f"✓ Milestone slipping (+{w})")
-
-        # ── CUSTOMER_DEPENDENCY (10) ─────────────────────────────────────────
-        if signals.get("customer_dependency"):
-            param = params.get("CUSTOMER_DEPENDENCY", {})
-            if param.get("enabled", True) and rules.get("CUSTOMER_DEP_INCREASES_RISK", True):
-                w = param.get("weight", 10)
-                score += w
-                breakdown.append(f"✓ Customer dependency pending (+{w})")
-
-        # ── PROGRESS (10) ────────────────────────────────────────────────────
-        if signals.get("progress_behind"):
-            param = params.get("PROGRESS", {})
-            if param.get("enabled", True):
-                w = param.get("weight", 10)
-                score += w
-                breakdown.append(f"✓ Progress behind schedule (+{w})")
-
-        # ── TECHNICAL_DEPENDENCY (5) ─────────────────────────────────────────
-        if signals.get("technical_dependency"):
-            param = params.get("TECHNICAL_DEPENDENCY", {})
-            if param.get("enabled", True):
-                w = param.get("weight", 5)
-                score += w
-                breakdown.append(f"✓ Technical dependency blocking (+{w})")
-
-        # ── MISSING_DELIVERABLE (5) ──────────────────────────────────────────
-        if signals.get("missing_deliverable"):
-            param = params.get("MISSING_DELIVERABLE", {})
-            if param.get("enabled", True) and rules.get("MISSING_DELIVERABLE_RISK", True):
-                w = param.get("weight", 5)
-                score += w
-                breakdown.append(f"✓ Missing deliverable (+{w})")
-
-        # ── CONFIDENCE (5) ───────────────────────────────────────────────────
-        # confidence is float 0.0–1.0; scale into the weight bucket
-        param = params.get("CONFIDENCE", {})
-        if param.get("enabled", True):
-            w = param.get("weight", 5)
-            conf_score = round(confidence * w)
-            if conf_score > 0:
-                score += conf_score
-                breakdown.append(f"✓ Evidence confidence ({int(confidence * 100)}%) (+{conf_score})")
-
-        # ── BUSINESS_IMPACT (5) ──────────────────────────────────────────────
-        # LLM classifies impact; impact_matrix maps that label to a score.
-        param = params.get("BUSINESS_IMPACT", {})
-        if param.get("enabled", True):
-            impact_key = (business_impact or "LOW").upper()
-            impact_add = impact_matrix.get(impact_key, 0)
-            if impact_add > 0:
-                score += impact_add
-                breakdown.append(f"✓ Business impact {impact_key.title()} (+{impact_add})")
-
-        # ── DEPENDENCY_IMPACT (Cascade Risk) ─────────────────────────────────
-        if blocked_milestones is None: blocked_milestones = []
-        if dependency_config is None: dependency_config = []
-        dependent_count = len(blocked_milestones)
+        score_breakdown = {}
+        total_score = 0
         
-        if dependent_count > 0 and risk_category != "NONE":
-            # Get points from config
-            dep_score = 0
-            for cfg in dependency_config:
-                if dependent_count >= cfg['blocked_count_threshold']:
-                    dep_score = cfg['risk_points']
-                    break
-                    
-            if dep_score > 0:
-                score += dep_score
-                blocked_word = "milestone" if dependent_count == 1 else "milestones"
-                breakdown.append(f"✓ Blocking {dependent_count} dependent {blocked_word}: {', '.join(blocked_milestones)} — cascade risk (+{dep_score})")
+        def add_score(param_code, condition, value=None):
+            nonlocal total_score
+            param = params.get(param_code, {})
+            if not param.get("enabled", True):
+                return
+            
+            weight = param.get("weight", 1.0)
+            max_s = param.get("max_score", 0)
+            eval_type = param.get("evaluation_type", "NUMERIC")
+            
+            if eval_type == "BOOLEAN" and condition:
+                pts = max_s * weight
+                score_breakdown[param_code] = round(pts)
+                total_score += pts
+            elif eval_type == "NUMERIC" and condition and value is not None:
+                # Value is expected to be a ratio (0.0 to 1.0) of the max score
+                pts = min(value * max_s, max_s) * weight
+                score_breakdown[param_code] = round(pts)
+                total_score += pts
+            elif eval_type == "ENUM" and condition and value is not None:
+                # Value is the direct addition
+                pts = value * weight
+                score_breakdown[param_code] = round(pts)
+                total_score += pts
 
-        final_score = min(score, 100)
-        return final_score, breakdown
+        # EXECUTION_PRIORITY
+        # Base urgency if blocked, delayed, or in progress
+        is_urgent = status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]
+        # Normalize execution urgency to a 0.0-1.0 scale (1.0 for blocked/delayed)
+        urgency_ratio = 0.0
+        if status in ["BLOCKED", "DELAYED"]:
+            urgency_ratio = 1.0
+        elif status == "IN_PROGRESS":
+            urgency_ratio = 0.5
+        elif status == "NOT_STARTED":
+            urgency_ratio = 0.3
+            
+        add_score("EXECUTION_PRIORITY", is_urgent, urgency_ratio)
+        
+        # CASCADE_IMPACT
+        # Normalize cascade count (cap at 5 for max score ratio)
+        cascade_ratio = min(cascade_count / 5.0, 1.0) if cascade_count > 0 else 0.0
+        add_score("CASCADE_IMPACT", cascade_count > 0, cascade_ratio)
+        
+        # DATE_PROXIMITY
+        proximity_ratio = 0.0
+        if days_overdue is not None and days_overdue > 0:
+            proximity_ratio = 1.0
+        elif days_until_due is not None:
+            if days_until_due <= 0:
+                proximity_ratio = 1.0
+            elif days_until_due <= 7:
+                proximity_ratio = 0.8
+            elif days_until_due <= 14:
+                proximity_ratio = 0.5
+            elif days_until_due <= 30:
+                proximity_ratio = 0.2
+        add_score("DATE_PROXIMITY", proximity_ratio > 0, proximity_ratio)
+        
+        # ROOT_CAUSE
+        add_score("ROOT_CAUSE", is_root_cause)
+        
+        # CUSTOMER_DEPENDENCY
+        # Naive check: if 'API' or 'VPN' or 'Customer' in blocked_by
+        is_cust_dep = any("API" in b.upper() or "VPN" in b.upper() or "CUSTOMER" in b.upper() for b in blocked_by)
+        add_score("CUSTOMER_DEPENDENCY", is_cust_dep)
+        
+        # TECHNICAL_DEPENDENCY
+        # If blocked, but not by customer
+        is_tech_dep = len(blocked_by) > 0 and not is_cust_dep
+        add_score("TECHNICAL_DEPENDENCY", is_tech_dep)
+        
+        # SCOPE_CREEP
+        add_score("SCOPE_CREEP", is_scope_creep)
+        
+        # BUSINESS_IMPACT
+        impact_key = (business_impact or "LOW").upper()
+        impact_add = impact_matrix.get(impact_key, 0)
+        add_score("BUSINESS_IMPACT", impact_add > 0, impact_add)
+        
+        # CONFIDENCE
+        add_score("CONFIDENCE", True, confidence)
+        
+        final_score = min(round(total_score), 100)
+        
+        return {
+            "execution_priority_score": final_score,
+            "score_breakdown": score_breakdown
+        }
 
     @classmethod
     def format_reasoning(
         cls,
         score: int,
         severity: str,
-        breakdown: list,
+        breakdown: dict,
         mom_evidence: str,
         llm_reasoning: str,
         original_contract_sentence: str = None
@@ -178,12 +134,13 @@ class RiskScoringEngine:
         Formats the full evidence-backed reasoning string stored in tracker_items.reasoning.
         """
         lines = [
-            f"Risk Score: {score}  |  Severity: {severity}",
+            f"Execution Priority Score: {score}  |  Severity: {severity}",
             "",
-            "Contributing Factors:",
+            "Score Breakdown:"
         ]
         if breakdown:
-            lines.extend(breakdown)
+            for k, v in breakdown.items():
+                lines.append(f"  - {k}: {v} pts")
         else:
             lines.append("  (No risk signals detected)")
 
@@ -200,7 +157,7 @@ class RiskScoringEngine:
             lines.append("")
             
         if mom_evidence:
-            lines.append("Evidence:")
+            lines.append("Evidence (MoM):")
             lines.append(mom_evidence)
 
         return "\n".join(lines).strip()
