@@ -5,7 +5,8 @@ class TrackerAuditAgent:
     def persist_tracker_item(cls, db_cursor, project_id: int, document_id: int, item_type: str, 
                              is_out_of_scope: bool, risk_score: int, risk_level: str, 
                              risk_category: str, confidence: float, reasoning: str, 
-                             requires_escalation: bool, title: str = None, reference_id: int = None) -> int:
+                             requires_escalation: bool, title: str = None, reference_id: int = None,
+                             priority_order: int = None) -> int:
         """
         Acts as the Tracker & Audit Agent. Deterministically persists state with evidence lineage
         into the `tracker_items` table and logs the action in the `audit_logs` table.
@@ -53,35 +54,54 @@ class TrackerAuditAgent:
             existing_score = existing['risk_score'] if isinstance(existing, dict) else existing[1]
             existing_reasoning = existing['reasoning'] if isinstance(existing, dict) else existing[2]
             
-            # Append new reasoning if different
-            new_reasoning = existing_reasoning
-            if reasoning and reasoning not in existing_reasoning:
-                new_reasoning = existing_reasoning + f"\n\n[Update]: {reasoning}"
+            # Check source document ID to know if this is a re-evaluation or a new update
+            db_cursor.execute("SELECT source_document_id FROM tracker_items WHERE id = %s", (existing_id,))
+            existing_doc = db_cursor.fetchone()
+            existing_doc_id = existing_doc['source_document_id'] if isinstance(existing_doc, dict) else (existing_doc[0] if existing_doc else None)
+
+            if str(existing_doc_id) == str(document_id):
+                # Same document (re-evaluation): Overwrite reasoning and score
+                new_reasoning = reasoning
+                final_risk_score = risk_score
+            else:
+                # New document: Append reasoning, take new score (allow score to go down)
+                new_reasoning = existing_reasoning
+                if reasoning and reasoning not in existing_reasoning:
+                    new_reasoning = existing_reasoning + f"\n\n[Update]: {reasoning}"
+                final_risk_score = risk_score
                 
-            # Take the max risk score
-            final_risk_score = max(existing_score, risk_score)
-            
-            # Update the existing record
+            # Update the existing record — always refresh category + score + reasoning
             update_sql = """
                 UPDATE tracker_items 
-                SET source_document_id = %s, risk_score = %s, risk_level = %s, confidence = %s, reasoning = %s
+                SET source_document_id = %s, risk_score = %s, risk_level = %s,
+                    risk_category = %s, confidence = %s, reasoning = %s
+                    {priority_clause}
                 WHERE id = %s
-            """
-            db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, confidence, new_reasoning, existing_id))
+            """.format(priority_clause=", priority_order = %s" if priority_order is not None else "")
+            
+            if priority_order is not None:
+                db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, risk_category, confidence, new_reasoning, priority_order, existing_id))
+            else:
+                db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, risk_category, confidence, new_reasoning, existing_id))
             tracker_id = existing_id
             action_type = 'UPDATED'
         else:
             # 2. Insert new tracker_items
+            has_priority = priority_order is not None
             tracker_sql = """
                 INSERT INTO tracker_items 
                 (project_id, source_document_id, item_type, reference_id, title, is_out_of_scope, risk_score, 
-                 risk_level, risk_category, confidence, reasoning, requires_escalation, status)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'OPEN')
-            """
+                 risk_level, risk_category, confidence, reasoning, requires_escalation{priority_col}, status)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{priority_placeholder}, 'OPEN')
+            """.format(
+                priority_col=", priority_order" if has_priority else "",
+                priority_placeholder=", %s" if has_priority else ""
+            )
+            extra_vals = (priority_order,) if has_priority else ()
             db_cursor.execute(tracker_sql, (
                 project_id, document_id, item_type, reference_id, title, int(is_out_of_scope), risk_score,
                 risk_level, risk_category, confidence, reasoning, int(requires_escalation)
-            ))
+            ) + extra_vals)
             tracker_id = db_cursor.lastrowid
             action_type = 'CREATED'
         

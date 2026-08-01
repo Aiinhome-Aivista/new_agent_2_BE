@@ -282,10 +282,20 @@ class RiskEvaluationAgent:
         milestone_id_to_name = {m['id']: m['name'] for m in milestone_details.values()}
 
         # Map canonical titles to milestone IDs
+        # IMPORTANT: scope_to_milestone_id only contains items in the scope BASELINE.
+        # Items like Azure AD SSO may exist as project_milestones but not scope_items.
+        # We build a second name->id map from ALL project milestones as a fallback.
+        milestone_name_to_id = {_normalize(m['name']): m_id for m_id, m in milestone_details.items()}
+        
         def get_milestone_id(canonical_title):
             c_norm = _normalize(canonical_title)
+            # 1. Exact scope mapping first (highest confidence)
             for db_scope_name, m_id in scope_to_milestone_id.items():
                 db_norm = _normalize(db_scope_name)
+                if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
+                    return m_id
+            # 2. Fallback: match against ALL project milestone names
+            for db_norm, m_id in milestone_name_to_id.items():
                 if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
                     return m_id
             return None
@@ -340,50 +350,96 @@ class RiskEvaluationAgent:
             
             entity_type = result.get("entity_type", "MILESTONE").upper()
             
-            # Entity Type Override based on Baseline Match
-            # If it explicitly matches an IN_SCOPE item, it's a MILESTONE
-            # If it's explicitly extracted as DEPENDENCY, we keep it as DEPENDENCY
-            if is_confirmed_in_scope and entity_type != "DEPENDENCY":
+            # ── Dependency Analysis prep ──────────────────────────────
+            m_id = get_milestone_id(canonical_title)
+            
+            # Entity Type Override based on Baseline or Milestone Match
+            # If it explicitly matches an IN_SCOPE item OR a known milestone ID, it's a MILESTONE
+            # (Unless explicitly flagged as a CUSTOMER DEPENDENCY)
+            if (is_confirmed_in_scope or m_id is not None) and entity_type != "DEPENDENCY":
                 entity_type = "MILESTONE"
                 
             dependency_source = None
             if entity_type == "DEPENDENCY" or blocked_by:
-                dependency_source = DependencyClassificationService.classify(activity_name, blocked_by, evidence)
+                dependency_source = DependencyClassificationService.classify(
+                    activity_name, blocked_by, evidence, entity_type=entity_type
+                )
                 
-            # Dependency analysis data
-            m_id = get_milestone_id(canonical_title)
+            # Dependency analysis data (m_id already computed above)
             dep_data = dep_analysis_results.get(m_id, {})
             cascade_count = dep_data.get("cascade_count", 0)
             is_root_cause = dep_data.get("is_root_cause", False)
 
-            # Assign Category
+            # ── Determine if this item is a DIRECT blocker ──────────────────
+            # A milestone is a "direct blocker" if it is the immediate child
+            # of an incomplete root-cause (i.e. its own parent status is not COMPLETED).
+            is_direct_blocker = False
+            if m_id and m_id in backward_graph:
+                direct_deps = backward_graph[m_id]
+                for dep_id in direct_deps:
+                    dep_status = milestone_status_map.get(dep_id, "COMPLETED")
+                    if dep_status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
+                        status = "BLOCKED"
+                        is_direct_blocker = True
+
+                # Override LLM's generic blocked_by with exact DB direct blockers
+                db_direct_blocked_by = [
+                    milestone_id_to_name.get(d) for d in direct_deps
+                    if d in milestone_id_to_name
+                ]
+                if db_direct_blocked_by:
+                    blocked_by = db_direct_blocked_by
+
+            # If the LLM extracted blockers, or the graph says it's blocked → BLOCKED
+            if blocked_by and status not in ["BLOCKED", "DELAYED"]:
+                status = "BLOCKED"
+
+            # ── Assign Category (graph-first) ───────────────────────────────
             category_rules = RiskConfigurationService.get_category_rules(db_cursor)
+
+            # Collect all transitive downstream names for critical-path check
+            blocking = dep_data.get("downstream_milestones", [])
+            downstream_names = [milestone_id_to_name.get(m, str(m)) for m in blocking]
+
             risk_cat = CategoryAssignmentEngine.assign_category(
                 rules=category_rules,
                 entity_type=entity_type,
                 status=status,
                 dependency_source=dependency_source,
                 is_root_cause=is_root_cause,
-                cascade_count=cascade_count
+                cascade_count=cascade_count,
+                downstream_names=downstream_names,
+                is_direct_blocker=is_direct_blocker,
+                item_name=canonical_title,
             )
+
+            # ── STAGE DIAGNOSTIC LOG ────────────────────────────────────────
+            _WATCH = {"api", "vpn", "azure", "knowledge", "sit", "crm"}
+            if any(w in canonical_title.lower() for w in _WATCH):
+                print(f"[STAGE] '{canonical_title[:40]}'"
+                      f" | entity={entity_type} | src={dependency_source}"
+                      f" | root={is_root_cause} | cascade={cascade_count}"
+                      f" | direct_blocker={is_direct_blocker}"
+                      f" | status={status}"
+                      f" | cat={risk_cat}")
             
             # Map back to old flags for the Scoring Engine
             is_scope_creep = (risk_cat == "SCOPE_CREEP")
 
-            # Date calculation
+            # Date calculation — use a SEPARATE variable to avoid shadowing dep m_id
             days_overdue = 0
             days_until_due = 9999
-            m_id = None
+            date_m_id = None
             c_norm = _normalize(canonical_title)
             for db_scope_name, mid in scope_to_milestone_id.items():
                 db_norm = _normalize(db_scope_name)
                 if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
-                    m_id = mid
+                    date_m_id = mid
                     break
             
             p_date_str = None
-            if m_id and m_id in milestone_details:
-                p_date_str = milestone_details[m_id].get("planned_date")
+            if date_m_id and date_m_id in milestone_details:
+                p_date_str = milestone_details[date_m_id].get("planned_date")
                 if p_date_str:
                     try:
                         p_date = datetime.strptime(str(p_date_str).split(' ')[0], "%Y-%m-%d").date()
@@ -410,7 +466,8 @@ class RiskEvaluationAgent:
                 confidence=1.0,
                 business_impact="MEDIUM",
                 params=risk_params,
-                impact_matrix=impact_matrix
+                impact_matrix=impact_matrix,
+                category=risk_cat,
             )
             
             exec_score = score_result["execution_priority_score"]
@@ -425,14 +482,9 @@ class RiskEvaluationAgent:
                     break
 
             reasoning = result.get("reasoning", "")
-            full_evidence = RiskScoringEngine.format_reasoning(
-                score=exec_score,
-                severity=severity,
-                breakdown=breakdown,
-                mom_evidence=evidence,
-                llm_reasoning=reasoning,
-                original_contract_sentence=original_contract_sentence
-            )
+            
+            direct_blocking = dep_data.get("direct_downstream_milestones", [])
+            direct_blocking_names = [milestone_id_to_name.get(m, str(m)) for m in direct_blocking]
 
             # Grouping
             if is_scope_creep:
@@ -440,11 +492,23 @@ class RiskEvaluationAgent:
                     "activity": canonical_title,
                     "entity_type": entity_type,
                     "classification": "OUT_OF_SCOPE" if severity in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
-                    "reason": full_evidence,
+                    "reason": reasoning,
                     "similar_deliverable": canonical_title,
                     "confidence": 100,
                     "risk_score": exec_score,
                     "risk_level": severity,
+                    
+                    "category": risk_cat,
+                    "current_status": status,
+                    "progress": result.get("progress"),
+                    "is_root_cause": is_root_cause,
+                    "cascade_count": cascade_count,
+                    "blockers": blocked_by,
+                    "blocking_names": downstream_names,
+                    "direct_blocking_names": direct_blocking_names,
+                    "score_breakdown": breakdown,
+                    "mom_evidence": evidence,
+                    "original_contract_sentence": original_contract_sentence
                 })
             elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
                 tracker_items.append({
@@ -465,7 +529,13 @@ class RiskEvaluationAgent:
                     "days_until_due": days_until_due,
                     "risk": severity,
                     "risk_score": exec_score,
-                    "reasoning": full_evidence
+                    "reasoning": reasoning,
+                    
+                    "blocking_names": downstream_names,
+                    "direct_blocking_names": direct_blocking_names,
+                    "score_breakdown": breakdown,
+                    "mom_evidence": evidence,
+                    "original_contract_sentence": original_contract_sentence
                 })
                 
                 # DEBUG INJECTION
@@ -488,12 +558,69 @@ class RiskEvaluationAgent:
                     "confidence": 100,
                 })
 
+        # Deduplicate tracker_items by deliverable name
+        def dedup_items(items_list, key_field):
+            merged = {}
+            for item in items_list:
+                key = _normalize(item[key_field])
+                if key not in merged:
+                    merged[key] = item
+                else:
+                    # Merge logic: take max score, combine mom_evidence
+                    existing = merged[key]
+                    if item['risk_score'] > existing['risk_score']:
+                        new_evidence = existing.get('mom_evidence', '')
+                        item_evidence = item.get('mom_evidence', '')
+                        if item_evidence and item_evidence not in new_evidence:
+                            new_evidence += f"\n\n{item_evidence}"
+                        item['mom_evidence'] = new_evidence
+                        merged[key] = item
+                    else:
+                        existing_evidence = existing.get('mom_evidence', '')
+                        item_evidence = item.get('mom_evidence', '')
+                        if item_evidence and item_evidence not in existing_evidence:
+                            existing_evidence += f"\n\n{item_evidence}"
+                        existing['mom_evidence'] = existing_evidence
+                        
+            final_list = list(merged.values())
+            for item in final_list:
+                formatted = RiskScoringEngine.format_reasoning(
+                    score=item.get("risk_score"),
+                    severity=item.get("risk") or item.get("risk_level"),
+                    category=item.get("category"),
+                    entity_type=item.get("entity_type"),
+                    status=item.get("current_status"),
+                    progress=item.get("progress"),
+                    is_root_cause=item.get("is_root_cause"),
+                    cascade_count=item.get("cascade_count"),
+                    blocked_by=item.get("blockers"),
+                    blocking=item.get("blocking_names"),
+                    direct_blocking=item.get("direct_blocking_names"),
+                    breakdown=item.get("score_breakdown"),
+                    mom_evidence=item.get("mom_evidence"),
+                    original_contract_sentence=item.get("original_contract_sentence")
+                )
+                if 'reasoning' in item:
+                    item['reasoning'] = formatted
+                if 'reason' in item:
+                    item['reason'] = formatted
+                    
+            return final_list
+
+        out_of_scope_activities = dedup_items(out_of_scope_activities, "activity")
+        tracker_items = dedup_items(tracker_items, "deliverable")
+
         # 4. Risk Ranking Engine
         timeline_deliverables = RiskRankingEngine.rank_risks(tracker_items, category_priorities)
         
-        # Ensure 'action_priority_score' is mapped to execution_priority_score for FE compatibility
-        for item in timeline_deliverables:
+        # Stamp priority_order on each item so the DB query can ORDER BY it
+        for rank_idx, item in enumerate(timeline_deliverables):
+            item["priority_order"] = rank_idx + 1
             item["action_priority_score"] = item.get("execution_priority_score", 0)
+
+        # --- DEBUG: confirm category-first ordering ---
+        print("[RankEngine] Ranked order:",
+              [(r["deliverable"], r["category"], r["execution_priority_score"]) for r in timeline_deliverables])
 
         in_scope_result = {"activities": in_scope_activities}
         out_of_scope_result = {"activities": out_of_scope_activities}
@@ -639,7 +766,8 @@ class RiskEvaluationAgent:
                 db_cursor, project_id, document_id, item_type,
                 False, item_risk_score, item_risk_level, actual_risk_cat,
                 1.0, full_reasoning, True,
-                title=card_title, reference_id=ref_id
+                title=card_title, reference_id=ref_id,
+                priority_order=deliv.get('priority_order')
             )
 
             # Use alert threshold from DB config (not hardcoded 70)

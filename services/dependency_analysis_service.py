@@ -42,6 +42,7 @@ class DependencyAnalysisService:
                 results[milestone] = {
                     "cascade_count": 0,
                     "downstream_milestones": [],
+                    "direct_downstream_milestones": [],
                     "is_root_cause": False,
                     "dependency_depth": 0
                 }
@@ -63,6 +64,7 @@ class DependencyAnalysisService:
             results[milestone] = {
                 "cascade_count": cascade_count,
                 "downstream_milestones": list(downstream_set),
+                "direct_downstream_milestones": reverse_graph.get(milestone, []),
                 "is_root_cause": is_root_cause and cascade_count > 0,
                 "dependency_depth": len(dependency_graph.get(milestone, []))
             }

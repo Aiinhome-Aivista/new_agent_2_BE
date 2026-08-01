@@ -25,6 +25,11 @@ class TrackerRepository:
                     conn.commit()
                 except Exception:
                     pass
+                try:
+                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN priority_order INT NULL;")
+                    conn.commit()
+                except Exception:
+                    pass  # already exists
                 cursor.close()
                 conn.close()
         except Exception as e:
@@ -92,7 +97,9 @@ class TrackerRepository:
             LEFT JOIN documents d ON ti.source_document_id = d.id
             LEFT JOIN users u ON ti.resolved_by = u.id
             WHERE ti.project_id = %s
-            ORDER BY ti.risk_score DESC
+            ORDER BY
+                CASE WHEN ti.priority_order IS NOT NULL THEN ti.priority_order ELSE 9999 END ASC,
+                ti.risk_score DESC
         """, (project_id,))
         items = cursor.fetchall()
         cursor.close()

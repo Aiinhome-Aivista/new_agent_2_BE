@@ -20,12 +20,16 @@ class RiskScoringEngine:
         confidence: float,
         business_impact: str,
         params: dict,
-        impact_matrix: dict
+        impact_matrix: dict,
+        category: str = "GENERAL",
     ) -> dict:
         """
         Step 1: Calculate parameter scores
         Step 2: Calculate execution score
         Step 3: Calculate risk score
+        
+        category: the pre-assigned business category (ROOT_CAUSE, CUSTOMER_DEPENDENCY, etc.)
+                  Used to correctly assign bonus points without polluting downstream items.
         """
         score_breakdown = {}
         total_score = 0
@@ -60,12 +64,18 @@ class RiskScoringEngine:
         is_urgent = status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]
         # Normalize execution urgency to a 0.0-1.0 scale (1.0 for blocked/delayed)
         urgency_ratio = 0.0
-        if status in ["BLOCKED", "DELAYED"]:
+        if is_root_cause:
+            urgency_ratio = 1.0
+        elif status in ["BLOCKED", "DELAYED"]:
             urgency_ratio = 1.0
         elif status == "IN_PROGRESS":
             urgency_ratio = 0.5
         elif status == "NOT_STARTED":
             urgency_ratio = 0.3
+            
+        # Ensure it's marked as urgent if it's a root cause
+        if is_root_cause:
+            is_urgent = True
             
         add_score("EXECUTION_PRIORITY", is_urgent, urgency_ratio)
         
@@ -93,13 +103,18 @@ class RiskScoringEngine:
         add_score("ROOT_CAUSE", is_root_cause)
         
         # CUSTOMER_DEPENDENCY
-        # Naive check: if 'API' or 'VPN' or 'Customer' in blocked_by
-        is_cust_dep = any("API" in b.upper() or "VPN" in b.upper() or "CUSTOMER" in b.upper() for b in blocked_by)
+        # Only award points when this item IS the customer dependency, not when it
+        # is transitively downstream of one. This prevents SIT from inheriting API Credentials bonus.
+        is_cust_dep = (category == "CUSTOMER_DEPENDENCY")
         add_score("CUSTOMER_DEPENDENCY", is_cust_dep)
         
         # TECHNICAL_DEPENDENCY
-        # If blocked, but not by customer
-        is_tech_dep = len(blocked_by) > 0 and not is_cust_dep
+        # Award when blocked by an internal milestone (not a customer dependency)
+        is_tech_dep = (
+            len(blocked_by) > 0
+            and not is_cust_dep
+            and category not in ("ROOT_CAUSE", "DIRECT_EXECUTION_BLOCKER", "TRANSITIVE_EXECUTION_BLOCKER")
+        )
         add_score("TECHNICAL_DEPENDENCY", is_tech_dep)
         
         # SCOPE_CREEP
@@ -125,39 +140,92 @@ class RiskScoringEngine:
         cls,
         score: int,
         severity: str,
+        category: str,
+        entity_type: str,
+        status: str,
+        progress: int,
+        is_root_cause: bool,
+        cascade_count: int,
+        blocked_by: list,
+        blocking: list,
+        direct_blocking: list,
         breakdown: dict,
         mom_evidence: str,
-        llm_reasoning: str,
         original_contract_sentence: str = None
     ) -> str:
         """
-        Formats the full evidence-backed reasoning string stored in tracker_items.reasoning.
+        Formats the full evidence-backed reasoning string stored in tracker_items.reasoning
+        into an operational decision-support dashboard view.
         """
         lines = [
-            f"Execution Priority Score: {score}  |  Severity: {severity}",
+            f"Execution Priority Score: {score} | Severity: {severity}",
+            f"Category: {category.replace('_', ' ').title()}",
             "",
-            "Score Breakdown:"
+            "Current Status",
         ]
-        if breakdown:
-            for k, v in breakdown.items():
-                lines.append(f"  - {k}: {v} pts")
+        
+        # Status & Progress
+        status_display = status.replace("_", " ").title() if status else "Unknown"
+        if progress is not None and str(progress).isdigit():
+            lines.append(f"• {status_display} ({progress}%)")
         else:
-            lines.append("  (No risk signals detected)")
-
+            lines.append(f"• {status_display}")
+            
         lines.append("")
         
-        if original_contract_sentence:
-            lines.append("Original Contract:")
-            lines.append(original_contract_sentence)
+        # Why this is high priority
+        if is_root_cause or cascade_count > 0:
+            lines.append("Why this is high priority")
+            if is_root_cause:
+                lines.append("\u2022 Root cause of the current execution chain")
+            if category == "DIRECT_EXECUTION_BLOCKER":
+                lines.append("\u2022 Directly blocked by an incomplete predecessor (next in chain)")
+            elif category == "TRANSITIVE_EXECUTION_BLOCKER":
+                lines.append("\u2022 Transitively blocked — waiting on upstream milestones")
+            if cascade_count > 0:
+                lines.append(f"\u2022 Blocks {cascade_count} downstream milestone{'s' if cascade_count > 1 else ''}")
+            lines.append("")
+            
+        # Blocked By
+        if blocked_by:
+            if entity_type == "DEPENDENCY" or category == "CUSTOMER_DEPENDENCY":
+                lines.append("Dependency / Waiting For")
+            else:
+                lines.append("Blocked By")
+            for b in blocked_by:
+                lines.append(f"• {b}")
+            lines.append("")
+            
+        # Blocking
+        if direct_blocking or blocking:
+            lines.append("Blocking")
+            if direct_blocking:
+                lines.append("Directly Blocks:")
+                for b in direct_blocking:
+                    lines.append(f"• {b}")
+            transitive = [b for b in blocking if b not in (direct_blocking or [])]
+            if transitive:
+                lines.append("Transitively Blocks:")
+                for b in transitive:
+                    lines.append(f"• {b}")
             lines.append("")
 
-        if llm_reasoning:
-            lines.append("Reasoning:")
-            lines.append(llm_reasoning)
+        # Score Breakdown
+        lines.append("Score Breakdown")
+        if breakdown:
+            for k, v in breakdown.items():
+                lines.append(f"• {k.replace('_', ' ').title()}: {v} pts")
+        else:
+            lines.append("• (No risk signals detected)")
+        lines.append("")
+
+        if original_contract_sentence:
+            lines.append("Original Contract")
+            lines.append(f"\"{original_contract_sentence}\"")
             lines.append("")
             
         if mom_evidence:
-            lines.append("Evidence (MoM):")
-            lines.append(mom_evidence)
+            lines.append("Evidence (MoM)")
+            lines.append(f"\"{mom_evidence}\"")
 
         return "\n".join(lines).strip()
