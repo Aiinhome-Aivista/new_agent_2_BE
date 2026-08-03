@@ -32,6 +32,15 @@ def confirm_upload_document(
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
+    
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT monitoring_status FROM projects WHERE id = %s", (project_id,))
+    project = cursor.fetchone()
+    cursor.close()
+    
+    if project and project.get("monitoring_status") == "CLOSED":
+        raise HTTPException(status_code=400, detail="Cannot upload documents to a closed project.")
+
     if document_type in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
         raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to upload EL or IFA documents.")
         
