@@ -224,10 +224,14 @@ class BaselineRepository:
         cursor.execute("""
             SELECT pm.*, 
                    GROUP_CONCAT(DISTINCT md.child_milestone_id) as blocking_ids, 
-                   GROUP_CONCAT(DISTINCT md2.parent_milestone_id) as blocked_by_ids
+                   GROUP_CONCAT(DISTINCT md2.parent_milestone_id) as blocked_by_ids,
+                   GROUP_CONCAT(DISTINCT CONCAT(succ.name, '||', md.dependency_type) SEPARATOR ';;') as successor_details,
+                   GROUP_CONCAT(DISTINCT CONCAT(pred.name, '||', md2.dependency_type) SEPARATOR ';;') as predecessor_details
             FROM project_milestones pm
             LEFT JOIN milestone_dependencies md ON pm.id = md.parent_milestone_id
+            LEFT JOIN project_milestones succ ON md.child_milestone_id = succ.id
             LEFT JOIN milestone_dependencies md2 ON pm.id = md2.child_milestone_id
+            LEFT JOIN project_milestones pred ON md2.parent_milestone_id = pred.id
             WHERE pm.project_id = %s AND pm.baseline_id = %s
             GROUP BY pm.id
         """, (project_id, baseline["id"]))
@@ -366,11 +370,77 @@ class BaselineRepository:
         progress_percentage: Optional[int], 
         execution_summary: str,
         dependencies: list,
+        resolved_items: list,
         confidence: float,
         evidence_text: str
     ) -> None:
         import json
         cursor = db.cursor()
+        import datetime
+        import re
+        _normalize = lambda x: re.sub(r'[^\w\s]', '', (x or '').lower().strip())
+        
+        # Dependency Lifecycle Merging (Execution Prerequisite State Manager)
+        # Fetch the previous dependencies for this scope_item
+        cursor.execute(
+            "SELECT dependencies FROM deliverable_progress WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1",
+            (scope_item_id,)
+        )
+        prev_row = cursor.fetchone()
+        
+        previous_deps_map = {}
+        if prev_row and prev_row[0]:
+            try:
+                prev_deps = json.loads(prev_row[0])
+                for d in prev_deps:
+                    if isinstance(d, dict) and "name" in d:
+                        previous_deps_map[_normalize(d["name"])] = d
+                    elif isinstance(d, str):
+                        # Handle legacy string format
+                        previous_deps_map[_normalize(d)] = {
+                            "name": d,
+                            "status": "PENDING",
+                            "last_updated": datetime.datetime.now().isoformat(),
+                            "evidence": "",
+                            "resolved_by_document": None
+                        }
+            except Exception:
+                pass
+                
+        # Build new dependencies state
+        current_deps_map = {}
+        
+        # 1. Start with everything we just extracted (which the LLM thinks are pending/blocking right now)
+        for d in dependencies:
+            name = d if isinstance(d, str) else d.get("name", str(d))
+            norm_name = _normalize(name)
+            current_deps_map[norm_name] = {
+                "name": name,
+                "status": "PENDING",
+                "last_updated": datetime.datetime.now().isoformat(),
+                "evidence": "Extracted as execution prerequisite",
+                "resolved_by_document": None
+            }
+            
+        # 2. Inherit previous dependencies that haven't explicitly transitioned
+        for norm_name, prev_obj in previous_deps_map.items():
+            if norm_name not in current_deps_map:
+                current_deps_map[norm_name] = prev_obj
+                
+        # 3. Apply Explicit Resolutions
+        for r_item in resolved_items:
+            r_name = r_item.get("name", "")
+            r_norm = _normalize(r_name)
+            # Find matching prerequisite
+            for d_norm in list(current_deps_map.keys()):
+                if r_norm in d_norm or d_norm in r_norm:
+                    current_deps_map[d_norm]["status"] = "COMPLETED"
+                    current_deps_map[d_norm]["last_updated"] = datetime.datetime.now().isoformat()
+                    current_deps_map[d_norm]["evidence"] = r_item.get("resolution_evidence", "Resolved")
+                    current_deps_map[d_norm]["resolved_by_document"] = source_document_id
+                    
+        final_dependencies = list(current_deps_map.values())
+
         sql = """
             INSERT INTO deliverable_progress (
                 project_id, scope_item_id, source_document_id, risk_evaluation_id, baseline_version,
@@ -380,7 +450,7 @@ class BaselineRepository:
         """
         cursor.execute(sql, (
             project_id, scope_item_id, source_document_id, risk_evaluation_id, baseline_version,
-            status_code, progress_percentage, execution_summary, json.dumps(dependencies) if dependencies else "[]", 
+            status_code, progress_percentage, execution_summary, json.dumps(final_dependencies), 
             confidence, evidence_text
         ))
         cursor.close()

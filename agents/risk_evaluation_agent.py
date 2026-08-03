@@ -148,7 +148,20 @@ class RiskEvaluationAgent:
 
         # STEP 2: Extract activities once — LLM CALL #1
         _emit("Extracting Activities", 35)
-        raw_activities = ActivityExtractorAgent.extract_activities(document_text)
+        
+        # Get active tracker items to assist LLM in matching
+        db_cursor.execute("SELECT id, title, risk_category, status FROM tracker_items WHERE project_id = %s AND status = 'OPEN'", (project_id,))
+        active_tracker_items = db_cursor.fetchall()
+        active_items_list = []
+        for r in active_tracker_items:
+            title = r['title'] if isinstance(r, dict) else r[1]
+            cat = r['risk_category'] if isinstance(r, dict) else r[2]
+            active_items_list.append(f"- {title} (Category: {cat})")
+        active_tracker_block = "\n".join(active_items_list) if active_items_list else "None"
+        
+        extraction_result = ActivityExtractorAgent.extract_activities(document_text, active_tracker_block)
+        raw_activities = extraction_result.get("activities", [])
+        resolved_items = extraction_result.get("resolved_items", [])
 
         # ── Post-extraction: resolve canonical title immediately, then deduplicate ──
         # Root cause fix: deduplication must happen on the CANONICAL title, not the raw
@@ -182,7 +195,8 @@ class RiskEvaluationAgent:
                 "activity": name,
                 "canonical_title": canonical_title,
                 "is_in_scope": is_in_scope,
-                "source_sentence": item.get("source_sentence", name)
+                "source_sentence": item.get("source_sentence", name),
+                "extraction_confidence": item.get("confidence", 100)
             })
 
         # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
@@ -196,6 +210,7 @@ class RiskEvaluationAgent:
             canonical_title = act_item["canonical_title"]
             is_already_in_scope = act_item["is_in_scope"]
             source_sentence = act_item["source_sentence"]
+            extraction_confidence = act_item["extraction_confidence"]
             matched_si, confidence, match_type = _deterministic_match(activity_name, scope_items)
 
             # Also try matching on canonical_title if activity_name didn't hit
@@ -213,7 +228,8 @@ class RiskEvaluationAgent:
                     "canonical_title": final_title,
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "extraction_confidence": extraction_confidence
                 })
             else:
                 # Ambiguous — needs deeper analysis
@@ -222,7 +238,8 @@ class RiskEvaluationAgent:
                     "canonical_title": canonical_title,
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
-                    "confidence": confidence
+                    "confidence": confidence,
+                    "extraction_confidence": extraction_confidence
                 })
 
         # ===========================================================
@@ -242,9 +259,11 @@ class RiskEvaluationAgent:
             )
             activities_with_contexts.append({
                 "activity": activity_name,
+                "canonical_title": item.get("canonical_title"),
                 "source_sentence": item.get("source_sentence", activity_name),
                 "context": context,
-                "matched_si": matched_si
+                "matched_si": matched_si,
+                "extraction_confidence": item.get("extraction_confidence", 100)
             })
 
         # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
@@ -320,12 +339,65 @@ class RiskEvaluationAgent:
             
             m_id = get_milestone_id(canonical_title)
             if m_id:
-                milestone_status_map[m_id] = result.get("status", "UNKNOWN").upper()
+                new_status = result.get("status", "UNKNOWN").upper()
+                # Status precedence: COMPLETED > BLOCKED > IN_PROGRESS > PENDING
+                status_rank = {"COMPLETED": 4, "BLOCKED": 3, "IN_PROGRESS": 2, "PENDING": 1, "UNKNOWN": 0}
+                existing_status = milestone_status_map.get(m_id, "UNKNOWN")
                 
-        # 2. Dependency Analysis (Deterministic)
-        _, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
-        dep_analysis_results = DependencyAnalysisService.analyze_dependencies(milestone_status_map, backward_graph)
+                if status_rank.get(new_status, 0) > status_rank.get(existing_status, 0):
+                    milestone_status_map[m_id] = new_status
+
+        from agents.execution_pipeline import (
+            MilestoneExecutionStateManager, 
+            ProjectStateSnapshot, 
+            DependencyExecutionStateResolver, 
+            DerivedExecutionState
+        )
         
+        # 2. Milestone Execution State Manager
+        # Updates DB using the TransitionValidator
+        MilestoneExecutionStateManager.update_milestones(db_cursor, project_id, milestone_status_map)
+        
+        # 3. Execution Prerequisite Manager (Sub-deliverables & Prerequisites)
+        _emit("Evaluating Execution Prerequisites", 55)
+        try:
+            from agents.risk_evaluator_subagents import DeliverableTimelineEvaluationAgent
+            from repositories.baseline_repository import BaselineRepository
+            progress_records = DeliverableTimelineEvaluationAgent.evaluate_progress(
+                approved_baseline_items=scope_items, 
+                document_text=document_text, 
+                risk_eval_output=[]  # Running before risk engine now
+            )
+            for pr in progress_records:
+                BaselineRepository.insert_deliverable_progress(
+                    db=db_cursor._connection, 
+                    project_id=project_id,
+                    scope_item_id=pr.get("scope_item_id"),
+                    source_document_id=document_id,
+                    risk_evaluation_id=None,  # Not linked to a risk evaluation yet
+                    baseline_version=1,
+                    status_code=pr.get("progress_status", "UNKNOWN"),
+                    progress_percentage=pr.get("progress_percentage"),
+                    execution_summary=pr.get("execution_summary", ""),
+                    dependencies=pr.get("dependencies", []),
+                    resolved_items=resolved_items,
+                    confidence=pr.get("confidence", 1.0),
+                    evidence_text=pr.get("evidence_text", "")
+                )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"Error evaluating deliverable progress: {e}")
+            
+        # 4. Project State Snapshot (Immutable)
+        state_snapshot = ProjectStateSnapshot(db_cursor, project_id)
+        
+        # 4. Dependency Execution State Resolver (Static Graph)
+        _, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
+        dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
+        
+        # 5. Derived Execution State
+        derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
         tracker_items = []
         out_of_scope_activities = []
         in_scope_activities = list(deterministic_in_scope)
@@ -371,28 +443,27 @@ class RiskEvaluationAgent:
             is_root_cause = dep_data.get("is_root_cause", False)
 
             # ── Determine if this item is a DIRECT blocker ──────────────────
-            # A milestone is a "direct blocker" if it is the immediate child
-            # of an incomplete root-cause (i.e. its own parent status is not COMPLETED).
             is_direct_blocker = False
-            if m_id and m_id in backward_graph:
-                direct_deps = backward_graph[m_id]
-                for dep_id in direct_deps:
-                    dep_status = milestone_status_map.get(dep_id, "COMPLETED")
-                    if dep_status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
-                        status = "BLOCKED"
-                        is_direct_blocker = True
-
-                # Override LLM's generic blocked_by with exact DB direct blockers
-                db_direct_blocked_by = [
-                    milestone_id_to_name.get(d) for d in direct_deps
-                    if d in milestone_id_to_name
-                ]
-                if db_direct_blocked_by:
-                    blocked_by = db_direct_blocked_by
-
-            # If the LLM extracted blockers, or the graph says it's blocked → BLOCKED
-            if blocked_by and status not in ["BLOCKED", "DELAYED"]:
-                status = "BLOCKED"
+            
+            # Apply derived execution state (deterministic blockers overrides LLM)
+            if m_id and m_id in derived_states:
+                d_state = derived_states[m_id]
+                # Only upgrade to BLOCKED deterministically if derived says so
+                if d_state["status"] == "BLOCKED" and status != "COMPLETED":
+                    status = "BLOCKED"
+                
+                if d_state["blockers"] and d_state["status"] == "BLOCKED":
+                    blocked_by = d_state["blockers"]
+                    is_direct_blocker = True
+            
+            # ── Preservation of Historical Metadata (Bug 2, 3, 4) ────────────
+            # If a milestone transitions to COMPLETED, it is no longer the root cause 
+            # of current blockages, but we preserve the historical dependency_source and root_cause.
+            if status == "COMPLETED":
+                # We do not delete dependency_source! It stays for historical audit.
+                # However, it is no longer ACTIVELY blocking anything.
+                is_root_cause = False
+                blocked_by = []
 
             # ── Assign Category (graph-first) ───────────────────────────────
             category_rules = RiskConfigurationService.get_category_rules(db_cursor)
@@ -486,6 +557,28 @@ class RiskEvaluationAgent:
             direct_blocking = dep_data.get("direct_downstream_milestones", [])
             direct_blocking_names = [milestone_id_to_name.get(m, str(m)) for m in direct_blocking]
 
+            should_create_risk = False
+            llm_confidence = activities_with_contexts[i].get("extraction_confidence", 100) if i < len(activities_with_contexts) else 100
+            
+            if llm_confidence >= 80:
+                if entity_type == "DEPENDENCY" or entity_type == "NEW_FEATURE":
+                    should_create_risk = True
+                elif is_scope_creep and exec_score > 35:
+                    should_create_risk = True
+                elif status in ["BLOCKED", "DELAYED"]:
+                    should_create_risk = True
+                elif len(blocked_by) > 0:
+                    should_create_risk = True
+                elif dependency_source is not None:
+                    should_create_risk = True
+                elif is_direct_blocker:
+                    should_create_risk = True
+                elif risk_cat not in ["GENERAL", "UNKNOWN", "SCOPE_CREEP"]:
+                    should_create_risk = True
+                    
+            if not should_create_risk and status not in ["COMPLETED", "RESOLVED"]:
+                continue
+
             # Grouping
             if is_scope_creep:
                 out_of_scope_activities.append({
@@ -510,7 +603,7 @@ class RiskEvaluationAgent:
                     "mom_evidence": evidence,
                     "original_contract_sentence": original_contract_sentence
                 })
-            elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
+            elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED", "PENDING", "COMPLETED", "RESOLVED"]:
                 tracker_items.append({
                     "deliverable": canonical_title,
                     "entity_type": entity_type,
@@ -519,7 +612,7 @@ class RiskEvaluationAgent:
                     "progress": result.get("progress"),
                     "delay_days": days_overdue,
                     "blockers": blocked_by,
-                    "confidence": 100,
+                    "confidence": llm_confidence,
                     "execution_priority_score": exec_score,
                     "dependency_status": risk_cat,
                     "category": risk_cat,
@@ -676,37 +769,8 @@ class RiskEvaluationAgent:
         bv_row = db_cursor.fetchone()
         baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
 
-        # Evaluate Deliverable Progress (Execution Status)
-        _emit("Evaluating Deliverable Progress", 95)
-        try:
-            from agents.risk_evaluator_subagents import DeliverableTimelineEvaluationAgent
-            from repositories.baseline_repository import BaselineRepository
-            progress_records = DeliverableTimelineEvaluationAgent.evaluate_progress(
-                approved_baseline_items=scope_items, 
-                document_text=document_text, 
-                risk_eval_output=sub_agent_results
-            )
-            for pr in progress_records:
-                BaselineRepository.insert_deliverable_progress(
-                    db=db_cursor._connection, 
-                    project_id=project_id,
-                    scope_item_id=pr.get("scope_item_id"),
-                    source_document_id=document_id,
-                    risk_evaluation_id=risk_eval_id,
-                    baseline_version=baseline_version,
-                    status_code=pr.get("progress_status", "UNKNOWN"),
-                    progress_percentage=pr.get("progress_percentage"),
-                    execution_summary=pr.get("execution_summary", ""),
-                    dependencies=pr.get("dependencies", []),
-                    confidence=pr.get("confidence", 1.0),
-                    evidence_text=pr.get("evidence_text", "")
-                )
-            db_cursor._connection.commit()
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            print(f"Error evaluating deliverable progress: {e}")
-
+        # Deliverable Progress is now evaluated earlier in the pipeline as Execution Prerequisite Manager.
+        
         # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline
@@ -725,12 +789,16 @@ class RiskEvaluationAgent:
             item_risk_level = oos_item.get('risk_level', 'MEDIUM')
             confidence_val  = oos_item.get('confidence', 70) / 100.0
             full_reasoning  = oos_item.get('reason', f'Activity: {oos_name}')
+            
+            is_resolved = (item_risk_score == 0) or (oos_item.get('current_status') in ['COMPLETED', 'RESOLVED'])
+            target_status = 'RESOLVED' if is_resolved else 'OPEN'
 
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, 'ACTIVITY',
                 True, item_risk_score, item_risk_level, 'SCOPE_CREEP',
                 confidence_val, full_reasoning, True,
-                title=card_title, reference_id=ref_id
+                title=card_title, reference_id=ref_id,
+                status=target_status
             )
 
             # Use alert threshold from DB config (not hardcoded 70)
@@ -742,7 +810,7 @@ class RiskEvaluationAgent:
                 )
 
         # Persist Timeline / Delay risks to tracker
-        for deliv in timeline_result.get("deliverables", []):
+        for deliv in tracker_items:
             deliv_name = deliv.get('deliverable', 'Unknown')  # Already canonical from pipeline
 
             card_title = deliv_name
@@ -761,22 +829,79 @@ class RiskEvaluationAgent:
 
             actual_risk_cat = deliv.get('dependency_status', 'DELAY')
             item_type = 'BLOCKER' if actual_risk_cat in ['BLOCKED', 'DEPENDENCY'] else 'ACTION_ITEM'
+            
+            # Auto-resolve logic: if score drops to 0, dependency status is RESOLVED, or status is COMPLETED
+            is_resolved = (item_risk_score == 0) or (actual_risk_cat == 'RESOLVED') or (deliv.get('current_status') == 'COMPLETED')
+            target_status = 'RESOLVED' if is_resolved else 'OPEN'
 
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, item_type,
                 False, item_risk_score, item_risk_level, actual_risk_cat,
                 1.0, full_reasoning, True,
                 title=card_title, reference_id=ref_id,
-                priority_order=deliv.get('priority_order')
+                priority_order=deliv.get('priority_order'),
+                status=target_status
             )
 
             # Use alert threshold from DB config (not hardcoded 70)
-            delay_alert_rule = alert_rules.get(item_risk_level, {})
-            if delay_alert_rule.get('send_email') and item_risk_score >= delay_alert_rule.get('min_score_threshold', 70):
-                AlertingAgent.dispatch_alert(
-                    project_id, f"Delay Risk: {card_title}",
-                    full_reasoning, stakeholders, db_cursor=db_cursor
+            if not is_resolved:
+                delay_alert_rule = alert_rules.get(item_risk_level, {})
+                if delay_alert_rule.get('send_email') and item_risk_score >= delay_alert_rule.get('min_score_threshold', 70):
+                    AlertingAgent.dispatch_alert(
+                        project_id, f"Delay Risk: {card_title}",
+                        full_reasoning, stakeholders, db_cursor=db_cursor
+                    )
+                    
+        # Task 3: Risk Resolution by Type
+        # A) Explicit Evidence (resolved_items) for Customer Dependencies / Technical Risks
+        for resolved in resolved_items:
+            res_name = resolved.get("name", "")
+            res_evidence = resolved.get("resolution_evidence", "No evidence provided")
+            res_confidence = resolved.get("confidence", 0)
+            
+            # Only resolve if confidence > 85 (High Confidence)
+            if res_confidence > 85:
+                ref_id = None
+                res_name_clean = res_name.lower().strip()
+                for name, act_id in activity_map.items():
+                    if name in res_name_clean or res_name_clean in name:
+                        ref_id = act_id
+                        break
+                        
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, 'ACTIVITY',
+                    False, 0, 'LOW', 'RESOLVED',
+                    1.0, f"Explicitly resolved in document.\n\nEvidence: {res_evidence}", False,
+                    title=res_name, reference_id=ref_id,
+                    status='RESOLVED', resolve_only=True
                 )
+                
+        # B) Execution Blockers: Auto-resolve if associated milestone completes
+        completed_milestone_ids = [m_id for m_id, status in milestone_status_map.items() if status == "COMPLETED"]
+        if completed_milestone_ids:
+            format_strings = ','.join(['%s'] * len(completed_milestone_ids))
+            db_cursor.execute(f"""
+                SELECT id, title, risk_category FROM tracker_items 
+                WHERE project_id = %s 
+                AND status = 'OPEN' 
+                AND reference_id IN ({format_strings})
+                AND risk_category IN ('ROOT_CAUSE', 'DIRECT_EXECUTION_BLOCKER', 'TRANSITIVE_EXECUTION_BLOCKER', 'TECHNICAL_DEPENDENCY')
+            """, (project_id, *completed_milestone_ids))
+            
+            completed_risks = db_cursor.fetchall()
+            for r in completed_risks:
+                r_id = r['id'] if isinstance(r, dict) else r[0]
+                r_title = r['title'] if isinstance(r, dict) else r[1]
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, 'ACTIVITY',
+                    False, 0, 'LOW', 'RESOLVED',
+                    1.0, f"Execution milestone completed.", False,
+                    title=r_title, reference_id=None, # Already matching by title
+                    status='RESOLVED', resolve_only=True
+                )
+                
+        # General Risks remain open unless mentioned (handled by not updating them)
+
 
         _emit("Completed", 100)
         return {

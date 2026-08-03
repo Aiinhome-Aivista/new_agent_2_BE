@@ -160,9 +160,18 @@ class RiskScoringEngine:
         lines = [
             f"Execution Priority Score: {score} | Severity: {severity}",
             f"Category: {category.replace('_', ' ').title()}",
-            "",
-            "Current Status",
+            ""
         ]
+        
+        if status == 'RESOLVED' or category == 'RESOLVED':
+            lines.append("Current Status")
+            lines.append("• Resolved")
+            lines.append("")
+            lines.append("Evidence")
+            lines.append(f"\"{mom_evidence}\"")
+            return "\n".join(lines)
+            
+        lines.append("Current Status")
         
         # Status & Progress
         status_display = status.replace("_", " ").title() if status else "Unknown"

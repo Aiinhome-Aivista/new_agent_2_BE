@@ -6,7 +6,8 @@ class TrackerAuditAgent:
                              is_out_of_scope: bool, risk_score: int, risk_level: str, 
                              risk_category: str, confidence: float, reasoning: str, 
                              requires_escalation: bool, title: str = None, reference_id: int = None,
-                             priority_order: int = None) -> int:
+                             priority_order: int = None, status: str = 'OPEN',
+                             resolve_only: bool = False) -> int:
         """
         Acts as the Tracker & Audit Agent. Deterministically persists state with evidence lineage
         into the `tracker_items` table and logs the action in the `audit_logs` table.
@@ -59,6 +60,33 @@ class TrackerAuditAgent:
             existing_doc = db_cursor.fetchone()
             existing_doc_id = existing_doc['source_document_id'] if isinstance(existing_doc, dict) else (existing_doc[0] if existing_doc else None)
 
+            # --- Rule 6: Per-Entity Version Protection & Conflict Detection ---
+            db_cursor.execute("SELECT uploaded_at FROM documents WHERE id = %s", (document_id,))
+            incoming_doc_row = db_cursor.fetchone()
+            incoming_date = incoming_doc_row['uploaded_at'] if isinstance(incoming_doc_row, dict) else (incoming_doc_row[0] if incoming_doc_row else None)
+
+            if existing_doc_id:
+                db_cursor.execute("SELECT uploaded_at FROM documents WHERE id = %s", (existing_doc_id,))
+                existing_doc_row = db_cursor.fetchone()
+                existing_date = existing_doc_row['uploaded_at'] if isinstance(existing_doc_row, dict) else (existing_doc_row[0] if existing_doc_row else None)
+            else:
+                existing_date = None
+                
+            if existing_date and incoming_date:
+                # Same-day conflict detection
+                if incoming_date.date() == existing_date.date() and str(existing_doc_id) != str(document_id):
+                    # We check current status in the DB
+                    db_cursor.execute("SELECT status FROM tracker_items WHERE id = %s", (existing_id,))
+                    curr_st = db_cursor.fetchone()
+                    curr_status = curr_st['status'] if isinstance(curr_st, dict) else curr_st[0]
+                    if curr_status != status:
+                        requires_escalation = True
+                        reasoning = f"[CONFLICT DETECTED: Attempted to change status from {curr_status} to {status} on the same day]\n" + reasoning
+                        status = curr_status
+                elif incoming_date < existing_date:
+                    return existing_id # Ignore stale update completely
+            # ----------------------------------------------------------------
+
             if str(existing_doc_id) == str(document_id):
                 # Same document (re-evaluation): Overwrite reasoning and score
                 new_reasoning = reasoning
@@ -74,18 +102,27 @@ class TrackerAuditAgent:
             update_sql = """
                 UPDATE tracker_items 
                 SET source_document_id = %s, risk_score = %s, risk_level = %s,
-                    risk_category = %s, confidence = %s, reasoning = %s
+                    risk_category = %s, confidence = %s, reasoning = %s, status = %s
                     {priority_clause}
                 WHERE id = %s
             """.format(priority_clause=", priority_order = %s" if priority_order is not None else "")
             
             if priority_order is not None:
-                db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, risk_category, confidence, new_reasoning, priority_order, existing_id))
+                db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, risk_category, confidence, new_reasoning, status, priority_order, existing_id))
             else:
-                db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, risk_category, confidence, new_reasoning, existing_id))
+                db_cursor.execute(update_sql, (document_id, final_risk_score, risk_level, risk_category, confidence, new_reasoning, status, existing_id))
             tracker_id = existing_id
-            action_type = 'UPDATED'
+            
+            if status == 'RESOLVED':
+                # Also set resolved_at / resolution if it's resolved
+                db_cursor.execute("UPDATE tracker_items SET resolved_at = NOW(), resolution = 'Auto-resolved (Condition cleared)' WHERE id = %s", (existing_id,))
+                action_type = 'RESOLVED'
+            else:
+                action_type = 'UPDATED'
         else:
+            if resolve_only:
+                return None  # Do not create a new record if we only intend to resolve an existing one.
+                
             # 2. Insert new tracker_items
             has_priority = priority_order is not None
             tracker_sql = """
@@ -108,7 +145,8 @@ class TrackerAuditAgent:
         # 3. Insert into audit_logs to maintain lineage
         audit_details = {
             "source_document_id": document_id,
-            "risk_score": risk_score,
+            "risk_score": final_risk_score if existing else risk_score,
+            "previous_score": existing_score if existing else None,
             "risk_level": risk_level,
             "reasoning": reasoning[:200] + "..." if len(reasoning) > 200 else reasoning
         }

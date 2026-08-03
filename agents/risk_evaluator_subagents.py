@@ -4,7 +4,7 @@ from services.llm_service import LLMService
 
 class ActivityExtractorAgent:
     @classmethod
-    def extract_activities(cls, document_text: str) -> list:
+    def extract_activities(cls, document_text: str, active_tracker_block: str = "None") -> list:
         """
         STEP 1: Single-pass extraction.
         
@@ -25,9 +25,12 @@ class ActivityExtractorAgent:
           - Merge semantically equivalent activities into a single business entity
         """
         from core.prompts import get_activity_extractor_prompt
-        prompt = get_activity_extractor_prompt(document_text)
+        prompt = get_activity_extractor_prompt(document_text, active_tracker_block)
         result = LLMService.generate_json(prompt)
-        return result.get("activities", [])
+        return {
+            "activities": result.get("activities", []),
+            "resolved_items": result.get("resolved_items", [])
+        }
 
 
 class BatchActivityRiskAgent:

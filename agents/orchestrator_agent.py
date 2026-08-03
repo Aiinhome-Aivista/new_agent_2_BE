@@ -103,6 +103,13 @@ class OrchestratorAgent:
             if emit:
                 emit(step, pct)
 
+        # ── Step 0: Validate Document Order ─────────────────────────────────────
+        from agents.execution_pipeline import TransitionValidator
+        if not TransitionValidator.validate_document_order(db_cursor, project_id, document_id):
+            print(f"Stale document detected (ID {document_id}). Aborting workflow to prevent regressions.")
+            _emit("Stale Document Ignored", 100)
+            return
+
         # ── Step 1: Status Ingestion ────────────────────────────────────────────
         _emit("Reading Uploaded Document", 15)
         extracted_data = StatusIngestionAgent.extract_status(text)
@@ -175,16 +182,6 @@ class OrchestratorAgent:
             ))
             request_id = db_cursor.lastrowid
             request_map[name.lower().strip()] = request_id
-
-        # Commit immediately to release S-locks on the documents table
-        # so that emit/progress updates don't hit Lock Wait Timeout during slow LLM calls.
-        try:
-            if hasattr(db_cursor, "connection") and db_cursor.connection:
-                db_cursor.connection.commit()
-            else:
-                db_cursor.execute("COMMIT")
-        except Exception as e:
-            print(f"Warning: failed to commit persisted ingestion data: {e}")
 
         return activity_map, request_map
 

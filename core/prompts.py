@@ -163,10 +163,13 @@ Output MUST be a valid JSON object:
 # RISK EVALUATOR SUBAGENTS PROMPTS
 # ==========================================
 # Phase 1a: Activity Extractor and Normalizer
-def get_activity_extractor_prompt(document_text: str) -> str:
+def get_activity_extractor_prompt(document_text: str, active_tracker_block: str = "None") -> str:
     return f"""You are the Activity Extractor and Normalizer Agent.
 Your job is to read the following project document (MOM / Status Report) and extract every
 work activity, deliverable update, action item, or scope request mentioned.
+
+=== CURRENT ACTIVE PROJECT RISKS ===
+{active_tracker_block}
 
 === DOCUMENT ===
 {document_text}
@@ -185,6 +188,8 @@ CRITICAL RULES:
      "SAP Integration Request Assessment" both normalize to "SAP Integration"
 4. Preserve the original sentence as source_sentence (this becomes the evidence).
 5. Ignore greetings, attendance lists, signatures, and agenda headings.
+6. Extract any items (risks, blockers, dependencies) that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-100) and the exact evidence sentence.
+   IMPORTANT: When extracting a resolved item, if it conceptually matches one of the CURRENT ACTIVE PROJECT RISKS listed above, you MUST use the EXACT title from the active risks list as the `name`.
 
 Examples of correct normalization:
 - "Evaluate SAP Integration Request" → "SAP Integration"
@@ -204,6 +209,13 @@ Output MUST be valid JSON — return unique normalized activities only (deduplic
       "activity": "SAP Integration",
       "source_sentence": "The team discussed evaluating the SAP Integration request.",
       "confidence": 90
+    }}
+  ],
+  "resolved_items": [
+    {{
+      "name": "VPN Access",
+      "resolution_evidence": "Production VPN access received",
+      "confidence": 96
     }}
   ]
 }}
@@ -479,6 +491,13 @@ Schema Example (Your output MUST follow these keys and value types exactly):
       "sentiment": "POSITIVE",
       "source_page": 1,
       "evidence_text": "Exact quote from document"
+    }}
+  ],
+  "resolved_items": [
+    {{
+      "name": "VPN Access",
+      "resolution_evidence": "Production VPN access received",
+      "confidence": 96
     }}
   ]
 }}

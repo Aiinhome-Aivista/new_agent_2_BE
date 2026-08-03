@@ -167,3 +167,69 @@ class ProjectKnowledgeService:
         lines.extend(blocker_lines)
         return "\n".join(lines)
 
+    @classmethod
+    def get_pm_execution_context(cls, db_cursor, project_id: int) -> str:
+        """
+        Gathers comprehensive PM execution data (milestone graph, status, risks, and customer dependencies)
+        to inject into the AI Chat Assistant.
+        """
+        lines = []
+        
+        try:
+            # 1. Project Milestones & Status
+            db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s ORDER BY id ASC", (project_id,))
+            milestones = db_cursor.fetchall()
+            
+            lines.append("--- PROJECT MILESTONES & STATUS ---")
+            if milestones:
+                for m in milestones:
+                    lines.append(f"Milestone: {m['name']} | Status: {m['status']} (ID: {m['id']})")
+            else:
+                lines.append("No milestones defined.")
+                
+            # 2. Milestone Dependency Graph (Edges with dependency type)
+            db_cursor.execute("""
+                SELECT p.name AS parent_name, c.name AS child_name,
+                       COALESCE(md.dependency_type, 'FINISH_TO_START') AS dependency_type
+                FROM milestone_dependencies md
+                JOIN project_milestones p ON md.parent_milestone_id = p.id
+                JOIN project_milestones c ON md.child_milestone_id = c.id
+                WHERE md.project_id = %s
+            """, (project_id,))
+            dependencies = db_cursor.fetchall()
+            
+            dep_type_labels = {
+                "FINISH_TO_START": "Finish-to-Start (FS): must FINISH before child can START",
+                "START_TO_START": "Start-to-Start (SS): must START before child can START",
+                "FINISH_TO_FINISH": "Finish-to-Finish (FF): must FINISH before child can FINISH",
+                "START_TO_FINISH": "Start-to-Finish (SF): must START before child can FINISH",
+            }
+
+            lines.append("\n--- MILESTONE DEPENDENCY GRAPH (EXECUTION SEQUENCE) ---")
+            if dependencies:
+                for d in dependencies:
+                    dep_label = dep_type_labels.get(d['dependency_type'], d['dependency_type'])
+                    lines.append(f"{d['parent_name']} -> {d['child_name']} [{dep_label}]")
+            else:
+                lines.append("No sequential dependencies defined.")
+                
+            # 3. Active Risks & External Dependencies (Tracker)
+            db_cursor.execute("""
+                SELECT title, item_type, risk_category, risk_level, status
+                FROM tracker_items
+                WHERE project_id = %s AND status = 'ACTIVE'
+            """, (project_id,))
+            tracker_items = db_cursor.fetchall()
+            
+            lines.append("\n--- ACTIVE RISKS & CUSTOMER DEPENDENCIES ---")
+            if tracker_items:
+                for t in tracker_items:
+                    lines.append(f"[{t['risk_category']}] {t['title']} | Severity: {t['risk_level']} | Type: {t['item_type']}")
+            else:
+                lines.append("No active risks or external dependencies.")
+                
+        except Exception as e:
+            print(f"Failed to build PM Execution Context: {e}")
+            return ""
+
+        return "\n".join(lines)
