@@ -359,7 +359,10 @@ class RiskEvaluationAgent:
         MilestoneExecutionStateManager.update_milestones(db_cursor, project_id, milestone_status_map)
         
         # 3. Execution Prerequisite Manager (Sub-deliverables & Prerequisites)
+        # NOTE: We collect progress records here but insert them AFTER risk_eval_id
+        # is obtained (further below), because risk_evaluation_id is NOT NULL in DB.
         _emit("Evaluating Execution Prerequisites", 55)
+        pending_progress_records = []
         try:
             from agents.risk_evaluator_subagents import DeliverableTimelineEvaluationAgent
             from repositories.baseline_repository import BaselineRepository
@@ -368,22 +371,7 @@ class RiskEvaluationAgent:
                 document_text=document_text, 
                 risk_eval_output=[]  # Running before risk engine now
             )
-            for pr in progress_records:
-                BaselineRepository.insert_deliverable_progress(
-                    db=db_cursor._connection, 
-                    project_id=project_id,
-                    scope_item_id=pr.get("scope_item_id"),
-                    source_document_id=document_id,
-                    risk_evaluation_id=None,  # Not linked to a risk evaluation yet
-                    baseline_version=1,
-                    status_code=pr.get("progress_status", "UNKNOWN"),
-                    progress_percentage=pr.get("progress_percentage"),
-                    execution_summary=pr.get("execution_summary", ""),
-                    dependencies=pr.get("dependencies", []),
-                    resolved_items=resolved_items,
-                    confidence=pr.get("confidence", 1.0),
-                    evidence_text=pr.get("evidence_text", "")
-                )
+            pending_progress_records = progress_records
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -398,6 +386,31 @@ class RiskEvaluationAgent:
         
         # 5. Derived Execution State
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
+        
+        # ── RISK RECONCILIATION ENGINE ───────────────────────────────────────
+        # Deterministically resolve existing OPEN risks if their originating condition has cleared.
+        db_cursor.execute("SELECT * FROM tracker_items WHERE project_id = %s AND status = 'OPEN'", (project_id,))
+        open_tracker_items = db_cursor.fetchall()
+        
+        from services.risk_reconciliation_engine import RiskReconciliationEngine
+        current_state = {
+            "derived_states": derived_states,
+            "resolved_items": extraction_result.get("resolved_items", [])
+        }
+        
+        risks_to_resolve = RiskReconciliationEngine.reconcile_open_risks(open_tracker_items, current_state)
+        
+        for risk, reason, res_type in risks_to_resolve:
+            TrackerAuditAgent.persist_tracker_item(
+                db_cursor, project_id, document_id, risk.get("item_type", "ACTIVITY"),
+                False, 0, 'LOW', 'RESOLVED',
+                1.0, f"[Type: {res_type}]\nReason: {reason}", False,
+                title=risk.get("title"), reference_id=risk.get("reference_id"),
+                status='RESOLVED', resolve_only=True
+            )
+            print(f"  [Reconciliation] Auto-resolved stale risk: {risk.get('title')} ({res_type})")
+        # ─────────────────────────────────────────────────────────────────────
+
         tracker_items = []
         out_of_scope_activities = []
         in_scope_activities = list(deterministic_in_scope)
@@ -438,32 +451,62 @@ class RiskEvaluationAgent:
                 )
                 
             # Dependency analysis data (m_id already computed above)
+            # ── Apply 4-state derived execution status ──────────────────────
+            # The derived state is the authoritative view from the static
+            # dependency graph. It overrides the LLM's raw status ONLY when
+            # it identifies a genuine blockage.
+            #
+            # WAITING: predecessors still in-progress but not blocked → keep
+            #          the LLM status (IN_PROGRESS / NOT_STARTED). Never a risk.
+            # BLOCKED: a predecessor is itself BLOCKED or DELAYED → override.
+            is_direct_blocker = False
+
+            if m_id and m_id in derived_states:
+                d_state = derived_states[m_id]
+                derived_status = d_state["status"]
+
+                if derived_status == "BLOCKED" and status not in ["COMPLETED", "RESOLVED"]:
+                    # Genuine blockage — override LLM status and capture blockers
+                    status = "BLOCKED"
+                    blocked_by = d_state["blockers"]
+                    is_direct_blocker = True
+                elif derived_status == "WAITING":
+                    # Normal predecessor dependency in progress — do NOT escalate
+                    # This keeps the LLM's status (e.g. IN_PROGRESS, NOT_STARTED)
+                    # and prevents WAITING tasks from entering the risk register.
+                    pass  # status unchanged, is_direct_blocker stays False
+            
             dep_data = dep_analysis_results.get(m_id, {})
             cascade_count = dep_data.get("cascade_count", 0)
             is_root_cause = dep_data.get("is_root_cause", False)
 
-            # ── Determine if this item is a DIRECT blocker ──────────────────
-            is_direct_blocker = False
-            
-            # Apply derived execution state (deterministic blockers overrides LLM)
-            if m_id and m_id in derived_states:
-                d_state = derived_states[m_id]
-                # Only upgrade to BLOCKED deterministically if derived says so
-                if d_state["status"] == "BLOCKED" and status != "COMPLETED":
-                    status = "BLOCKED"
-                
-                if d_state["blockers"] and d_state["status"] == "BLOCKED":
-                    blocked_by = d_state["blockers"]
-                    is_direct_blocker = True
-            
-            # ── Preservation of Historical Metadata (Bug 2, 3, 4) ────────────
-            # If a milestone transitions to COMPLETED, it is no longer the root cause 
-            # of current blockages, but we preserve the historical dependency_source and root_cause.
+            # ── COMPLETED: Early-Exit Terminal Gate ──────────────────────────
+            # A completed milestone is NOT an active execution risk.
+            # Wipe ALL blocker context before any scoring or persistence.
+            # This prevents old dependency metadata (source, cascade, blockers)
+            # from leaking into the current evaluation snapshot.
             if status == "COMPLETED":
-                # We do not delete dependency_source! It stays for historical audit.
-                # However, it is no longer ACTIVELY blocking anything.
                 is_root_cause = False
                 blocked_by = []
+                dependency_source = None
+                cascade_count = 0
+                is_direct_blocker = False
+                
+                # Resolve any existing OPEN tracker item for this completed deliverable
+                existing_ref_id = get_milestone_id(canonical_title)
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, 'ACTIVITY',
+                    False, 0, 'LOW', 'RESOLVED',
+                    1.0,
+                    f"Milestone completed.\n\nEvidence: {evidence}",
+                    False,
+                    title=canonical_title,
+                    reference_id=existing_ref_id,
+                    status='RESOLVED',
+                    resolve_only=True
+                )
+                print(f"  [COMPLETED] '{canonical_title}' → early-exit RESOLVED. Skipping risk scoring.")
+                continue
 
             # ── Assign Category (graph-first) ───────────────────────────────
             category_rules = RiskConfigurationService.get_category_rules(db_cursor)
@@ -559,21 +602,41 @@ class RiskEvaluationAgent:
 
             should_create_risk = False
             llm_confidence = activities_with_contexts[i].get("extraction_confidence", 100) if i < len(activities_with_contexts) else 100
-            
+
+            # ── Risk Decision Engine ──────────────────────────────────────────
+            # Only genuine execution anomalies enter the Risk Register.
+            # A deliverable in normal progress (WAITING, IN_PROGRESS with no
+            # explicit blocker) is a Project Plan item, not a risk.
+            #
+            # COMPLETED/RESOLVED: handled above (early-exit). Should not arrive here.
+            if status in ["COMPLETED", "RESOLVED"]:
+                continue
+
+            # WAITING: predecessor is just in-progress. Not a risk.
+            if status == "WAITING":
+                continue
+
+            # Terminal deliverables (Knowledge Transfer, Closure, etc.) are
+            # normal end-of-project work. Never risk items.
+            if CategoryAssignmentEngine._is_terminal(canonical_title):
+                continue
+
             if llm_confidence >= 80:
-                if entity_type == "DEPENDENCY" or entity_type == "NEW_FEATURE":
-                    should_create_risk = True
-                elif is_scope_creep and exec_score > 35:
-                    should_create_risk = True
-                elif status in ["BLOCKED", "DELAYED"]:
+                # Explicit execution anomalies
+                if status in ["BLOCKED", "DELAYED"]:
                     should_create_risk = True
                 elif len(blocked_by) > 0:
                     should_create_risk = True
-                elif dependency_source is not None:
-                    should_create_risk = True
                 elif is_direct_blocker:
                     should_create_risk = True
-                elif risk_cat not in ["GENERAL", "UNKNOWN", "SCOPE_CREEP"]:
+                # Customer / Technical dependencies that are still pending
+                elif entity_type == "DEPENDENCY" and dependency_source in ["CUSTOMER", "TECHNICAL"]:
+                    should_create_risk = True
+                # Scope creep with material impact
+                elif is_scope_creep and exec_score > 35:
+                    should_create_risk = True
+                # Structural blocker categories (ROOT_CAUSE, DIRECT/TRANSITIVE BLOCKER)
+                elif risk_cat in ["ROOT_CAUSE", "DIRECT_EXECUTION_BLOCKER", "TRANSITIVE_EXECUTION_BLOCKER", "CUSTOMER_DEPENDENCY"]:
                     should_create_risk = True
                     
             if not should_create_risk and status not in ["COMPLETED", "RESOLVED"]:
@@ -603,7 +666,8 @@ class RiskEvaluationAgent:
                     "mom_evidence": evidence,
                     "original_contract_sentence": original_contract_sentence
                 })
-            elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED", "PENDING", "COMPLETED", "RESOLVED"]:
+            elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
+
                 tracker_items.append({
                     "deliverable": canonical_title,
                     "entity_type": entity_type,
@@ -769,8 +833,29 @@ class RiskEvaluationAgent:
         bv_row = db_cursor.fetchone()
         baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
 
-        # Deliverable Progress is now evaluated earlier in the pipeline as Execution Prerequisite Manager.
-        
+        # Deliverable Progress: now insert with the valid risk_eval_id
+        from repositories.baseline_repository import BaselineRepository
+        for pr in pending_progress_records:
+            try:
+                BaselineRepository.insert_deliverable_progress(
+                    db=db_cursor._connection,
+                    project_id=project_id,
+                    scope_item_id=pr.get("scope_item_id"),
+                    source_document_id=document_id,
+                    risk_evaluation_id=risk_eval_id,
+                    baseline_version=baseline_version,
+                    status_code=pr.get("progress_status", "UNKNOWN"),
+                    progress_percentage=pr.get("progress_percentage"),
+                    execution_summary=pr.get("execution_summary", ""),
+                    dependencies=pr.get("dependencies", []),
+                    resolved_items=resolved_items,
+                    confidence=pr.get("confidence", 1.0),
+                    evidence_text=pr.get("evidence_text", "")
+                )
+            except Exception as e:
+                print(f"Warning: Could not persist deliverable progress record: {e}")
+
+
         # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline

@@ -151,41 +151,56 @@ class DerivedExecutionState:
     @classmethod
     def compute_derived_status(cls, snapshot: ProjectStateSnapshot, backward_graph: dict) -> dict:
         """
-        Deterministically computes downstream readiness as runtime state.
-        If any dependency is incomplete, the milestone is derived as BLOCKED.
+        Deterministically computes downstream readiness using a 4-state model:
+
+            READY   — all predecessors COMPLETED. Milestone can start now.
+            WAITING — some predecessors still IN_PROGRESS but none are BLOCKED/DELAYED.
+                      Normal project flow. NOT an execution risk.
+            BLOCKED — at least one predecessor is explicitly BLOCKED or DELAYED.
+                      This is an active execution risk.
+            DELAYED — the milestone itself has missed its own planned date
+                      (date-check is done in the scoring layer, not here).
+
+        The critical enterprise PM distinction:
+            Waiting ≠ Blocked.
+            A WAITING task is on-track. A BLOCKED task has an active impediment.
         """
         derived_statuses = {}
-        
+
         for m_id, current_status in snapshot.milestone_statuses.items():
+            # Already completed — structural dependency is satisfied, not a risk.
             if current_status == "COMPLETED":
-                derived_statuses[m_id] = {
-                    "status": "COMPLETED",
-                    "blockers": []
-                }
+                derived_statuses[m_id] = {"status": "COMPLETED", "blockers": []}
                 continue
-                
-            is_blocked = False
-            is_at_risk = False
-            blocker_names = []
-            
-            for dep_id in backward_graph.get(m_id, []):
+
+            predecessors = backward_graph.get(m_id, [])
+
+            if not predecessors:
+                # No dependencies — milestone state is its own raw state.
+                derived_statuses[m_id] = {"status": current_status, "blockers": []}
+                continue
+
+            # Classify each predecessor's contribution
+            incomplete_predecessors = []   # predecessors not yet done
+            at_risk_predecessors = []      # predecessors that are BLOCKED or DELAYED
+
+            for dep_id in predecessors:
                 dep_status = snapshot.get_status(dep_id)
                 if dep_status not in ["COMPLETED", "RESOLVED"]:
-                    is_blocked = True
-                    blocker_names.append(snapshot.milestone_id_to_name.get(dep_id, str(dep_id)))
-                    if dep_status in ["BLOCKED", "DELAYED"]:
-                        is_at_risk = True
-                    
-            if is_blocked and current_status not in ["COMPLETED"]:
-                derived_statuses[m_id] = {
-                    "status": "BLOCKED" if is_at_risk else "PENDING",
-                    "blockers": blocker_names
-                }
+                    name = snapshot.milestone_id_to_name.get(dep_id, str(dep_id))
+                    incomplete_predecessors.append(name)
+                    if dep_status in ["BLOCKED", "DELAYED", "NOT_STARTED"]:
+                        at_risk_predecessors.append(name)
+
+            if not incomplete_predecessors:
+                # All predecessors done — milestone is READY (or its own status if in-progress)
+                derived_statuses[m_id] = {"status": current_status, "blockers": []}
+            elif at_risk_predecessors:
+                # At least one predecessor is actively blocked/delayed → this milestone is BLOCKED
+                derived_statuses[m_id] = {"status": "BLOCKED", "blockers": at_risk_predecessors}
             else:
-                derived_statuses[m_id] = {
-                    "status": current_status,
-                    "blockers": []
-                }
-                
+                # Predecessors exist but are just IN_PROGRESS → milestone is WAITING (not a risk)
+                derived_statuses[m_id] = {"status": "WAITING", "blockers": incomplete_predecessors}
+
         return derived_statuses
 
