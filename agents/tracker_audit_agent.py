@@ -73,18 +73,19 @@ class TrackerAuditAgent:
                 existing_date = None
                 
             if existing_date and incoming_date:
-                # Same-day conflict detection
-                if incoming_date.date() == existing_date.date() and str(existing_doc_id) != str(document_id):
-                    # We check current status in the DB
-                    db_cursor.execute("SELECT status FROM tracker_items WHERE id = %s", (existing_id,))
-                    curr_st = db_cursor.fetchone()
-                    curr_status = curr_st['status'] if isinstance(curr_st, dict) else curr_st[0]
-                    if curr_status != status:
-                        requires_escalation = True
-                        reasoning = f"[CONFLICT DETECTED: Attempted to change status from {curr_status} to {status} on the same day]\n" + reasoning
-                        status = curr_status
-                elif incoming_date < existing_date:
-                    return existing_id # Ignore stale update completely
+                # Same-day conflict detection (DISABLED FOR DEMO PURPOSES)
+                # In a demo, we upload multiple weeks of status reports within 5-10 minutes.
+                # if incoming_date.date() == existing_date.date() and str(existing_doc_id) != str(document_id):
+                #     db_cursor.execute("SELECT status FROM tracker_items WHERE id = %s", (existing_id,))
+                #     curr_st = db_cursor.fetchone()
+                #     curr_status = curr_st['status'] if isinstance(curr_st, dict) else curr_st[0]
+                #     if curr_status != status:
+                #         requires_escalation = True
+                #         reasoning = f"[CONFLICT DETECTED: Attempted to change status from {curr_status} to {status} on the same day]\n" + reasoning
+                #         status = curr_status
+                # elif incoming_date < existing_date:
+                #     return existing_id # Ignore stale update completely
+                pass
             # ----------------------------------------------------------------
 
             if str(existing_doc_id) == str(document_id):

@@ -23,11 +23,18 @@ class CategoryAssignmentEngine:
         "system integration testing", " sit",
     ]
 
-    # These milestones are always end-of-project; never rank as Execution Blockers.
+    # These milestones are always end-of-project or routine deliverables;
+    # they should NEVER appear in the Risk Register unless the MoM explicitly
+    # states they are blocked, delayed, or failing.
     TERMINAL_KEYWORDS = [
         "knowledge transfer", "closure", "handover",
         "documentation", "analytics dashboard",
         "warranty", "sign-off", "sign off",
+        # Routine sub-deliverables that are project plan items, not risks
+        "audit log", "activity tracking",
+        "user management", "user administration",
+        "document upload", "document indexing",
+        "training", "go-live support",
     ]
 
     @classmethod
