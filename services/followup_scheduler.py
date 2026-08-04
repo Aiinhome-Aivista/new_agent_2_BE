@@ -112,7 +112,11 @@ def process_followup_for_item(connection: Any, cursor: Any, item: Dict[str, Any]
     recipients_emails = [r['email'] for r in recipients]
     recipients_str = ", ".join(recipients_emails)
     
-    frontend_url = settings.FRONTEND_ORIGIN or "http://localhost:5173"
+    frontend_origin = (settings.FRONTEND_ORIGIN or "").strip()
+    if not frontend_origin or frontend_origin == "*" or not frontend_origin.startswith("http"):
+        frontend_url = "http://localhost:5173"
+    else:
+        frontend_url = frontend_origin.split(",")[0].strip()
     
     completed_link = f"{frontend_url}/projects/{project_id}/baseline?selected={item_id}&action=completed"
     pending_link = f"{frontend_url}/projects/{project_id}/baseline?selected={item_id}&action=pending"
