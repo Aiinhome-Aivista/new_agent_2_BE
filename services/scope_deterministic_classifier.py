@@ -42,16 +42,7 @@ class ScopeDeterministicClassifier:
                     "evidence_text": f"Identified as customer responsibility by phrase: '{kw}'"
                 }
 
-        # Priority 3: Vendor Responsibilities
-        for kw in rules.get("vendor_responsibilities", []):
-            if kw.lower() in search_text:
-                return {
-                    "scope_type": "IN_SCOPE",
-                    "confidence": 0.98,
-                    "evidence_text": f"Identified as vendor responsibility by phrase: '{kw}'"
-                }
-
-        # Priority 4: Section-Based Rules (Fallback)
+        # Priority 3: Out of Scope Section overrides generic vendor keywords
         section = candidate.get("section", "")
         if section:
             for sec in rules.get("out_scope_sections", []):
@@ -61,7 +52,18 @@ class ScopeDeterministicClassifier:
                         "confidence": 0.99,
                         "evidence_text": f"Categorized based on document section: '{section}'"
                     }
-                    
+
+        # Priority 4: Vendor Responsibilities
+        for kw in rules.get("vendor_responsibilities", []):
+            if kw.lower() in search_text:
+                return {
+                    "scope_type": "IN_SCOPE",
+                    "confidence": 0.98,
+                    "evidence_text": f"Identified as vendor responsibility by phrase: '{kw}'"
+                }
+
+        # Priority 5: In Scope Section (Fallback)
+        if section:
             for sec in rules.get("in_scope_sections", []):
                 if sec.lower() == section.lower():
                     return {

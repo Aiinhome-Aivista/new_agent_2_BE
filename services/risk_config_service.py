@@ -9,9 +9,9 @@ It always goes through this service, which loads once and caches in memory.
 Tables used:
   risk_parameter_config   — weights per scoring dimension (enable/disable per client)
   risk_threshold_config   — severity bands (LOW / MEDIUM / HIGH / CRITICAL)
-  business_rule_config    — enable/disable business logic rules
   impact_matrix           — LLM says "HIGH impact" → this table says +10 score
   alert_rule_config       — which severities trigger email alerts
+  risk_category_priority  — order for tie breaking the highest priority items
 
 To change a weight without a deployment:
     UPDATE risk_parameter_config SET weight = 40 WHERE parameter_code = 'SCOPE_MATCH';
@@ -35,7 +35,7 @@ class RiskConfigurationService:
     @classmethod
     def get_parameters(cls, db_cursor) -> dict:
         """
-        Returns: { "SCOPE_MATCH": {"weight": 30, "enabled": True, "name": "Scope Match"}, ... }
+        Returns: { "EXECUTION_PRIORITY": {"weight": 1.0, "max_score": 35, ...}, ... }
         """
         return cls._load("parameters", db_cursor, cls._fetch_parameters)
 
@@ -46,13 +46,6 @@ class RiskConfigurationService:
         Sorted descending by min_score so CRITICAL is checked first.
         """
         return cls._load("thresholds", db_cursor, cls._fetch_thresholds)
-
-    @classmethod
-    def get_rules(cls, db_cursor) -> dict:
-        """
-        Returns: { "DEADLINE_MISSED_INCREASES_RISK": True, ... }
-        """
-        return cls._load("rules", db_cursor, cls._fetch_rules)
 
     @classmethod
     def get_impact_matrix(cls, db_cursor) -> dict:
@@ -67,6 +60,20 @@ class RiskConfigurationService:
         Returns: { "HIGH": {"send_email": True, "min_score_threshold": 70}, ... }
         """
         return cls._load("alert_rules", db_cursor, cls._fetch_alert_rules)
+
+    @classmethod
+    def get_category_priorities(cls, db_cursor) -> dict:
+        """
+        Returns: { "ROOT_CAUSE": 1, "EXECUTION_BLOCKER": 2, ... }
+        """
+        return cls._load("category_priorities", db_cursor, cls._fetch_category_priorities)
+
+    @classmethod
+    def get_category_rules(cls, db_cursor) -> list:
+        """
+        Returns: [{"entity_type": "DEPENDENCY", "dependency_source": "CUSTOMER", "status": "BLOCKED", "result_category": "CUSTOMER_DEPENDENCY"}, ...]
+        """
+        return cls._load("category_rules", db_cursor, cls._fetch_category_rules)
 
     # ── Utility ─────────────────────────────────────────────────────────────
 
@@ -100,7 +107,7 @@ class RiskConfigurationService:
     @staticmethod
     def _fetch_parameters(db_cursor) -> dict:
         db_cursor.execute(
-            "SELECT parameter_code, parameter_name, enabled, weight "
+            "SELECT parameter_code, parameter_name, enabled, weight, max_score, evaluation_type "
             "FROM risk_parameter_config"
         )
         rows = db_cursor.fetchall()
@@ -111,14 +118,18 @@ class RiskConfigurationService:
                 result[code] = {
                     "name": row["parameter_name"],
                     "enabled": bool(row["enabled"]),
-                    "weight": int(row["weight"]),
+                    "weight": float(row["weight"]),
+                    "max_score": int(row["max_score"]),
+                    "evaluation_type": row["evaluation_type"]
                 }
             else:
                 code = row[0]
                 result[code] = {
                     "name": row[1],
                     "enabled": bool(row[2]),
-                    "weight": int(row[3]),
+                    "weight": float(row[3]),
+                    "max_score": int(row[4]),
+                    "evaluation_type": row[5]
                 }
         return result
 
@@ -143,20 +154,6 @@ class RiskConfigurationService:
                     "min_score": int(row[1]),
                     "max_score": int(row[2]),
                 })
-        return result
-
-    @staticmethod
-    def _fetch_rules(db_cursor) -> dict:
-        db_cursor.execute(
-            "SELECT rule_code, enabled FROM business_rule_config"
-        )
-        rows = db_cursor.fetchall()
-        result = {}
-        for row in rows:
-            if isinstance(row, dict):
-                result[row["rule_code"]] = bool(row["enabled"])
-            else:
-                result[row[0]] = bool(row[1])
         return result
 
     @staticmethod
@@ -191,4 +188,33 @@ class RiskConfigurationService:
                     "send_email": bool(row[1]),
                     "min_score_threshold": int(row[2]),
                 }
+        return result
+
+    @staticmethod
+    def _fetch_category_priorities(db_cursor) -> dict:
+        db_cursor.execute("SELECT category, priority_order FROM risk_category_priority")
+        rows = db_cursor.fetchall()
+        result = {}
+        for row in rows:
+            if isinstance(row, dict):
+                result[row["category"]] = int(row["priority_order"])
+            else:
+                result[row[0]] = int(row[1])
+        return result
+
+    @staticmethod
+    def _fetch_category_rules(db_cursor) -> list:
+        db_cursor.execute("SELECT entity_type, dependency_source, status, result_category FROM category_assignment_rules")
+        rows = db_cursor.fetchall()
+        result = []
+        for row in rows:
+            if isinstance(row, dict):
+                result.append(row)
+            else:
+                result.append({
+                    "entity_type": row[0],
+                    "dependency_source": row[1],
+                    "status": row[2],
+                    "result_category": row[3]
+                })
         return result

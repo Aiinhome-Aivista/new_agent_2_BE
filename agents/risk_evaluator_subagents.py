@@ -4,7 +4,7 @@ from services.llm_service import LLMService
 
 class ActivityExtractorAgent:
     @classmethod
-    def extract_activities(cls, document_text: str) -> list:
+    def extract_activities(cls, document_text: str, active_tracker_block: str = "None") -> list:
         """
         STEP 1: Single-pass extraction.
         
@@ -24,57 +24,18 @@ class ActivityExtractorAgent:
           - Strip date suffixes from deliverable names (dates are metadata, not titles)
           - Merge semantically equivalent activities into a single business entity
         """
-        prompt = f"""You are the Activity Extractor and Normalizer Agent.
-Your job is to read the following project document (MOM / Status Report) and extract every
-work activity, deliverable update, action item, or scope request mentioned.
-
-=== DOCUMENT ===
-{document_text}
-
-CRITICAL RULES:
-1. The Risk Tracker is a contractual monitoring system. Tracker items represent contractual 
-   deliverables, not activity log entries.
-2. For each activity, produce a NORMALIZED BUSINESS ENTITY name — what the contractual item is,
-   not how it was described in this meeting.
-3. Normalization means:
-   - Strip action verbs: "Evaluate", "Review", "Prepare", "Discuss", "Assess", "Consider"
-   - Strip noise words: "Request", "Proposal", "Assessment", "Activity"
-   - Strip customer preambles: "Customer shall provide", "Client must"
-   - Strip date suffixes: "UAT - 15 May 2026" → "UAT"
-   - Merge semantically identical activities: "Evaluate SAP Integration Request" AND
-     "SAP Integration Request Assessment" both normalize to "SAP Integration"
-4. Preserve the original sentence as source_sentence (this becomes the evidence).
-5. Ignore greetings, attendance lists, signatures, and agenda headings.
-
-Examples of correct normalization:
-- "Evaluate SAP Integration Request" → "SAP Integration"
-- "Review Mobile Applications Request" → "Mobile Applications"
-- "Evaluate Voice Bot Proposal" → "Voice Bot"
-- "CRM Integration Development" → "CRM Integration"
-- "Analytics Dashboard Development" → "Analytics Dashboard"
-- "Customer shall provide VPN connectivity" → "VPN Connectivity"
-- "Customer shall provide API credentials" → "API Credentials"
-- "UAT - 15 May 2026" → "UAT"
-- "Go Live - 30 June 2026" → "Production Deployment (Go Live)"
-
-Output MUST be valid JSON — return unique normalized activities only (deduplicate by entity):
-{{
-  "activities": [
-    {{
-      "activity": "SAP Integration",
-      "source_sentence": "The team discussed evaluating the SAP Integration request.",
-      "confidence": 90
-    }}
-  ]
-}}
-"""
+        from core.prompts import get_activity_extractor_prompt
+        prompt = get_activity_extractor_prompt(document_text, active_tracker_block)
         result = LLMService.generate_json(prompt)
-        return result.get("activities", [])
+        return {
+            "activities": result.get("activities", []),
+            "resolved_items": result.get("resolved_items", [])
+        }
 
 
 class BatchActivityRiskAgent:
     @classmethod
-    def evaluate_batch(cls, activities_with_contexts: list) -> list:
+    def evaluate_batch(cls, activities_with_contexts: list, milestone_progress_block: str = "") -> list:
         """
         PHASE 1: Batch risk diagnosis.
         Evaluates ALL ambiguous activities in a SINGLE LLM call.
@@ -108,76 +69,8 @@ Baseline Context:
 {item['context']}
 """
 
-        prompt = f"""You are the Activity Risk Diagnosis Agent (Phase 1).
-The Risk Tracker is a contractual monitoring system. Every item must represent a contractual
-deliverable or scope request — not an activity log entry.
-
-Your job is DIAGNOSIS ONLY. You identify what kind of risk exists and which signals are present.
-You do NOT calculate numeric scores — that happens deterministically after your output.
-
-Evaluate each of the following activities using ONLY their provided baseline context.
-
-{activities_block}
-
-RULES:
-1. TRACKER TITLE PRIORITY (in order):
-   a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item". risk_category CANNOT be SCOPE_CREEP.
-   b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name. risk_category is SCOPE_CREEP.
-   c. If NO baseline match exists → use the normalized activity name. risk_category is SCOPE_CREEP.
-
-2. RISK CATEGORIES (pick ONE per activity):
-   - SCOPE_CREEP: Activity has NO approved IN_SCOPE baseline match (new request or excluded item).
-   - DELAY: Deliverable is behind schedule or has missed its contractual deadline.
-   - DEPENDENCY: Blocked waiting for client/third party obligation (VPN, API creds, infra).
-   - BLOCKED: Explicitly blocked by a technical or organizational issue.
-   - NONE: On-track and within approved scope with no blockers.
-
-3. DIAGNOSTIC SIGNALS — for each activity, identify which signals are TRUE:
-   - deadline_missed: The contractual or mentioned deadline has passed or is at immediate risk.
-   - customer_dependency: A customer obligation (VPN, API credentials, infrastructure, access) is pending.
-   - technical_dependency: An internal technical dependency is blocking progress.
-   - progress_behind: Stated or implied progress is behind expected pace.
-   - milestone_slipping: A named project milestone (UAT, Go Live, delivery) is slipping.
-   - missing_deliverable: A contractual deliverable has no evidence of progress at all.
-
-4. NEVER classify an approved IN_SCOPE baseline item as SCOPE_CREEP.
-
-5. TRACKER IDENTITY: matched_baseline_item must be the canonical baseline name, not the MoM wording.
-   The same baseline item must produce the same tracker title across different MoMs.
-
-6. CANONICAL TITLES: matched_baseline_item must be the SHORT business entity name.
-   - Use: "VPN Connectivity", NOT "Customer shall provide VPN connectivity"
-   - Use: "Azure AD SSO", NOT "The Vendor shall configure Azure AD SSO by 25 April 2026"
-   - Use: "API Credentials", NOT "Customer shall provide API credentials"
-   The original contractual sentence belongs in "reasoning" only.
-
-7. BUSINESS IMPACT:
-   - HIGH: Blocks a core contractual deliverable, threatens project viability.
-   - MEDIUM: Causes schedule risk or partial scope impact.
-   - LOW: Minor or easily recoverable issue.
-
-8. CONFIDENCE: 0.0–1.0 — how strongly does the baseline context support your diagnosis?
-
-Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
-[
-  {{
-    "activity": "Activity name as given",
-    "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
-    "risk_category": "SCOPE_CREEP|DELAY|DEPENDENCY|BLOCKED|NONE",
-    "signals": {{
-      "deadline_missed": false,
-      "customer_dependency": false,
-      "technical_dependency": false,
-      "progress_behind": false,
-      "milestone_slipping": false,
-      "missing_deliverable": false
-    }},
-    "business_impact": "LOW|MEDIUM|HIGH",
-    "confidence": 0.85,
-    "reasoning": "Short explanation citing the baseline context. Use the original MoM sentence as evidence here."
-  }}
-]
-"""
+        from core.prompts import get_batch_activity_risk_prompt
+        prompt = get_batch_activity_risk_prompt(milestone_progress_block, activities_block)
         result = LLMService.generate_json(prompt)
         if isinstance(result, list):
             return result
@@ -186,4 +79,31 @@ Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER
                 return result[key]
         return []
 
+
+class DeliverableTimelineEvaluationAgent:
+    @classmethod
+    def evaluate_progress(cls, approved_baseline_items: list, document_text: str, risk_eval_output: list) -> list:
+        """
+        Extracts deliverable progress from the MoM/Status Report.
+        Must strictly adhere to the rule of NEVER inventing percentages.
+        Consolidates multiple references into a single progress record per baseline item.
+        """
+        if not approved_baseline_items:
+            return []
+
+        baseline_block = ""
+        for item in approved_baseline_items:
+            baseline_block += f"- ID: {item.get('id', 'Unknown')} | Deliverable: {item.get('name', 'Unknown')}\n"
+
+        risk_block = ""
+        import json
+        try:
+            risk_block = json.dumps(risk_eval_output, indent=2)
+        except Exception:
+            risk_block = str(risk_eval_output)
+
+        from core.prompts import get_deliverable_timeline_evaluation_prompt
+        prompt = get_deliverable_timeline_evaluation_prompt(baseline_block, risk_block, document_text)
+        result = LLMService.generate_json(prompt)
+        return result.get("progress_records", [])
 

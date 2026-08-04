@@ -5,6 +5,7 @@ from core.database import get_db, get_db_connection
 from api.dependencies.auth import get_current_user, verify_project_access
 from services.rag_service import RAGService
 from services.llm_service import LLMService
+from services.project_knowledge_service import ProjectKnowledgeService
 from fastapi.responses import FileResponse
 import mysql.connector
 import json
@@ -325,11 +326,15 @@ def send_chat_message(
         })
     chroma_context_str = "\n".join(context_chunks) if context_chunks else "No relevant document excerpts found in Vector DB."
     
+    # 2.5 Retrieve PM Execution Engine context
+    pm_context_str = ProjectKnowledgeService.get_pm_execution_context(cursor, project_id)
+    
     # 3. Construct prompt
     prompt = f"""You are the Project AI Assistant. Your job is to answer the user's question accurately and professionally, based on the provided project contexts.
-You have access to two sources of information:
+You have access to three sources of information:
 1. STRUCTURED SCOPE ITEMS (From MySQL): Approved items currently in the scope baseline (In Scope or Out of Scope), including manual additions.
 2. SOURCE DOCUMENT EXCERPTS (From Vector DB / ChromaDB): Paragraphs retrieved from all project documents (EL, IFA, MOMs, Status Reports).
+3. PM EXECUTION ENGINE & DEPENDENCY GRAPH: The active project milestones, sequential dependencies, critical execution blockers, and external customer dependencies.
 
 === USER QUERY ===
 {query}
@@ -340,8 +345,12 @@ You have access to two sources of information:
 === CONTEXT SOURCE 2: SOURCE DOCUMENT EXCERPTS (Vector DB) ===
 {chroma_context_str}
 
+=== CONTEXT SOURCE 3: PM EXECUTION ENGINE & DEPENDENCY GRAPH ===
+{pm_context_str}
+
 === INSTRUCTIONS ===
 - Answer the user's query precisely using ONLY the provided contexts. If the context does not contain the answer, say "I cannot find the answer in the project documents."
+- For questions about dependencies, timelines, root causes, external blockers, or parallel execution, USE CONTEXT SOURCE 3.
 - Ground your answer in the provided facts. Do not assume or extrapolate.
 - CRITICAL: Do NOT use the hyphen/dash symbol (-) or asterisk (*) as bullet points, separators, or list markers.
 - CRITICAL: Do NOT output raw horizontal line dividers (like ---).

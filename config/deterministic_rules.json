@@ -14,7 +14,16 @@
     "client shall",
     "customer responsibility",
     "provided by customer",
-    "client responsibility"
+    "client responsibility",
+    "customer will",
+    "client will",
+    "business users will",
+    "customer team",
+    "client team",
+    "business users",
+    "customer is responsible",
+    "client is responsible",
+    "provided by client"
   ],
   "vendor_responsibilities": [
     "vendor shall",
@@ -32,7 +41,10 @@
     "deployment",
     "knowledge transfer",
     "training",
-    "uat"
+    "perform uat",
+    "conduct uat",
+    "support uat",
+    "uat execution"
   ],
   "in_scope_sections": [
     "Scope",
@@ -40,7 +52,8 @@
     "Deliverables",
     "Vendor Responsibilities",
     "Vendor Scope",
-    "Project Scope"
+    "Project Scope",
+    "Milestones"
   ],
   "out_scope_sections": [
     "Exclusions",

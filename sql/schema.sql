@@ -518,6 +518,64 @@ CREATE TABLE risk_evaluations (
     FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE progress_status_config (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    status_code VARCHAR(50) NOT NULL UNIQUE,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO progress_status_config (status_code, label) VALUES 
+('NOT_STARTED', 'Not Started'),
+('IN_PROGRESS', 'In Progress'),
+('BLOCKED', 'Blocked'),
+('COMPLETED', 'Completed'),
+('DELAYED', 'Delayed'),
+('RESCHEDULED', 'Rescheduled'),
+('AT_RISK', 'At Risk'),
+('PENDING', 'Pending');
+
+CREATE TABLE progress_source_config (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    source_code VARCHAR(50) NOT NULL UNIQUE,
+    label VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+INSERT INTO progress_source_config (source_code, label) VALUES 
+('DOCUMENT', 'Extracted from Document'),
+('USER', 'Manual Update'),
+('SYSTEM', 'System Generated');
+
+CREATE TABLE deliverable_progress (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    project_id BIGINT NOT NULL,
+    scope_item_id BIGINT NOT NULL,
+    source_document_id BIGINT NULL,
+    risk_evaluation_id BIGINT NOT NULL,
+    baseline_version INT NOT NULL,
+    status_code VARCHAR(50) NOT NULL,
+    progress_percentage INT NULL,
+    progress_source VARCHAR(50) NOT NULL DEFAULT 'DOCUMENT',
+    execution_summary TEXT,
+    dependencies JSON,
+    confidence DECIMAL(5,4),
+    evidence_text TEXT,
+    status_updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+    FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY (scope_item_id) REFERENCES scope_items(id) ON DELETE CASCADE,
+    FOREIGN KEY (source_document_id) REFERENCES documents(id) ON DELETE CASCADE,
+    FOREIGN KEY (risk_evaluation_id) REFERENCES risk_evaluations(id) ON DELETE CASCADE,
+    FOREIGN KEY (status_code) REFERENCES progress_status_config(status_code),
+    FOREIGN KEY (progress_source) REFERENCES progress_source_config(source_code)
+);
+
 CREATE INDEX idx_projects_status ON projects(monitoring_status);
 CREATE INDEX idx_documents_project ON documents(project_id);
 CREATE INDEX idx_documents_type ON documents(project_id, document_type);
@@ -542,6 +600,7 @@ BEGIN
     TRUNCATE TABLE alerts;
     TRUNCATE TABLE audit_logs;
     TRUNCATE TABLE context_compactions;
+    TRUNCATE TABLE deliverable_progress;
     TRUNCATE TABLE deliverables;
     TRUNCATE TABLE document_types;
     TRUNCATE TABLE documents;

@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import os
 import difflib
-from core.database import get_db
+from core.database import get_db, get_db_connection
 from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 from services.document_service import DocumentService
 from agents.scope_extraction_agent import ScopeExtractionAgent
@@ -17,115 +17,135 @@ from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
 from services.normalization_service import NormalizationService
+from services.milestone_dependency_extractor import MilestoneDependencyExtractor
+from services.milestone_dependency_service import MilestoneDependencyService
+
+# pyrefly: ignore [missing-import]
 import mysql.connector
+from repositories.document_repository import DocumentRepository
+import json
+from fastapi import Query
+import threading
 
 router = APIRouter()
 
-@router.post("/extract")
-def extract_baseline(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    verify_project_access(project_id, current_user, db)
-    
-    doc = BaselineRepository.get_document(db, document_id, project_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+def run_baseline_pipeline(project_id: int, document_id: int):
+    # Establish a fresh connection for the thread
+    thread_conn = get_db_connection()
+    if not thread_conn:
+        print("!!! Background baseline pipeline failed to connect !!!")
+        return
         
-    if doc["document_type"] not in ["EL", "IFA"]:
-        raise HTTPException(status_code=400, detail="Only EL and IFA can be used for baseline extraction")
-        
+    def emit(step: str, progress: int):
+        print(f"DEBUG: Starting emit for {step}")
+        try:
+            upd_cursor = thread_conn.cursor()
+            upd_cursor.execute(
+                "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
+                (progress, step, document_id)
+            )
+            thread_conn.commit()
+            upd_cursor.close()
+            print(f"DEBUG: Successfully emitted {step}")
+        except Exception as ex:
+            print(f"Failed to update baseline progress in DB for {step}: {ex}")
+
     try:
+        # Mark as PROCESSING and set start time
+        upd = thread_conn.cursor()
+        upd.execute(
+            "UPDATE documents SET processing_status = 'PROCESSING', processing_progress = 5, processing_step = 'Detecting Scope Sections', processing_started_at = NOW() WHERE id = %s",
+            (document_id,)
+        )
+        thread_conn.commit()
+        upd.close()
+        
+        doc = BaselineRepository.get_document(thread_conn, document_id, project_id)
+        if not doc:
+            raise RuntimeError("Document not found")
+            
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
         
-        # Pipeline Step 1: Detect Sections deterministically
+        # Pipeline Step 1: Detect Sections
+        emit("Detecting Scope Sections", 15)
         chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
         
-        # Pipeline Step 2: Extract Candidates deterministically
+        # Pipeline Step 2: Extract Candidates
+        emit("Extracting Scope Candidates", 30)
         raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
         
-        # Pipeline Step 3: Small LLM Classification with Hybrid Retrieval Evidence
-        import concurrent.futures
-
-        classified_candidates = []
-        # Process candidates concurrently to drastically reduce processing time
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            # Create a helper function that passes project_id along with the candidate
-            def classify(candidate):
-                return ScopeClassifier.classify_candidate(project_id, candidate)
-                
-            classified_candidates = list(executor.map(classify, raw_candidates))
+        # Pipeline Step 3: Classification
+        emit("Classifying Scope Items", 50)
+        classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
             
         # Pipeline Step 4: Fuzzy Deduplication
+        emit("Deduplicating Candidates", 70)
         deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
         
         # Pipeline Step 5: Milestone & Deadline Extraction
+        emit("Extracting Milestones & Deadlines", 85)
         enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
         
-        # Pipeline Step 6: Normalization
+        # Pipeline Step 6: Normalization and Diffing/Saving
+        emit("Saving Baseline Draft", 95)
         for item in enriched_candidates:
             item["scope_item_normalized"] = NormalizationService.normalize_scope_item(item.get("name"))
             item["milestone_normalized"] = NormalizationService.normalize_milestone(item.get("milestone"), item.get("scope_item_normalized"))
             item["deadline_original"] = item.get("deadline_text")
             item["deadline_normalized"] = item.get("deadline")
-        
-        # Issue 8 & 10: Structured candidate logging with normalized values
-        print("\n" + "="*60)
-        print("EXTRACTION PIPELINE RESULTS:")
-        print("="*60)
-        for item in enriched_candidates:
-            print(f"Original Text: {item.get('name')}")
-            print(f"Normalized Scope Item: {item.get('scope_item_normalized')}")
-            print(f"Milestone: {item.get('milestone_normalized')}")
-            print(f"Deadline: {item.get('deadline_original')} ({item.get('deadline_normalized')})")
-            print(f"Classification: {item.get('scope_type')}")
-            print(f"Confidence: {item.get('confidence')}")
-            evidence = item.get('evidence_text', '')
-            print(f"Evidence Used: {evidence[:100] + '...' if len(evidence) > 100 else evidence}")
-            print(f"Extraction Method: {item.get('extraction_method')} ({item.get('extraction_confidence')})")
-            print("-" * 60)
             
-        # Format for downstream smart diff and saving
         extracted_data = {
             "scope_items": enriched_candidates,
             "deliverables": [],
             "stakeholders": []
         }
         
-        # Check if there is an existing DRAFT baseline for the project
-        existing_draft = BaselineRepository.get_draft_baseline(db, project_id)
-        
+        existing_draft = BaselineRepository.get_draft_baseline(thread_conn, project_id)
+        latest_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id)
+
         if existing_draft:
             baseline_id = existing_draft["id"]
-            BaselineRepository.update_baseline_source_document(db, baseline_id, document_id)
-            BaselineRepository.delete_stakeholders_by_project(db, project_id)
-        else:
-            # Get max version to auto-increment it for the new draft
-            max_v = BaselineRepository.get_max_baseline_version(db, project_id)
-            next_version = max_v + 1
-            
-            # Create draft baseline
-            baseline_id = BaselineRepository.create_baseline(db, project_id, next_version, document_id)
-            
-            # Copy items from latest APPROVED baseline to carry forward historical data
-            latest_approved = BaselineRepository.get_latest_approved_baseline(db, project_id)
+            BaselineRepository.update_baseline_source_document(thread_conn, baseline_id, document_id)
+            BaselineRepository.delete_scope_items_by_baseline(thread_conn, baseline_id)
+            BaselineRepository.delete_deliverables_by_baseline(thread_conn, baseline_id)
+            BaselineRepository.delete_stakeholders_by_project(thread_conn, project_id)
             if latest_approved:
                 app_baseline_id = latest_approved["id"]
-                # Copy scope items
-                BaselineRepository.copy_scope_items(db, app_baseline_id, baseline_id)
-                
-                # Copy deliverables
-                BaselineRepository.copy_deliverables(db, app_baseline_id, baseline_id)
-
-            BaselineRepository.delete_stakeholders_by_project(db, project_id)
-        # Check if this project has an approved baseline to compare against
-        has_approved = BaselineRepository.get_latest_approved_baseline(db, project_id) is not None
-
-        # Smart Diffing (UPSERT)
-        existing_scope_items = BaselineRepository.get_scope_items_for_diff(db, baseline_id)
+                BaselineRepository.copy_scope_items(thread_conn, app_baseline_id, baseline_id)
+                BaselineRepository.copy_deliverables(thread_conn, app_baseline_id, baseline_id)
+        else:
+            max_v = BaselineRepository.get_max_baseline_version(thread_conn, project_id)
+            next_version = max_v + 1
+            baseline_id = BaselineRepository.create_baseline(thread_conn, project_id, next_version, document_id)
+            if latest_approved:
+                app_baseline_id = latest_approved["id"]
+                BaselineRepository.copy_scope_items(thread_conn, app_baseline_id, baseline_id)
+                BaselineRepository.copy_deliverables(thread_conn, app_baseline_id, baseline_id)
+            BaselineRepository.delete_stakeholders_by_project(thread_conn, project_id)
+            
+        has_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id) is not None
+        existing_scope_items = BaselineRepository.get_scope_items_for_diff(thread_conn, baseline_id)
         
         for item in extracted_data.get("scope_items", []):
             item_name = item.get("name", "Unknown")
             item_type = item.get("scope_type", "UNCERTAIN")
             
+            item_category = item.get("category")
+            if item.get("is_pure_milestone", False):
+                item_type = "IN_SCOPE"
+                item_category = "MILESTONE"
+            
+            if not item_category:
+                item_category = "FUNCTIONAL"
+
+            raw_status = item.get("milestone_status", "").upper()
+            completion_status = "ACTIVE"
+            if "COMPLETED" in raw_status or "DONE" in raw_status:
+                completion_status = "COMPLETED"
+            elif "CANCEL" in raw_status:
+                completion_status = "CANCELLED"
+
             existing_item = None
             best_ratio = 0.0
             for db_item in existing_scope_items:
@@ -140,7 +160,6 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 if has_approved:
                     if old_type != item_type:
                         tags.append(f"Changed from {old_type} to {item_type}")
-                        
                     old_deadline = existing_item.get("deadline_text")
                     new_deadline = item.get("deadline_text")
                     if old_deadline != new_deadline:
@@ -150,7 +169,6 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                             tags.append(f"Deadline Removed")
                         else:
                             tags.append(f"Deadline Changed: {old_deadline} -> {new_deadline}")
-                            
                     old_milestone = existing_item.get("milestone")
                     new_milestone = item.get("milestone")
                     if old_milestone != new_milestone:
@@ -160,11 +178,9 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                             tags.append(f"Milestone Removed")
                         else:
                             tags.append(f"Milestone Changed: {old_milestone} -> {new_milestone}")
-                            
                 status_change_tag = " | ".join(tags) if tags else None
-                    
                 BaselineRepository.update_scope_item(
-                    db=db,
+                    db=thread_conn,
                     item_id=existing_item["id"],
                     description=item.get("description", ""),
                     scope_type=item_type,
@@ -182,11 +198,15 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     scope_item_normalized=item.get("scope_item_normalized"),
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
-                    deadline_normalized=item.get("deadline_normalized")
+                    deadline_normalized=item.get("deadline_normalized"),
+                    category=item_category,
+                    completion_status=completion_status
                 )
+                item_id = existing_item["id"]
+                item["_db_id"] = item_id
             else:
-                BaselineRepository.insert_scope_item_extracted(
-                    db=db,
+                item_id = BaselineRepository.insert_scope_item_extracted(
+                    db=thread_conn,
                     baseline_id=baseline_id,
                     project_id=project_id,
                     name=item_name,
@@ -205,12 +225,89 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     scope_item_normalized=item.get("scope_item_normalized"),
                     milestone_normalized=item.get("milestone_normalized"),
                     deadline_original=item.get("deadline_original"),
-                    deadline_normalized=item.get("deadline_normalized")
+                    deadline_normalized=item.get("deadline_normalized"),
+                    category=item_category,
+                    completion_status=completion_status
                 )
-            
-        # UPSERT deliverables
-        existing_deliverables = BaselineRepository.get_deliverables_for_diff(db, baseline_id)
+                item["_db_id"] = item_id
         
+        # Commit DB changes to release any locks on `documents` table 
+        # so `emit` (which gets a new connection) does not deadlock.
+        thread_conn.commit()
+        
+        # Process Milestones & Dependencies
+        emit("Building Milestone Dependencies", 97)
+        # Clear existing draft milestones/mappings/dependencies (if any)
+        # We will clear project_milestones for the draft baseline. But actually, project_milestones are tied to project_id.
+        # Let's delete project_milestones for this project_id and baseline_id.
+        cursor = thread_conn.cursor()
+        cursor.execute("DELETE FROM project_milestones WHERE project_id = %s AND baseline_id = %s", (project_id, baseline_id))
+        
+        # 1. Extract distinct milestones
+        milestone_dict = {} # normalized_name -> dict
+        for item in extracted_data.get("scope_items", []):
+            m_norm = item.get("milestone_normalized")
+            m_orig = item.get("milestone")
+            if m_norm:
+                if m_norm not in milestone_dict:
+                    milestone_dict[m_norm] = {
+                        "name": m_orig,
+                        "planned_date": item.get("deadline_normalized"),
+                        "status": item.get("milestone_status", "Planned"),
+                        "scope_item_ids": []
+                    }
+                if item.get("_db_id"):
+                    milestone_dict[m_norm]["scope_item_ids"].append(item["_db_id"])
+                    
+        # 2. Sort milestones chronologically and insert into project_milestones
+        def get_date_val(item):
+            d = item[1].get("planned_date")
+            return d if d else "9999-12-31"
+            
+        sorted_milestones = sorted(milestone_dict.items(), key=get_date_val)
+        
+        seq = 1
+        name_to_id = {}
+        for m_norm, m_data in sorted_milestones:
+            m_id = BaselineRepository.create_project_milestone(
+                thread_conn, project_id, baseline_id, m_data["name"], seq, m_data["status"], m_data["planned_date"]
+            )
+            name_to_id[m_norm] = m_id
+            seq += 1
+            for scope_id in m_data["scope_item_ids"]:
+                BaselineRepository.create_scope_milestone_mapping(thread_conn, scope_id, m_id)
+                
+        # 3. Extract dependencies
+        extracted_deps = MilestoneDependencyExtractor.extract_dependencies(extracted_data.get("scope_items", []), doc["document_text"] if "document_text" in doc else "")
+        
+        edges = []
+        for dep in extracted_deps:
+            parent_name = NormalizationService.normalize_milestone(dep["parent_milestone"], None)
+            child_name = NormalizationService.normalize_milestone(dep["child_milestone"], None)
+            if parent_name in name_to_id and child_name in name_to_id:
+                edges.append((name_to_id[parent_name], name_to_id[child_name]))
+                
+        # 4. Validate DAG
+        dag_valid = True
+        try:
+            if edges:
+                MilestoneDependencyService.validate_dag(edges)
+        except ValueError:
+            dag_valid = False
+            
+        if dag_valid and edges:
+            for p, c in edges:
+                cursor.execute(
+                    "INSERT INTO milestone_dependencies (project_id, parent_milestone_id, child_milestone_id, dependency_type) VALUES (%s, %s, %s, 'FINISH_TO_START')",
+                    (project_id, p, c)
+                )
+        else:
+            # FALLBACK: If LLM failed to extract a valid DAG, use sequential dependencies
+            MilestoneDependencyService.generate_sequential_dependencies(cursor, project_id)
+        cursor.close()
+        
+        # UPSERT deliverables
+        existing_deliverables = BaselineRepository.get_deliverables_for_diff(thread_conn, baseline_id)
         for item in extracted_data.get("deliverables", []):
             item_name = item.get("name", "Unknown")
             deadline = item.get("deadline") if item.get("deadline") else None
@@ -225,7 +322,7 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
             
             if existing_deliv:
                 BaselineRepository.update_deliverable(
-                    db=db,
+                    db=thread_conn,
                     item_id=existing_deliv["id"],
                     description=item.get("description", ""),
                     deadline=deadline,
@@ -234,7 +331,7 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 )
             else:
                 BaselineRepository.insert_deliverable(
-                    db=db,
+                    db=thread_conn,
                     baseline_id=baseline_id,
                     project_id=project_id,
                     name=item_name,
@@ -243,11 +340,11 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                     owner=item.get("owner"),
                     source_document_id=document_id
                 )
-            
+                
         # Insert stakeholders
         for stakeholder in extracted_data.get("stakeholders", []):
             BaselineRepository.insert_stakeholder(
-                db=db,
+                db=thread_conn,
                 project_id=project_id,
                 name=stakeholder.get("name", "Unknown"),
                 email=stakeholder.get("email"),
@@ -255,15 +352,80 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
                 responsibility=stakeholder.get("responsibility")
             )
             
-        # Update project status
-        BaselineRepository.update_project_monitoring_status(db, project_id, 'BASELINE_PENDING_REVIEW')
-        db.commit()
+        BaselineRepository.update_project_monitoring_status(thread_conn, project_id, 'BASELINE_PENDING_REVIEW')
+        
+        # Mark as COMPLETED
+        upd2 = thread_conn.cursor()
+        upd2.execute(
+            "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, processing_step = 'Completed' WHERE id = %s",
+            (document_id,)
+        )
+        thread_conn.commit()
+        upd2.close()
         
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Baseline extraction failed: {e}")
+        import traceback
+        print("!!! Baseline pipeline execution failed !!!")
+        traceback.print_exc()
+        try:
+            thread_conn.rollback()
+        except Exception:
+            pass
+        try:
+            err_conn = get_db_connection()
+            if err_conn:
+                err_cursor = err_conn.cursor()
+                err_cursor.execute(
+                    "UPDATE documents SET processing_status = 'FAILED', processing_error = %s, processing_progress = 0, processing_step = 'Failed' WHERE id = %s",
+                    (str(e)[:500], document_id)
+                )
+                err_conn.commit()
+                err_cursor.close()
+                err_conn.close()
+        except Exception as db_ex:
+            traceback.print_exc()
+    finally:
+        thread_conn.close()
+
+@router.post("/extract")
+def extract_baseline(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
+    
+    doc = BaselineRepository.get_document(db, document_id, project_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
         
-    return {"success": True, "message": "Draft baseline extracted", "data": {"baseline_id": baseline_id}}
+    if doc["document_type"] not in ["EL", "IFA"]:
+        raise HTTPException(status_code=400, detail="Only EL and IFA can be used for baseline extraction")
+        
+    # Prevent concurrent baseline extraction on the same project
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT id FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' LIMIT 1",
+        (project_id,)
+    )
+    active_proc = cursor.fetchone()
+    cursor.close()
+    if active_proc or doc.get("processing_status") == "PROCESSING":
+        return {"success": True, "message": "Baseline extraction already in progress for this project", "data": {"baseline_id": None}}
+        
+    # Set status to PROCESSING synchronously to prevent race condition with frontend polling
+    cursor = db.cursor()
+    cursor.execute(
+        "UPDATE documents SET processing_status = 'PROCESSING', processing_progress = 5, processing_step = 'Starting extraction...', processing_started_at = NOW() WHERE id = %s",
+        (document_id,)
+    )
+    db.commit()
+    cursor.close()
+
+    thread = threading.Thread(
+        target=run_baseline_pipeline,
+        args=(project_id, document_id),
+        daemon=True
+    )
+    thread.start()
+    
+    return {"success": True, "message": "Baseline extraction started", "data": {"baseline_id": None}}
 
 @router.get("/")
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
@@ -389,7 +551,8 @@ def delete_scope_item(
     return {"success": True, "message": "Scope item deleted successfully"}
 
 class ScopeItemCompletionUpdate(BaseModel):
-    completion_status: str
+    completion_status: Optional[str] = None
+    deadline: Optional[str] = None
 
 @router.patch("/items/{item_id}/completion")
 def update_scope_item_completion(
@@ -405,10 +568,58 @@ def update_scope_item_completion(
     if not item:
         raise HTTPException(status_code=404, detail="Scope item not found")
         
-    if data.completion_status not in ["ACTIVE", "COMPLETED", "CANCELLED"]:
+    if data.completion_status is not None and data.completion_status not in ["ACTIVE", "COMPLETED", "CANCELLED"]:
         raise HTTPException(status_code=400, detail="Invalid completion status")
-        
-    BaselineRepository.update_scope_item_completion(db, item_id, project_id, data.completion_status)
+
+    # Fetch old state for the audit log
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT name, completion_status, deadline FROM scope_items WHERE id = %s", (item_id,))
+    old_item = cursor.fetchone()
+    cursor.close()
+
+    # Perform repository update
+    BaselineRepository.update_scope_item_details(
+        db, 
+        item_id, 
+        project_id, 
+        data.completion_status, 
+        data.deadline
+    )
+
+    # Log audit event
+    details = {
+        "item_id": item_id,
+        "item_name": old_item["name"] if old_item else "",
+        "old_status": old_item["completion_status"] if old_item else None,
+        "new_status": data.completion_status if data.completion_status is not None else (old_item["completion_status"] if old_item else None),
+        "old_deadline": str(old_item["deadline"]) if old_item and old_item["deadline"] else None,
+        "new_deadline": data.deadline if data.deadline is not None else (str(old_item["deadline"]) if old_item and old_item["deadline"] else None)
+    }
+    DocumentRepository.log_audit(
+        db=db,
+        project_id=project_id,
+        agent_name="Web UI",
+        action="UPDATE_SCOPE_ITEM",
+        entity_type="SCOPE_ITEM",
+        entity_id=item_id,
+        details_json=json.dumps(details)
+    )
+
     db.commit()
     
-    return {"success": True, "message": f"Scope item marked as {data.completion_status}"}
+    return {"success": True, "message": "Scope item updated successfully"}
+
+@router.post("/followup/trigger")
+def trigger_followup_reminders(
+    project_id: int,
+    target_date: Optional[str] = Query(None, description="ISO Date format YYYY-MM-DD to check deliverables due on that day"),
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    from services.followup_scheduler import run_followup_checks
+    
+    res = run_followup_checks(target_date)
+    return res
+

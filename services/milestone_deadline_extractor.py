@@ -8,7 +8,7 @@ class MilestoneDeadlineExtractor:
         r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date|acceptance\s+date|\bby\b|\bon\b)\s+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}|[0-9]{1,2}\s+[A-Za-z]+|[A-Za-z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of [A-Za-z]+)"
     ]
 
-    MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer", "milestone"]
+    MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer"]
 
     @classmethod
     def extract(cls, candidates: list[dict]) -> list[dict]:
@@ -16,6 +16,7 @@ class MilestoneDeadlineExtractor:
         Enriches scope items with milestone and deadline information.
         Must run AFTER deduplication.
         """
+        llm_batch = []
         for candidate in candidates:
             evidence = candidate.get("evidence_text", "")
             desc = candidate.get("description", "")
@@ -39,7 +40,7 @@ class MilestoneDeadlineExtractor:
                 has_mk = any(mk.lower() in sentence.lower() for mk in cls.MILESTONE_KEYWORDS)
                 
                 # If we have multiple sentences and this one is totally unrelated, skip it
-                if len(sentences) > 1 and not (has_item or has_mk):
+                if len(sentences) > 1 and not (has_item or has_mk or " | " in sentence):
                     continue
                     
                 for pattern in cls.DATE_PATTERNS:
@@ -72,17 +73,53 @@ class MilestoneDeadlineExtractor:
             needs_llm = any(kw in combined_text.lower() for kw in keywords) or any(mk.lower() in combined_text.lower() for mk in cls.MILESTONE_KEYWORDS)
             
             if needs_llm:
-                llm_res = cls._extract_via_llm(candidate["name"], combined_text)
-                if llm_res.get("has_schedule"):
-                    candidate["deadline_text"] = llm_res.get("deadline_text")
-                    candidate["deadline"] = cls._normalize_date(candidate["deadline_text"])
-                    candidate["milestone"] = llm_res.get("milestone")
-                    candidate["extraction_method"] = "LLM"
-                    candidate["extraction_confidence"] = 0.85
-                else:
-                    # Explicitly stated no schedule
-                    candidate["extraction_method"] = "LLM"
-                    candidate["extraction_confidence"] = 0.90
+                llm_batch.append({
+                    "candidate": candidate,
+                    "item_name": candidate["name"],
+                    "evidence": combined_text
+                })
+
+        # Process LLM queries in batches of 10
+        import json
+        BATCH_SIZE = 10
+        for i in range(0, len(llm_batch), BATCH_SIZE):
+            batch_slice = llm_batch[i:i+BATCH_SIZE]
+            print(f"[LLM] Extracting milestones for batch of {len(batch_slice)} candidates...")
+            
+            items_for_prompt = []
+            for idx, item in enumerate(batch_slice):
+                items_for_prompt.append({
+                    "id": str(idx),
+                    "item_name": item["item_name"],
+                    "evidence": item["evidence"]
+                })
+                
+            from core.prompts import get_batch_deadline_extraction_prompt
+            prompt = get_batch_deadline_extraction_prompt(items_for_prompt)
+            try:
+                batch_results = LLMService.generate_json(prompt)
+                if not isinstance(batch_results, list):
+                    batch_results = [batch_results]
+                    
+                result_map = {str(res.get("id", "")): res for res in batch_results}
+                for idx, item in enumerate(batch_slice):
+                    candidate_ref = item["candidate"]
+                    res = result_map.get(str(idx), {})
+                    if res.get("has_schedule"):
+                        candidate_ref["deadline_text"] = res.get("deadline_text")
+                        candidate_ref["deadline"] = cls._normalize_date(candidate_ref["deadline_text"])
+                        candidate_ref["milestone"] = res.get("milestone")
+                        candidate_ref["extraction_method"] = "LLM"
+                        candidate_ref["extraction_confidence"] = 0.85
+                    else:
+                        candidate_ref["extraction_method"] = "LLM"
+                        candidate_ref["extraction_confidence"] = 0.90
+            except Exception as e:
+                print(f"Failed to extract milestones for batch {i}: {e}")
+                for item in batch_slice:
+                    candidate_ref = item["candidate"]
+                    candidate_ref["extraction_method"] = "LLM_FAILED"
+                    candidate_ref["extraction_confidence"] = 0.0
 
         return candidates
 
@@ -111,41 +148,37 @@ class MilestoneDeadlineExtractor:
             year, month, day = match.groups()
             return f"{year}-{int(month):02d}-{int(day):02d}"
 
-        # 15 April 2026
-        months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
-                  "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
-        
-        # If year is missing in text, we DO NOT normalize. "Never guess missing year."
-        if not re.search(r"\d{4}", text):
-            return None
+        # 15 April 2026 or 15 Apr 2026
+        match = re.search(r"(?i)(\d{1,2})\s+([a-z]+)\s+(\d{4})", text)
+        if match:
+            months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+                      "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            day, month_str, year = match.groups()
+            month_str_lower = month_str.lower()
+            month_idx = -1
             
-        # Example for explicit parsing of like 15 April 2026 if regex above failed
-        # Since dateutil might not be installed, we just return None for complex strings.
-        # Strict formats were handled above.
+            # Check full months
+            for i, m in enumerate(months[:12]):
+                if m.startswith(month_str_lower):
+                    month_idx = i + 1
+                    break
+                    
+            if month_idx == -1:
+                # Check short months
+                for i, m in enumerate(months[12:]):
+                    if month_str_lower.startswith(m):
+                        month_idx = i + 1
+                        break
+                        
+            if month_idx != -1:
+                return f"{year}-{month_idx:02d}-{int(day):02d}"
+                
         return None
 
     @classmethod
     def _extract_via_llm(cls, item_name: str, evidence: str) -> dict:
-        prompt = f"""
-You are an expert contract scheduling extractor.
-Analyze the following scope item and its evidence text to extract Milestone and Deadline information.
-
-Scope Item: {item_name}
-Evidence: {evidence}
-
-Rules:
-1. Only extract if explicitly mentioned.
-2. If no deadline/milestone is mentioned, set has_schedule to false.
-3. If deadline is mentioned, return the EXACT original text (e.g., "15 Apr", "End of June").
-4. If a milestone name is mentioned (e.g. "UAT", "Go Live"), extract it. If the item itself is the milestone, use the item name.
-
-Return JSON format:
-{{
-    "has_schedule": boolean,
-    "milestone": string or null,
-    "deadline_text": string or null
-}}
-"""
+        from core.prompts import get_single_deadline_extraction_prompt
+        prompt = get_single_deadline_extraction_prompt(item_name, evidence)
         try:
             res = LLMService.generate_json(prompt)
             return res

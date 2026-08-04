@@ -41,6 +41,13 @@ class ScopeDeduplicator:
                 # Combine evidence if different
                 if candidate["evidence_text"] and candidate["evidence_text"] not in matched_existing["evidence_text"]:
                     matched_existing["evidence_text"] += f" Furthermore: {candidate['evidence_text']}"
+                    
+                # If a pure milestone merges with a regular scope item, the merged item is NOT a pure milestone
+                if not candidate.get("is_pure_milestone", False) or not matched_existing.get("is_pure_milestone", False):
+                    matched_existing["is_pure_milestone"] = False
+                    
+                if candidate.get("milestone_status") and not matched_existing.get("milestone_status"):
+                    matched_existing["milestone_status"] = candidate["milestone_status"]
             else:
                 # No match found, add as a new distinct item
                 merged_candidates.append(candidate)

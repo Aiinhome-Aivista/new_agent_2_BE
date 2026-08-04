@@ -10,22 +10,8 @@ class AlertingAgent:
         and stakeholders related to this specific project.
         """
         # 1. Use the LLM to compose the message
-        prompt = f"""You are the Alerting Agent for a project management system.
-A high-risk project deviation has just been detected. 
-Your job is to compose a structured email notification to be sent to the project stakeholders and team members.
-
-Project ID: {project_id}
-High-Risk Item: {item_name}
-AI Reasoning / Evidence: {reasoning}
-
-Output MUST be a valid JSON object matching this schema exactly:
-{{
-    "subject": "[URGENT] High Risk Detected - Project <project_id>",
-    "summary": "1-2 sentence summary of the issue.",
-    "root_cause": "Detailed explanation of why this occurred or what the blocker is, based on the AI reasoning.",
-    "suggested_fix": "1-2 clear, actionable steps to resolve the issue."
-}}
-"""
+        from core.prompts import get_alerting_prompt
+        prompt = get_alerting_prompt(project_id, item_name, reasoning)
         response = LLMService.generate_json(prompt)
         
         subject = response.get("subject", f"[ACSE ALERT] High Risk Item Detected - Project {project_id}")

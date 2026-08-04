@@ -41,3 +41,22 @@ def resolve_tracker_item(project_id: int, item_id: int, update: ResolutionUpdate
     
     updated_item = TrackerRepository.get_resolved_item_details(db, item_id)
     return {"success": True, "message": "Tracker item resolved", "data": updated_item}
+
+@router.post("/{item_id}/reactivate")
+def reactivate_tracker_item(project_id: int, item_id: int, current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "PROJECT_LEAD", "PMO_REVIEWER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+    verify_project_access(project_id, current_user, db)
+    
+    item = TrackerRepository.get_tracker_item_by_id_and_project(db, item_id, project_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Item not found")
+        
+    TrackerRepository.reactivate_item(db, item_id, current_user["id"])
+    
+    # If the tracker item is associated with a scope item (reference_id), mark the scope item as ACTIVE
+    if item.get("reference_id"):
+        BaselineRepository.update_scope_item_completion(db, item["reference_id"], project_id, "ACTIVE")
+        
+    db.commit()
+    
+    updated_item = TrackerRepository.get_tracker_item_by_id_and_project(db, item_id, project_id)
+    return {"success": True, "message": "Tracker item reactivated", "data": updated_item}
