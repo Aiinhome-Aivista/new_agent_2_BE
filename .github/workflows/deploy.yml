@@ -7,7 +7,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: aiinhhome-aivista/new_agent_2_be
+  IMAGE_NAME: aiinhome-aivista/new_agent_2_be
   CONTAINER_NAME: new-agent-2-be
   PORT: 3012
 
