@@ -9,7 +9,7 @@ class Settings(BaseSettings):
     API_PORT: int = 8000
     API_PREFIX: str = "/api"
     
-    FRONTEND_ORIGIN: str = "http://localhost:5173"
+    FRONTEND_ORIGIN: str = "*"
     
     DB_HOST: str = "localhost"
     DB_PORT: int = 3306

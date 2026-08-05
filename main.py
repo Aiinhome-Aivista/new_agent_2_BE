@@ -21,15 +21,17 @@ app = FastAPI(
 app.add_middleware(APIStandardResponseMiddleware)
 
 # CORS configuration
+raw_origins = [o.strip() for o in settings.FRONTEND_ORIGIN.split(",") if o.strip()] if settings.FRONTEND_ORIGIN else ["*"]
+allow_origins = ["*"] if "*" in raw_origins else list(set(raw_origins + [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:8080",
+    "http://127.0.0.1:8080"
+]))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.FRONTEND_ORIGIN,
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:8080",
-        "http://127.0.0.1:8080"
-    ],
+    allow_origins=allow_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
