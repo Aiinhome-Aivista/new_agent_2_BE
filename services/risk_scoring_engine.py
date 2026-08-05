@@ -21,7 +21,13 @@ class RiskScoringEngine:
         business_impact: str,
         params: dict,
         impact_matrix: dict,
+        item_name: str = None,
         category: str = "GENERAL",
+        immediate_unlocks: list = None,
+        future_unlocks: list = None,
+        next_milestone_name: str = None,
+        next_milestone_date: str = None,
+        days_to_next_milestone: int = None,
     ) -> dict:
         """
         Step 1: Calculate parameter scores
@@ -59,74 +65,87 @@ class RiskScoringEngine:
                 score_breakdown[param_code] = round(pts)
                 total_score += pts
 
-        # EXECUTION_PRIORITY
-        # Base urgency if blocked, delayed, or in progress
-        is_urgent = status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]
-        # Normalize execution urgency to a 0.0-1.0 scale (1.0 for blocked/delayed)
+        # EXECUTION_UNLOCK_IMPACT (30)
+        # Ratio based on immediate downstream blocks. Unblocking 1 gives 50%, 2 gives 75%, >=3 gives 100%
+        has_immediate = bool(immediate_unlocks)
+        unlock_ratio = 0.0
+        if has_immediate:
+            num = len(immediate_unlocks)
+            unlock_ratio = min(num / 3.0, 1.0)
+            if num == 1: unlock_ratio = 0.5
+            elif num == 2: unlock_ratio = 0.75
+        add_score("EXECUTION_UNLOCK_IMPACT", has_immediate, unlock_ratio)
+
+        # SCHEDULE_URGENCY (18)
         urgency_ratio = 0.0
-        if is_root_cause:
-            urgency_ratio = 1.0
-        elif status in ["BLOCKED", "DELAYED"]:
-            urgency_ratio = 1.0
-        elif status == "IN_PROGRESS":
-            urgency_ratio = 0.5
-        elif status == "NOT_STARTED":
-            urgency_ratio = 0.3
-            
-        # Ensure it's marked as urgent if it's a root cause
-        if is_root_cause:
-            is_urgent = True
-            
-        add_score("EXECUTION_PRIORITY", is_urgent, urgency_ratio)
+        if days_to_next_milestone is not None:
+            if days_to_next_milestone <= 0:
+                urgency_ratio = 1.0
+            elif days_to_next_milestone <= 7:
+                urgency_ratio = 0.8
+            elif days_to_next_milestone <= 14:
+                urgency_ratio = 0.5
+            elif days_to_next_milestone <= 30:
+                urgency_ratio = 0.2
+        add_score("SCHEDULE_URGENCY", days_to_next_milestone is not None, urgency_ratio)
         
-        # CASCADE_IMPACT
-        # Normalize cascade count (cap at 5 for max score ratio)
-        cascade_ratio = min(cascade_count / 5.0, 1.0) if cascade_count > 0 else 0.0
-        add_score("CASCADE_IMPACT", cascade_count > 0, cascade_ratio)
-        
-        # DATE_PROXIMITY
-        proximity_ratio = 0.0
-        if days_overdue is not None and days_overdue > 0:
-            proximity_ratio = 1.0
-        elif days_until_due is not None:
-            if days_until_due <= 0:
-                proximity_ratio = 1.0
-            elif days_until_due <= 7:
-                proximity_ratio = 0.8
-            elif days_until_due <= 14:
-                proximity_ratio = 0.5
-            elif days_until_due <= 30:
-                proximity_ratio = 0.2
-        add_score("DATE_PROXIMITY", proximity_ratio > 0, proximity_ratio)
-        
-        # ROOT_CAUSE
+        # ROOT_CAUSE (15)
         add_score("ROOT_CAUSE", is_root_cause)
         
-        # CUSTOMER_DEPENDENCY
-        # Only award points when this item IS the customer dependency, not when it
-        # is transitively downstream of one. This prevents SIT from inheriting API Credentials bonus.
-        is_cust_dep = (category == "CUSTOMER_DEPENDENCY")
-        add_score("CUSTOMER_DEPENDENCY", is_cust_dep)
+        # CASCADE_DEPTH (10)
+        # Count of future unlocks
+        future_len = len(future_unlocks) if future_unlocks else 0
+        cascade_ratio = min(future_len / 5.0, 1.0) if future_len > 0 else 0.0
+        add_score("CASCADE_DEPTH", future_len > 0, cascade_ratio)
         
-        # TECHNICAL_DEPENDENCY
-        # Award when blocked by an internal milestone (not a customer dependency)
-        is_tech_dep = (
-            len(blocked_by) > 0
-            and not is_cust_dep
-            and category not in ("ROOT_CAUSE", "DIRECT_EXECUTION_BLOCKER", "TRANSITIVE_EXECUTION_BLOCKER")
-        )
-        add_score("TECHNICAL_DEPENDENCY", is_tech_dep)
+        # BUSINESS_IMPACT (20)
+        # Business Impact = critical path weight + customer-facing milestone + number of downstream milestones + delivery phase
+        b_score_ratio = 0.0
         
-        # SCOPE_CREEP
-        add_score("SCOPE_CREEP", is_scope_creep)
+        # 1. Number of downstream milestones (Up to 40% of the impact)
+        future_len = len(future_unlocks) if future_unlocks else 0
+        if future_len > 0:
+            b_score_ratio += min(future_len / 5.0, 1.0) * 0.4
+            
+        # 2. Critical path weight (Up to 30% of the impact)
+        if is_root_cause:
+            b_score_ratio += 0.3
+            
+        # 3. Customer-facing / Delivery phase (Up to 30% of the impact)
+        name_cat = f"{item_name or ''} {category} {next_milestone_name or ''}".upper()
+        if any(kw in name_cat for kw in ["CUSTOMER", "CLIENT", "UAT", "LIVE", "PROD", "DEPLOY", "GO-LIVE", "BUSINESS", "EXTERNAL"]):
+            b_score_ratio += 0.3
+            
+        b_score_ratio = min(b_score_ratio, 1.0)
         
-        # BUSINESS_IMPACT
-        impact_key = (business_impact or "LOW").upper()
-        impact_add = impact_matrix.get(impact_key, 0)
-        add_score("BUSINESS_IMPACT", impact_add > 0, impact_add)
+        # Fallback to older matrix if 0 and explicit impact provided
+        if b_score_ratio == 0.0 and business_impact:
+            impact_key = business_impact.upper()
+            fallbacks = {"CRITICAL": 1.0, "HIGH": 0.8, "MEDIUM": 0.5, "LOW": 0.2}
+            b_score_ratio = fallbacks.get(impact_key, 0.0)
+            
+        add_score("BUSINESS_IMPACT", b_score_ratio > 0, b_score_ratio)
         
-        # CONFIDENCE
+        # DEPENDENCY (25)
+        # Combines customer/technical dependency
+        is_cust_dep = (category == "CUSTOMER_DEPENDENCY" or category == "DEPENDENCY")
+        is_tech_dep = (len(blocked_by) > 0 and cascade_count > 0 and not is_cust_dep and category not in ("ROOT_CAUSE", "EXECUTION_BLOCKER"))
+        
+        dep_ratio = 0.0
+        if is_cust_dep:
+            dep_ratio = 1.0
+        elif is_tech_dep:
+            dep_ratio = 0.5
+            
+        add_score("DEPENDENCY", dep_ratio > 0, dep_ratio)
+        
+        # CONFIDENCE (5)
         add_score("CONFIDENCE", True, confidence)
+        
+        # OTHER (5)
+        is_urgent_status = status in ["BLOCKED", "DELAYED"]
+        add_score("OTHER", is_urgent_status, 1.0)
+
         
         final_score = min(round(total_score), 100)
         
@@ -151,17 +170,19 @@ class RiskScoringEngine:
         direct_blocking: list,
         breakdown: dict,
         mom_evidence: str,
-        original_contract_sentence: str = None
+        original_contract_sentence: str = None,
+        immediate_unlocks: list = None,
+        future_unlocks: list = None,
+        longest_path: list = None,
+        next_milestone_name: str = None,
+        next_milestone_date: str = None,
+        days_to_next_milestone: int = None,
     ) -> str:
         """
         Formats the full evidence-backed reasoning string stored in tracker_items.reasoning
         into an operational decision-support dashboard view.
         """
-        lines = [
-            f"Execution Priority Score: {score} | Severity: {severity}",
-            f"Category: {category.replace('_', ' ').title()}",
-            ""
-        ]
+        lines = []
         
         if status == 'RESOLVED' or category == 'RESOLVED':
             lines.append("Current Status")
@@ -182,21 +203,76 @@ class RiskScoringEngine:
             
         lines.append("")
         
-        # Why this is high priority
-        if is_root_cause or cascade_count > 0:
-            lines.append("Why this is high priority")
-            if is_root_cause:
-                lines.append("\u2022 Root cause of the current execution chain")
-            if category == "DIRECT_EXECUTION_BLOCKER":
-                lines.append("\u2022 Directly blocked by an incomplete predecessor (next in chain)")
-            elif category == "TRANSITIVE_EXECUTION_BLOCKER":
-                lines.append("\u2022 Transitively blocked — waiting on upstream milestones")
-            if cascade_count > 0:
-                lines.append(f"\u2022 Blocks {cascade_count} downstream milestone{'s' if cascade_count > 1 else ''}")
-            lines.append("")
+        # Execution Unlock Impact
+        lines.append("------------------------")
+        lines.append("Execution Chain")
+        lines.append("")
+        
+        raw_chain = longest_path if longest_path else (immediate_unlocks or []) + (future_unlocks or [])
+        chain_items = []
+        
+        for item in (raw_chain or []):
+            if not item:
+                continue
+            name = None
+            if isinstance(item, str):
+                name = item
+            elif isinstance(item, dict):
+                name = item.get("name") or item.get("deliverable") or item.get("activity") or item.get("title")
+            elif hasattr(item, "name"):
+                name = getattr(item, "name")
+            elif hasattr(item, "deliverable"):
+                name = getattr(item, "deliverable")
+            else:
+                try:
+                    name = str(item)
+                except Exception:
+                    pass
             
+            if name:
+                chain_items.append(name)
+                
+        if not chain_items:
+            lines.append("No downstream dependencies")
+        else:
+            # Remove duplicates while preserving order
+            seen = set()
+            unique_chain = []
+            for item in chain_items:
+                if item not in seen:
+                    unique_chain.append(item)
+                    seen.add(item)
+            
+            for i, item in enumerate(unique_chain):
+                lines.append(f"{item}")
+                if i < len(unique_chain) - 1:
+                    lines.append("↓")
+            
+            lines.append("")
+            lines.append(f"Total Unlocked Milestones: {len(unique_chain)}")
+            
+        lines.append("")
+            
+        # Schedule Urgency
+        if next_milestone_name:
+            lines.append("------------------------")
+            lines.append("Schedule Urgency")
+            lines.append("")
+            lines.append("Next milestone")
+            lines.append(f"{next_milestone_name}")
+            lines.append("")
+            if next_milestone_date:
+                lines.append("Planned Start")
+                lines.append(f"{next_milestone_date}")
+                lines.append("")
+            if days_to_next_milestone is not None:
+                lines.append("Starts in")
+                lines.append(f"{days_to_next_milestone} days")
+                lines.append("")
+
         # Blocked By
         if blocked_by:
+            lines.append("------------------------")
             if entity_type == "DEPENDENCY" or category == "CUSTOMER_DEPENDENCY":
                 lines.append("Dependency / Waiting For")
             else:
@@ -204,36 +280,26 @@ class RiskScoringEngine:
             for b in blocked_by:
                 lines.append(f"• {b}")
             lines.append("")
-            
-        # Blocking
-        if direct_blocking or blocking:
-            lines.append("Blocking")
-            if direct_blocking:
-                lines.append("Directly Blocks:")
-                for b in direct_blocking:
-                    lines.append(f"• {b}")
-            transitive = [b for b in blocking if b not in (direct_blocking or [])]
-            if transitive:
-                lines.append("Transitively Blocks:")
-                for b in transitive:
-                    lines.append(f"• {b}")
-            lines.append("")
 
         # Score Breakdown
+        lines.append("------------------------")
         lines.append("Score Breakdown")
+        lines.append("")
         if breakdown:
             for k, v in breakdown.items():
-                lines.append(f"• {k.replace('_', ' ').title()}: {v} pts")
+                lines.append(f"{k.replace('_', ' ').title().ljust(25)} {v}")
         else:
             lines.append("• (No risk signals detected)")
         lines.append("")
 
         if original_contract_sentence:
+            lines.append("------------------------")
             lines.append("Original Contract")
             lines.append(f"\"{original_contract_sentence}\"")
             lines.append("")
             
         if mom_evidence:
+            lines.append("------------------------")
             lines.append("Evidence (MoM)")
             lines.append(f"\"{mom_evidence}\"")
 

@@ -16,7 +16,7 @@ class ProjectKnowledgeService:
         """
         try:
             db_cursor.execute("""
-                SELECT si.id, si.name, si.scope_type, si.milestone, si.deadline, si.deadline_text
+                SELECT si.id, si.name, si.scope_type, si.category, si.milestone, si.deadline, si.deadline_text
                 FROM scope_items si
                 JOIN scope_baselines sb ON si.baseline_id = sb.id
                 WHERE si.project_id = %s
@@ -39,7 +39,7 @@ class ProjectKnowledgeService:
         """
         try:
             db_cursor.execute("""
-                SELECT si.id, si.name, si.scope_type, si.milestone, si.deadline, si.deadline_text
+                SELECT si.id, si.name, si.scope_type, si.category, si.milestone, si.deadline, si.deadline_text
                 FROM scope_items si
                 JOIN scope_baselines sb ON si.baseline_id = sb.id
                 WHERE si.project_id = %s

@@ -1,7 +1,6 @@
 import json
 from services.hybrid_retrieval_service import HybridRetrievalService
 from services.llm_service import LLMService
-from services.scope_deterministic_classifier import ScopeDeterministicClassifier
 import difflib
 class ScopeClassifier:
     """
@@ -81,14 +80,8 @@ class ScopeClassifier:
             if not combined_evidence:
                 combined_evidence = "No specific supporting evidence found in the contract."
             
-            # 2. Deterministic Classification
-            deterministic_result = ScopeDeterministicClassifier.classify(candidate, combined_evidence)
-            if deterministic_result.get("confidence", 0.0) >= 0.95:
-                print(f"[Deterministic] '{candidate['name']}' -> {deterministic_result['scope_type']} (Reason: {deterministic_result['evidence_text']})")
-                candidate["scope_type"] = deterministic_result["scope_type"]
-                candidate["confidence"] = deterministic_result["confidence"]
-                candidate["evidence_text"] = deterministic_result["evidence_text"]
-                continue
+            # 2. Deterministic Classification bypassed, all candidates go to LLM
+            deterministic_result = {}
                 
             llm_batch.append({
                 "candidate": candidate,
@@ -119,7 +112,7 @@ class ScopeClassifier:
                 if not isinstance(batch_results, list):
                     batch_results = [batch_results]
                     
-                result_map = {{str(res.get("id", "")) : res for res in batch_results}}
+                result_map = {str(res.get("id", "")) : res for res in batch_results}
                 for idx, item in enumerate(batch_slice):
                     candidate_ref = item["candidate"]
                     res = result_map.get(str(idx), {})
@@ -131,11 +124,11 @@ class ScopeClassifier:
                 for item in batch_slice:
                     candidate_ref = item["candidate"]
                     det_res = item["deterministic_result"]
-                    if det_res.get("scope_type") != "UNCERTAIN":
+                    if det_res.get("scope_type", "UNCERTAIN") != "UNCERTAIN":
                         print(f"[Failsafe] Falling back to deterministic low-confidence result for '{candidate_ref['name']}'.")
-                        candidate_ref["scope_type"] = det_res["scope_type"]
-                        candidate_ref["confidence"] = det_res["confidence"]
-                        candidate_ref["evidence_text"] = det_res["evidence_text"]
+                        candidate_ref["scope_type"] = det_res.get("scope_type", "UNCERTAIN")
+                        candidate_ref["confidence"] = det_res.get("confidence", 0.0)
+                        candidate_ref["evidence_text"] = det_res.get("evidence_text", "")
                     else:
                         candidate_ref["scope_type"] = "UNCERTAIN"
                         candidate_ref["confidence"] = 0.0
@@ -221,14 +214,8 @@ class ScopeClassifier:
         if not combined_evidence:
             combined_evidence = "No specific supporting evidence found in the contract."
 
-        # Deterministic Classification Step
-        deterministic_result = ScopeDeterministicClassifier.classify(candidate, combined_evidence)
-        if deterministic_result.get("confidence", 0.0) >= 0.95:
-            print(f"[Deterministic] '{candidate['name']}' -> {deterministic_result['scope_type']} (Reason: {deterministic_result['evidence_text']})")
-            candidate["scope_type"] = deterministic_result["scope_type"]
-            candidate["confidence"] = deterministic_result["confidence"]
-            candidate["evidence_text"] = deterministic_result["evidence_text"]
-            return candidate
+        # Deterministic Classification bypassed — all candidates go to LLM
+        deterministic_result = {}
             
         print(f"[LLM Fallback] '{candidate['name']}' was ambiguous. Calling LLM...")
             

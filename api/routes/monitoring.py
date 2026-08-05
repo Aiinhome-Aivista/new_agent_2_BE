@@ -137,7 +137,7 @@ def stream_monitoring(
                     return
                 def thread_emit(step: str, progress: int):
                     event = json.dumps({"step": step, "progress": progress, "status": "running"})
-                    pending_events.append(f"data: {event}\\n\\n")
+                    pending_events.append(f"data: {event}\n\n")
                     try:
                         upd_cursor = thread_conn.cursor()
                         upd_cursor.execute(

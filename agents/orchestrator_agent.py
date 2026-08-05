@@ -1,5 +1,5 @@
 from agents.status_ingestion_agent import StatusIngestionAgent
-from agents.risk_evaluation_agent import RiskEvaluationAgent
+from services.document_processing_pipeline import DocumentProcessingPipeline
 from typing import Callable, Optional
 import datetime
 import re
@@ -120,16 +120,14 @@ class OrchestratorAgent:
             project_id, document_id, extracted_data, db_cursor
         )
 
-        # ── Step 3: Multi-Agent Risk Evaluation ───────────────────────────────
+        # ── Step 3: Multi-Agent Document Pipeline (Extraction, Classification, Registers)
         try:
-            RiskEvaluationAgent.evaluate_document(
+            DocumentProcessingPipeline.process_document(
                 project_id=project_id,
                 document_id=document_id,
-                document_text=text,
+                text=text,
                 db_cursor=db_cursor,
-                activity_map=activity_map,
-                request_map=request_map,
-                emit=emit,
+                emit=emit
             )
         except Exception as e:
             print(f"Warning: Multi-Agent risk evaluation failed. Termination handled gracefully. Error: {e}")

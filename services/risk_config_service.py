@@ -62,6 +62,24 @@ class RiskConfigurationService:
         return cls._load("alert_rules", db_cursor, cls._fetch_alert_rules)
 
     @classmethod
+    def get_visibility_threshold(cls) -> int:
+        """
+        Returns the minimum score required for a risk to be visible on the main UI.
+        Risks scoring below this threshold are saved but hidden (status='HIDDEN').
+        Allows PMs to tune dashboard density.
+        """
+        import json, os
+        config_path = os.path.join(os.path.dirname(__file__), '..', 'risk_config.json')
+        try:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                    return config.get('RISK_VISIBILITY_THRESHOLD', 15)
+        except Exception:
+            pass
+        return 15
+
+    @classmethod
     def get_category_priorities(cls, db_cursor) -> dict:
         """
         Returns: { "ROOT_CAUSE": 1, "EXECUTION_BLOCKER": 2, ... }

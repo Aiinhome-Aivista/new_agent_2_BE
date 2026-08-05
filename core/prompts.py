@@ -164,7 +164,7 @@ Output MUST be a valid JSON object:
 # ==========================================
 # Phase 1a: Activity Extractor and Normalizer
 def get_activity_extractor_prompt(document_text: str, active_tracker_block: str = "None") -> str:
-    return f"""You are the Activity Extractor and Normalizer Agent.
+    return f"""You are the Document Fact Extraction Agent.
 Your job is to read the following project document (MOM / Status Report) and extract every
 work activity, deliverable update, action item, or scope request mentioned.
 
@@ -175,47 +175,35 @@ work activity, deliverable update, action item, or scope request mentioned.
 {document_text}
 
 CRITICAL RULES:
-1. The Risk Tracker is a contractual monitoring system. Tracker items represent contractual 
-   deliverables, not activity log entries.
-2. For each activity, produce a NORMALIZED BUSINESS ENTITY name — what the contractual item is,
-   not how it was described in this meeting.
-3. Normalization means:
-   - Strip action verbs: "Evaluate", "Review", "Prepare", "Discuss", "Assess", "Consider"
-   - Strip noise words: "Request", "Proposal", "Assessment", "Activity"
-   - Strip customer preambles: "Customer shall provide", "Client must"
-   - Strip date suffixes: "UAT - 15 May 2026" → "UAT"
-   - Merge semantically identical activities: "Evaluate SAP Integration Request" AND
-     "SAP Integration Request Assessment" both normalize to "SAP Integration"
-4. Preserve the original sentence as source_sentence (this becomes the evidence).
-5. Ignore greetings, attendance lists, signatures, and agenda headings.
-6. Extract any items (risks, blockers, dependencies) that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-100) and the exact evidence sentence.
+1. DO NOT CLASSIFY the items (do not decide if it's a Risk, Action, Dependency, etc). Your job is PURE FACT EXTRACTION.
+2. Extract the raw statement or entity name.
+3. Identify any primary action verb associated with the statement.
+4. Identify the owner, assignee, or responsible party if mentioned.
+5. Identify any due date or deadline mentioned.
+6. Identify if this item is explicitly blocking or delaying any other milestones (return the names of the blocked items).
+7. Preserve the exact original sentence as `source_sentence`.
+8. Ignore greetings, attendance lists, signatures, and agenda headings.
+9. Extract any items that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-1) and the exact evidence sentence.
    IMPORTANT: When extracting a resolved item, if it conceptually matches one of the CURRENT ACTIVE PROJECT RISKS listed above, you MUST use the EXACT title from the active risks list as the `name`.
 
-Examples of correct normalization:
-- "Evaluate SAP Integration Request" → "SAP Integration"
-- "Review Mobile Applications Request" → "Mobile Applications"
-- "Evaluate Voice Bot Proposal" → "Voice Bot"
-- "CRM Integration Development" → "CRM Integration"
-- "Analytics Dashboard Development" → "Analytics Dashboard"
-- "Customer shall provide VPN connectivity" → "VPN Connectivity"
-- "Customer shall provide API credentials" → "API Credentials"
-- "UAT - 15 May 2026" → "UAT"
-- "Go Live - 30 June 2026" → "Production Deployment (Go Live)"
-
-Output MUST be valid JSON — return unique normalized activities only (deduplicate by entity):
+Output MUST be valid JSON conforming to the following structure:
 {{
-  "activities": [
+  "extractions": [
     {{
-      "activity": "SAP Integration",
-      "source_sentence": "The team discussed evaluating the SAP Integration request.",
-      "confidence": 90
+      "statement": "Production VPN Access",
+      "verb": "provide",
+      "owner": "Customer",
+      "due_date": "2026-09-09",
+      "blocks": ["CRM Integration"],
+      "confidence": 0.98,
+      "source_sentence": "Customer must provide Production VPN Access by Sept 9, which is delaying the CRM Integration."
     }}
   ],
   "resolved_items": [
     {{
-      "name": "VPN Access",
-      "resolution_evidence": "Production VPN access received",
-      "confidence": 96
+      "name": "API Credentials",
+      "resolution_evidence": "Production API credentials were received.",
+      "confidence": 0.96
     }}
   ]
 }}
@@ -256,6 +244,9 @@ RULES:
 6. EVIDENCE TEXT:
    - You MUST provide `evidence_text` for every extracted fact. Every downstream calculation must be traceable back to the original MoM sentence.
 
+7. REASONING:
+   - Provide a 2-3 sentence business-friendly narrative explaining the situation (e.g. "SIT start is delayed by 2 weeks. This will automatically block UAT."). Do not output raw scoring or numeric calculations.
+
 Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
 [
   {{
@@ -265,7 +256,9 @@ Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER
     "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|UNKNOWN",
     "progress": 70,
     "blocked_by": ["Item 1", "Item 2"],
-    "evidence_text": "Exact quote from document proving this status/blocker."
+    "evidence_text": "Exact quote from document proving this status/blocker.",
+    "reasoning": "2-3 sentences explaining the business impact and risk.",
+    "recommended_action": "Specific actionable recommendation to resolve this item, if blocked or delayed, else null"
   }}
 ]
 """
@@ -765,3 +758,4 @@ Rules:
    - "baseline_item_name": The exact name of the matched baseline item, or null.
 5. Output ONLY valid JSON. No markdown blocks.
 """
+

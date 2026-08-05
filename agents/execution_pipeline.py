@@ -85,11 +85,11 @@ class ProjectStateSnapshot:
             m_id = r['id'] if isinstance(r, dict) else r[0]
             name = r['name'] if isinstance(r, dict) else r[1]
             status = r['status'] if isinstance(r, dict) else r[2]
-            self.milestone_statuses[m_id] = (status or "UNKNOWN").upper()
+            self.milestone_statuses[m_id] = (status or "UNKNOWN").upper().replace(" ", "_")
             self.milestone_id_to_name[m_id] = name
 
     def get_status(self, m_id: int) -> str:
-        return self.milestone_statuses.get(m_id, "UNKNOWN")
+        return self.milestone_statuses.get(m_id, "UNKNOWN").replace(" ", "_")
 
 
 class DependencyExecutionStateResolver:

@@ -9,7 +9,6 @@ from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivit
 from agents.tracker_audit_agent import TrackerAuditAgent
 from agents.alerting_agent import AlertingAgent
 from services.milestone_dependency_service import MilestoneDependencyService
-from services.dependency_classification_service import DependencyClassificationService
 from services.category_assignment_engine import CategoryAssignmentEngine
 
 # ---------------------------------------------------------------------------
@@ -149,18 +148,26 @@ class RiskEvaluationAgent:
         # STEP 2: Extract activities once — LLM CALL #1
         _emit("Extracting Activities", 35)
         
-        # Get active tracker items to assist LLM in matching
-        db_cursor.execute("SELECT id, title, risk_category, status FROM tracker_items WHERE project_id = %s AND status = 'OPEN'", (project_id,))
-        active_tracker_items = db_cursor.fetchall()
-        active_items_list = []
-        for r in active_tracker_items:
-            title = r['title'] if isinstance(r, dict) else r[1]
-            cat = r['risk_category'] if isinstance(r, dict) else r[2]
-            active_items_list.append(f"- {title} (Category: {cat})")
-        active_tracker_block = "\n".join(active_items_list) if active_items_list else "None"
-        
-        extraction_result = ActivityExtractorAgent.extract_activities(document_text, active_tracker_block)
+        # If the new pipeline already extracted facts, use them!
+        if 'pre_extracted_activities' in activity_map:
+            extraction_result = activity_map['pre_extracted_activities']
+        else:
+            # Get active tracker items to assist LLM in matching
+            db_cursor.execute("SELECT id, title, risk_category, status FROM tracker_items WHERE project_id = %s AND status = 'OPEN'", (project_id,))
+            active_tracker_items = db_cursor.fetchall()
+            active_items_list = []
+            for r in active_tracker_items:
+                title = r['title'] if isinstance(r, dict) else r[1]
+                cat = r['risk_category'] if isinstance(r, dict) else r[2]
+                active_items_list.append(f"- {title} (Category: {cat})")
+            active_tracker_block = "\n".join(active_items_list) if active_items_list else "None"
+            
+            extraction_result = ActivityExtractorAgent.extract_activities(document_text, active_tracker_block)
+            
         raw_activities = extraction_result.get("activities", [])
+        if not raw_activities and "extractions" in extraction_result:
+            raw_activities = extraction_result.get("extractions", [])
+            
         resolved_items = extraction_result.get("resolved_items", [])
 
         # ── Post-extraction: resolve canonical title immediately, then deduplicate ──
@@ -174,9 +181,31 @@ class RiskEvaluationAgent:
         seen_canonical = set()
         cleaned_activities = []  # list of {activity, canonical_title, is_in_scope, source_sentence}
         for item in raw_activities:
-            name = str(item.get("activity", "")).strip()
+            name = str(item.get("activity") or item.get("statement") or "").strip()
+            classification = str(item.get("classification_type", "RISK")).strip().upper()
+            
             if not name:
                 continue
+
+            # ── PHASE 1 CLASSIFICATION GATE (EARLY INTERCEPT) ──
+            if classification == "PROGRESS_UPDATE":
+                print(f"  [Gate] Dropping PROGRESS_UPDATE: {name}")
+                continue
+                
+            if classification in ["ACTION_ITEM", "DECISION", "CHANGE_REQUEST"]:
+                item_type = "ACTION_ITEM"
+                if classification == "DECISION": item_type = "DECISION"
+                if classification == "CHANGE_REQUEST": item_type = "NEW_REQUEST"
+                
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, item_type,
+                    False, 0, 'LOW', 'GENERAL',
+                    1.0, f"Captured as {classification}", False,
+                    title=name, status='OPEN', risk_source='OBSERVED'
+                )
+                print(f"  [Gate] Bypassed Risk Engine for {classification}: {name}")
+                continue
+            # ───────────────────────────────────────────────────
 
             # Resolve canonical title against full baseline RIGHT NOW, before anything else
             canonical_title, is_in_scope = _resolve_tracker_title(
@@ -193,10 +222,12 @@ class RiskEvaluationAgent:
 
             cleaned_activities.append({
                 "activity": name,
+                "classification_type": classification,
                 "canonical_title": canonical_title,
                 "is_in_scope": is_in_scope,
                 "source_sentence": item.get("source_sentence", name),
-                "extraction_confidence": item.get("confidence", 100)
+                "extraction_confidence": item.get("confidence", 100),
+                "blocks": item.get("blocks", [])
             })
 
         # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
@@ -222,9 +253,10 @@ class RiskEvaluationAgent:
             if confidence >= cls.DETERMINISTIC_CONFIDENCE_THRESHOLD or is_already_in_scope:
                 resolved_name = matched_si["name"] if matched_si else canonical_title
                 final_title, _ = _resolve_tracker_title(activity_name, resolved_name, scope_items, all_baseline_items)
-                print(f"  [Deterministic] '{activity_name}' → mapped as '{final_title}' (confidence: {confidence}%)")
+                print(f"  [Deterministic] '{activity_name}' -> mapped as '{final_title}' (confidence: {confidence}%)")
                 ambiguous_activities.append({
                     "activity": activity_name,
+                    "classification_type": act_item["classification_type"],
                     "canonical_title": final_title,
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
@@ -235,6 +267,7 @@ class RiskEvaluationAgent:
                 # Ambiguous — needs deeper analysis
                 ambiguous_activities.append({
                     "activity": activity_name,
+                    "classification_type": act_item["classification_type"],
                     "canonical_title": canonical_title,
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
@@ -259,6 +292,7 @@ class RiskEvaluationAgent:
             )
             activities_with_contexts.append({
                 "activity": activity_name,
+                "classification_type": item["classification_type"],
                 "canonical_title": item.get("canonical_title"),
                 "source_sentence": item.get("source_sentence", activity_name),
                 "context": context,
@@ -271,6 +305,11 @@ class RiskEvaluationAgent:
         llm_risk_results = []
         if activities_with_contexts:
             print(f"  [LLM] Batch-evaluating {len(activities_with_contexts)} ambiguous activities...")
+            import json
+            try:
+                print(f"[DEBUG] activities_with_contexts = {json.dumps(activities_with_contexts, indent=2)}")
+            except:
+                print(f"[DEBUG] activities_with_contexts = {activities_with_contexts}")
             
             # Retrieve milestone progress block to inject into the LLM prompt
             milestone_progress_block = ProjectKnowledgeService.calculate_milestone_progress(db_cursor, project_id)
@@ -282,13 +321,20 @@ class RiskEvaluationAgent:
                 combined_context += "\n\n" + dependency_context_block
             
             llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, combined_context)
+            
+            print(f"=== [DEBUG] llm_risk_results ===")
+            import json
+            try:
+                print(json.dumps(llm_risk_results, indent=2))
+            except:
+                print(llm_risk_results)
+            print(f"==================================")
 
 
         # ===========================================================
         # STEP 6: Deterministic Risk & Execution Priority Analysis
         # ===========================================================
         _emit("Calculating Execution Priorities", 70)
-        from services.dependency_analysis_service import DependencyAnalysisService
         from services.risk_scoring_engine import RiskScoringEngine
         from services.risk_ranking_engine import RiskRankingEngine
         
@@ -390,7 +436,9 @@ class RiskEvaluationAgent:
         # ── RISK RECONCILIATION ENGINE ───────────────────────────────────────
         # Deterministically resolve existing OPEN risks if their originating condition has cleared.
         db_cursor.execute("SELECT * FROM tracker_items WHERE project_id = %s AND status = 'OPEN'", (project_id,))
-        open_tracker_items = db_cursor.fetchall()
+        # Fix: map tuples to dictionaries since db_cursor is a standard tuple cursor
+        columns = [col[0] for col in db_cursor.description]
+        open_tracker_items = [dict(zip(columns, row)) for row in db_cursor.fetchall()]
         
         from services.risk_reconciliation_engine import RiskReconciliationEngine
         current_state = {
@@ -420,6 +468,8 @@ class RiskEvaluationAgent:
         today = datetime.now().date()
         category_priorities = RiskConfigurationService.get_category_priorities(db_cursor)
 
+        # ── PHASE A: PRE-PROCESSING & CANDIDATE GENERATION ──
+        all_activities = []
         for i, result in enumerate(llm_risk_results):
             activity_name = result.get("activity", "Unknown")
             canonical_title = result["_canonical_title"]
@@ -427,38 +477,29 @@ class RiskEvaluationAgent:
             blocked_by = result.get("blocked_by", [])
             evidence = result.get("evidence_text", "")
             
-            # Resolve scope matching
-            matched_baseline_name = result.get("matched_baseline_item")
-            _, is_confirmed_in_scope = _resolve_tracker_title(
-                activity_name, matched_baseline_name, scope_items, all_baseline_items
-            )
+            # Resolve scope matching using deterministic logic, not just LLM output
+            context = activities_with_contexts[i] if i < len(activities_with_contexts) else {}
+            matched_si = context.get("matched_si")
+            is_confirmed_in_scope = context.get("is_in_scope", False)
             
             entity_type = result.get("entity_type", "MILESTONE").upper()
             
-            # ── Dependency Analysis prep ──────────────────────────────
             m_id = get_milestone_id(canonical_title)
             
-            # Entity Type Override based on Baseline or Milestone Match
-            # If it explicitly matches an IN_SCOPE item OR a known milestone ID, it's a MILESTONE
-            # (Unless explicitly flagged as a CUSTOMER DEPENDENCY)
-            if (is_confirmed_in_scope or m_id is not None) and entity_type != "DEPENDENCY":
+            # Deterministic Source of Truth for Entity Type
+            if matched_si and matched_si.get("category"):
+                db_category = str(matched_si.get("category")).upper()
+                if db_category == "FUNCTIONAL":
+                    if matched_si.get("milestone"):
+                        entity_type = "MILESTONE"
+                    else:
+                        entity_type = "ACTION_ITEM"
+                else:
+                    entity_type = db_category
+            elif (is_confirmed_in_scope or m_id is not None) and entity_type in ["SCOPE_REQUEST", "RISK"]:
                 entity_type = "MILESTONE"
                 
             dependency_source = None
-            if entity_type == "DEPENDENCY" or blocked_by:
-                dependency_source = DependencyClassificationService.classify(
-                    activity_name, blocked_by, evidence, entity_type=entity_type
-                )
-                
-            # Dependency analysis data (m_id already computed above)
-            # ── Apply 4-state derived execution status ──────────────────────
-            # The derived state is the authoritative view from the static
-            # dependency graph. It overrides the LLM's raw status ONLY when
-            # it identifies a genuine blockage.
-            #
-            # WAITING: predecessors still in-progress but not blocked → keep
-            #          the LLM status (IN_PROGRESS / NOT_STARTED). Never a risk.
-            # BLOCKED: a predecessor is itself BLOCKED or DELAYED → override.
             is_direct_blocker = False
 
             if m_id and m_id in derived_states:
@@ -466,25 +507,37 @@ class RiskEvaluationAgent:
                 derived_status = d_state["status"]
 
                 if derived_status == "BLOCKED" and status not in ["COMPLETED", "RESOLVED"]:
-                    # Genuine blockage — override LLM status and capture blockers
                     status = "BLOCKED"
                     blocked_by = d_state["blockers"]
                     is_direct_blocker = True
                 elif derived_status == "WAITING":
-                    # Normal predecessor dependency in progress — do NOT escalate
-                    # This keeps the LLM's status (e.g. IN_PROGRESS, NOT_STARTED)
-                    # and prevents WAITING tasks from entering the risk register.
-                    pass  # status unchanged, is_direct_blocker stays False
+                    pass  
             
+            # Classification Gate
+            classification_type = context.get("classification_type", "RISK")
+            blocks = context.get("blocks", [])
+            
+            if classification_type == "DEPENDENCY" and not is_direct_blocker and len(blocks) == 0 and status not in ["COMPLETED", "RESOLVED"]:
+                existing_ref_id = get_milestone_id(canonical_title)
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, "DEPENDENCY",
+                    False, 0, 'LOW', 'GENERAL',
+                    1.0, f"Captured as DEPENDENCY (Status: {status})", False,
+                    title=canonical_title, reference_id=existing_ref_id, status='OPEN', risk_source='OBSERVED'
+                )
+                print(f"  [Gate] Bypassed Risk Engine for non-blocking DEPENDENCY: {canonical_title}")
+                continue
+
             dep_data = dep_analysis_results.get(m_id, {})
             cascade_count = dep_data.get("cascade_count", 0)
             is_root_cause = dep_data.get("is_root_cause", False)
+            
+            if cascade_count == 0 and len(blocks) > 0:
+                cascade_count = len(blocks)
+                is_root_cause = True
+                if "downstream_milestones" not in dep_data:
+                    dep_data["downstream_milestones"] = blocks
 
-            # ── COMPLETED: Early-Exit Terminal Gate ──────────────────────────
-            # A completed milestone is NOT an active execution risk.
-            # Wipe ALL blocker context before any scoring or persistence.
-            # This prevents old dependency metadata (source, cascade, blockers)
-            # from leaking into the current evaluation snapshot.
             if status == "COMPLETED":
                 is_root_cause = False
                 blocked_by = []
@@ -492,55 +545,21 @@ class RiskEvaluationAgent:
                 cascade_count = 0
                 is_direct_blocker = False
                 
-                # Resolve any existing OPEN tracker item for this completed deliverable
                 existing_ref_id = get_milestone_id(canonical_title)
                 TrackerAuditAgent.persist_tracker_item(
                     db_cursor, project_id, document_id, 'ACTIVITY',
                     False, 0, 'LOW', 'RESOLVED',
-                    1.0,
-                    f"Milestone completed.\n\nEvidence: {evidence}",
-                    False,
-                    title=canonical_title,
-                    reference_id=existing_ref_id,
-                    status='RESOLVED',
-                    resolve_only=True
+                    1.0, f"Milestone completed.\n\nEvidence: {evidence}", False,
+                    title=canonical_title, reference_id=existing_ref_id, status='RESOLVED', resolve_only=True
                 )
-                print(f"  [COMPLETED] '{canonical_title}' → early-exit RESOLVED. Skipping risk scoring.")
+                print(f"  [COMPLETED] '{canonical_title}' -> early-exit RESOLVED. Skipping risk scoring.")
                 continue
 
-            # ── Assign Category (graph-first) ───────────────────────────────
-            category_rules = RiskConfigurationService.get_category_rules(db_cursor)
+            # Removed CategoryAssignmentEngine logic. We will use ValidationService instead.
+            risk_cat = "GENERAL"
+            is_scope_creep = False
+            downstream_names = []
 
-            # Collect all transitive downstream names for critical-path check
-            blocking = dep_data.get("downstream_milestones", [])
-            downstream_names = [milestone_id_to_name.get(m, str(m)) for m in blocking]
-
-            risk_cat = CategoryAssignmentEngine.assign_category(
-                rules=category_rules,
-                entity_type=entity_type,
-                status=status,
-                dependency_source=dependency_source,
-                is_root_cause=is_root_cause,
-                cascade_count=cascade_count,
-                downstream_names=downstream_names,
-                is_direct_blocker=is_direct_blocker,
-                item_name=canonical_title,
-            )
-
-            # ── STAGE DIAGNOSTIC LOG ────────────────────────────────────────
-            _WATCH = {"api", "vpn", "azure", "knowledge", "sit", "crm"}
-            if any(w in canonical_title.lower() for w in _WATCH):
-                print(f"[STAGE] '{canonical_title[:40]}'"
-                      f" | entity={entity_type} | src={dependency_source}"
-                      f" | root={is_root_cause} | cascade={cascade_count}"
-                      f" | direct_blocker={is_direct_blocker}"
-                      f" | status={status}"
-                      f" | cat={risk_cat}")
-            
-            # Map back to old flags for the Scoring Engine
-            is_scope_creep = (risk_cat == "SCOPE_CREEP")
-
-            # Date calculation — use a SEPARATE variable to avoid shadowing dep m_id
             days_overdue = 0
             days_until_due = 9999
             date_m_id = None
@@ -566,28 +585,30 @@ class RiskEvaluationAgent:
                     except Exception:
                         pass
 
-
-
-            # Execution Priority Scoring
-            score_result = RiskScoringEngine.calculate(
-                status=status,
-                blocked_by=blocked_by,
-                is_root_cause=is_root_cause,
-                cascade_count=cascade_count,
-                days_overdue=days_overdue,
-                days_until_due=days_until_due,
-                is_scope_creep=is_scope_creep,
-                confidence=1.0,
-                business_impact="MEDIUM",
-                params=risk_params,
-                impact_matrix=impact_matrix,
-                category=risk_cat,
-            )
+            direct_downstream = dep_data.get("direct_downstream_milestones", [])
+            all_downstream = dep_data.get("downstream_milestones", [])
+            immediate_unlocks = [milestone_id_to_name.get(m, str(m)) for m in direct_downstream]
+            future_unlocks = [milestone_id_to_name.get(m, str(m)) for m in all_downstream if m not in direct_downstream]
             
-            exec_score = score_result["execution_priority_score"]
-            breakdown = score_result["score_breakdown"]
-            severity = RiskConfigurationService.classify_severity(exec_score, risk_thresholds)
-            
+            next_milestone_name = None
+            next_milestone_date_str = None
+            days_to_next_milestone = None
+            earliest_date = None
+            for dm in direct_downstream:
+                dm_date_str = milestone_details.get(dm, {}).get("planned_date")
+                if dm_date_str:
+                    try:
+                        dm_date = datetime.strptime(str(dm_date_str).split(' ')[0], "%Y-%m-%d").date()
+                        if earliest_date is None or dm_date < earliest_date:
+                            earliest_date = dm_date
+                            next_milestone_name = milestone_id_to_name.get(dm, str(dm))
+                            next_milestone_date_str = str(dm_date_str).split(' ')[0]
+                    except Exception:
+                        pass
+                        
+            if earliest_date:
+                days_to_next_milestone = (earliest_date - today).days
+
             original_contract_sentence = ""
             for si in all_baseline_items:
                 si_norm = _normalize(si["name"])
@@ -596,123 +617,198 @@ class RiskEvaluationAgent:
                     break
 
             reasoning = result.get("reasoning", "")
-            
             direct_blocking = dep_data.get("direct_downstream_milestones", [])
             direct_blocking_names = [milestone_id_to_name.get(m, str(m)) for m in direct_blocking]
 
+            llm_confidence = context.get("extraction_confidence", 100)
+            try:
+                llm_confidence = float(llm_confidence)
+                if llm_confidence <= 1.0:
+                    llm_confidence *= 100
+            except:
+                llm_confidence = 100
+
             should_create_risk = False
-            llm_confidence = activities_with_contexts[i].get("extraction_confidence", 100) if i < len(activities_with_contexts) else 100
+            if status not in ["COMPLETED", "RESOLVED", "WAITING"]:
+                if llm_confidence >= 80:
+                    should_create_risk = True
 
-            # ── Risk Decision Engine ──────────────────────────────────────────
-            # Only genuine execution anomalies enter the Risk Register.
-            # A deliverable in normal progress (WAITING, IN_PROGRESS with no
-            # explicit blocker) is a Project Plan item, not a risk.
-            #
-            # COMPLETED/RESOLVED: handled above (early-exit). Should not arrive here.
-            if status in ["COMPLETED", "RESOLVED"]:
+            all_activities.append({
+                "activity": canonical_title,
+                "canonical_title": canonical_title,
+                "entity_type": entity_type,
+                "status": status,
+                "blocked_by": blocked_by,
+                "is_root_cause": is_root_cause,
+                "cascade_count": cascade_count,
+                "days_overdue": days_overdue,
+                "days_until_due": days_until_due,
+                "is_scope_creep": is_scope_creep,
+                "risk_cat": risk_cat,
+                "immediate_unlocks": immediate_unlocks,
+                "future_unlocks": future_unlocks,
+                "next_milestone_name": next_milestone_name,
+                "next_milestone_date": next_milestone_date_str,
+                "days_to_next_milestone": days_to_next_milestone,
+                "original_contract_sentence": original_contract_sentence,
+                "reasoning": reasoning,
+                "direct_blocking_names": direct_blocking_names,
+                "downstream_names": downstream_names,
+                "evidence": evidence,
+                "progress": result.get("progress"),
+                "recommended_action": result.get("recommended_action"),
+                "p_date_str": p_date_str,
+                "llm_confidence": llm_confidence,
+                "should_create_risk": should_create_risk
+            })
+
+        # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
+        # Deduplicate activities by canonical_title before building the dependency graph
+        deduplicated_activities = {}
+        for activity in all_activities:
+            title = activity["canonical_title"]
+            if title not in deduplicated_activities:
+                deduplicated_activities[title] = activity
+            else:
+                # Merge logic if duplicate found (e.g. prioritize active status)
+                existing = deduplicated_activities[title]
+                if existing["status"] in ["COMPLETED", "RESOLVED"] and activity["status"] not in ["COMPLETED", "RESOLVED"]:
+                    deduplicated_activities[title] = activity
+        
+        unique_activities = list(deduplicated_activities.values())
+        
+        from services.validation_service import ValidationService
+        print(f"  [ValidationGate] Enriching {len(unique_activities)} unique activities...")
+        enriched_activities = ValidationService.enrich_candidates(unique_activities)
+
+                                
+        # ── PHASE C: RISK SCORING & AGGREGATION ──
+        for idx, item in enumerate(enriched_activities):
+            if item["status"] in ["COMPLETED", "RESOLVED"]:
+                continue
+            if not item["should_create_risk"]:
+                if not item["is_scope_creep"]:
+                    in_scope_activities.append({
+                        "activity": item["canonical_title"],
+                        "classification": "IN_SCOPE",
+                        "deliverable": item["canonical_title"],
+                        "confidence": 100,
+                    })
                 continue
 
-            # WAITING: predecessor is just in-progress. Not a risk.
-            if status == "WAITING":
-                continue
 
-            # Terminal deliverables (Knowledge Transfer, Closure, etc.) are
-            # normal end-of-project work. Never risk items.
-            if CategoryAssignmentEngine._is_terminal(canonical_title):
-                continue
+            # Determine dynamic business impact based on graph cascade_count
+            cascade = item.get("cascade_count", 0)
+            if cascade >= 4:
+                b_impact = "CRITICAL"
+            elif cascade >= 2:
+                b_impact = "HIGH"
+            elif cascade == 1:
+                b_impact = "MEDIUM"
+            else:
+                b_impact = "LOW"
 
-            if llm_confidence >= 80:
-                # Explicit execution anomalies
-                if status in ["BLOCKED", "DELAYED"]:
-                    should_create_risk = True
-                elif len(blocked_by) > 0:
-                    should_create_risk = True
-                elif is_direct_blocker:
-                    should_create_risk = True
-                # Customer / Technical dependencies that are still pending
-                elif entity_type == "DEPENDENCY" and dependency_source in ["CUSTOMER", "TECHNICAL"]:
-                    should_create_risk = True
-                # Scope creep with material impact
-                elif is_scope_creep and exec_score > 35:
-                    should_create_risk = True
-                # Structural blocker categories (ROOT_CAUSE, DIRECT/TRANSITIVE BLOCKER)
-                elif risk_cat in ["ROOT_CAUSE", "DIRECT_EXECUTION_BLOCKER", "TRANSITIVE_EXECUTION_BLOCKER", "CUSTOMER_DEPENDENCY"]:
-                    should_create_risk = True
-                    
-            if not should_create_risk and status not in ["COMPLETED", "RESOLVED"]:
-                continue
-
-            # Grouping
-            if is_scope_creep:
+            score_result = RiskScoringEngine.calculate(
+                status=item["status"],
+                blocked_by=item["blocked_by"],
+                is_root_cause=item["is_root_cause"],
+                cascade_count=item["cascade_count"],
+                days_overdue=item["days_overdue"],
+                days_until_due=item["days_until_due"],
+                is_scope_creep=item["is_scope_creep"],
+                confidence=1.0,
+                business_impact=b_impact,
+                params=risk_params,
+                impact_matrix=impact_matrix,
+                item_name=item["canonical_title"],
+                category=item["risk_cat"],
+                immediate_unlocks=item["immediate_unlocks"],
+                future_unlocks=item["future_unlocks"],
+                next_milestone_name=item["next_milestone_name"],
+                next_milestone_date=item["next_milestone_date"],
+                days_to_next_milestone=item["days_to_next_milestone"]
+            )
+            
+            exec_score = score_result["execution_priority_score"]
+            breakdown = score_result["score_breakdown"]
+            severity = RiskConfigurationService.classify_severity(exec_score, risk_thresholds)
+            
+            full_reasoning = item.get('reasoning', '')
+            
+            if item["is_scope_creep"]:
                 out_of_scope_activities.append({
-                    "activity": canonical_title,
-                    "entity_type": entity_type,
+                    "activity": item["canonical_title"],
+                    "entity_type": item["entity_type"],
                     "classification": "OUT_OF_SCOPE" if severity in ["HIGH", "CRITICAL"] else "POSSIBLE_SCOPE_CREEP",
-                    "reason": reasoning,
-                    "similar_deliverable": canonical_title,
+                    "reason": full_reasoning,
+                    "similar_deliverable": item["canonical_title"],
                     "confidence": 100,
                     "risk_score": exec_score,
                     "risk_level": severity,
-                    
-                    "category": risk_cat,
-                    "current_status": status,
-                    "progress": result.get("progress"),
-                    "is_root_cause": is_root_cause,
-                    "cascade_count": cascade_count,
-                    "blockers": blocked_by,
-                    "blocking_names": downstream_names,
-                    "direct_blocking_names": direct_blocking_names,
+                    "category": item["risk_cat"],
+                    "current_status": item["status"],
+                    "progress": item["progress"],
+                    "is_root_cause": item["is_root_cause"],
+                    "cascade_count": item["cascade_count"],
+                    "blockers": item["blocked_by"],
+                    "blocking_names": item["downstream_names"],
+                    "direct_blocking_names": item["direct_blocking_names"],
+                    "immediate_unlocks": item.get("immediate_unlocks", []),
+                    "future_unlocks": item.get("future_unlocks", []),
+                    "longest_path": item.get("longest_path", []),
+                    "next_milestone_name": item["next_milestone_name"],
+                    "next_milestone_date": item["next_milestone_date"],
+                    "days_to_next_milestone": item["days_to_next_milestone"],
                     "score_breakdown": breakdown,
-                    "mom_evidence": evidence,
-                    "original_contract_sentence": original_contract_sentence
+                    "mom_evidence": item["evidence"],
+                    "original_contract_sentence": item["original_contract_sentence"]
                 })
-            elif status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED"]:
+            else:
+                # Correct entity_type if LLM misclassified an in-scope item as SCOPE_REQUEST
+                if item.get("matched_baseline_item") and item.get("entity_type") == "SCOPE_REQUEST":
+                    item["entity_type"] = "MILESTONE"
+
+                # FILTER: Do not surface Action Items or Pure Downstream Consequences as top-level risk cards.
+                is_standalone_risk = True
+                if item.get("entity_type") == "ACTION_ITEM":
+                    is_standalone_risk = False
+                elif len(item.get("blocked_by", [])) > 0 and item.get("cascade_count", 0) == 0 and not item.get("is_root_cause"):
+                    is_standalone_risk = False
+                        
+                if not is_standalone_risk:
+                    print(f"  [Filter] Suppressing non-actionable risk from top-level UI: {item['canonical_title']}")
+                    continue
 
                 tracker_items.append({
-                    "deliverable": canonical_title,
-                    "entity_type": entity_type,
-                    "expected_date": str(p_date_str) if p_date_str else "Unknown",
-                    "current_status": status,
-                    "progress": result.get("progress"),
-                    "delay_days": days_overdue,
-                    "blockers": blocked_by,
-                    "confidence": llm_confidence,
+                    "deliverable": item["canonical_title"],
+                    "entity_type": item["entity_type"],
+                    "expected_date": str(item["p_date_str"]) if item["p_date_str"] else "Unknown",
+                    "current_status": item["status"],
+                    "progress": item["progress"],
+                    "delay_days": item["days_overdue"],
+                    "blockers": item["blocked_by"],
+                    "confidence": item["llm_confidence"],
                     "execution_priority_score": exec_score,
-                    "dependency_status": risk_cat,
-                    "category": risk_cat,
-                    "is_root_cause": is_root_cause,
-                    "cascade_count": cascade_count,
-                    "days_overdue": days_overdue,
-                    "days_until_due": days_until_due,
+                    "dependency_status": item["risk_cat"],
+                    "category": item["risk_cat"],
+                    "risk_source": "DERIVED" if item["risk_cat"] in ["EXECUTION_BLOCKER", "ROOT_CAUSE", "TECHNICAL_DEPENDENCY"] else "OBSERVED",
+                    "is_root_cause": item["is_root_cause"],
+                    "cascade_count": item["cascade_count"],
+                    "days_overdue": item["days_overdue"],
+                    "days_until_due": item["days_until_due"],
                     "risk": severity,
                     "risk_score": exec_score,
-                    "reasoning": reasoning,
-                    
-                    "blocking_names": downstream_names,
-                    "direct_blocking_names": direct_blocking_names,
+                    "reasoning": full_reasoning,
+                    "blocking_names": item["downstream_names"],
+                    "direct_blocking_names": item["direct_blocking_names"],
+                    "immediate_unlocks": item["immediate_unlocks"],
+                    "future_unlocks": item["future_unlocks"],
+                    "next_milestone_name": item["next_milestone_name"],
+                    "days_to_next_milestone": item["days_to_next_milestone"],
                     "score_breakdown": breakdown,
-                    "mom_evidence": evidence,
-                    "original_contract_sentence": original_contract_sentence
-                })
-                
-                # DEBUG INJECTION
-                if "CRM" in canonical_title.upper() or "API" in canonical_title.upper():
-                    print(f"=== DEBUG: {canonical_title} ===")
-                    print(f"  entity_type: {entity_type}")
-                    print(f"  dependency_source: {dependency_source}")
-                    print(f"  is_root_cause: {is_root_cause}")
-                    print(f"  cascade_count: {cascade_count}")
-                    print(f"  assigned_category: {risk_cat}")
-                    print(f"  score_breakdown: {breakdown}")
-                    print(f"  final_score: {exec_score}")
-                    print(f"==============================")
-                    
-            else:
-                in_scope_activities.append({
-                    "activity": canonical_title,
-                    "classification": "IN_SCOPE",
-                    "deliverable": canonical_title,
-                    "confidence": 100,
+                    "mom_evidence": item["evidence"],
+                    "original_contract_sentence": item["original_contract_sentence"],
+                    "recommended_action": item["recommended_action"]
                 })
 
         # Deduplicate tracker_items by deliverable name
@@ -723,7 +819,6 @@ class RiskEvaluationAgent:
                 if key not in merged:
                     merged[key] = item
                 else:
-                    # Merge logic: take max score, combine mom_evidence
                     existing = merged[key]
                     if item['risk_score'] > existing['risk_score']:
                         new_evidence = existing.get('mom_evidence', '')
@@ -755,8 +850,23 @@ class RiskEvaluationAgent:
                     direct_blocking=item.get("direct_blocking_names"),
                     breakdown=item.get("score_breakdown"),
                     mom_evidence=item.get("mom_evidence"),
-                    original_contract_sentence=item.get("original_contract_sentence")
+                    original_contract_sentence=item.get("original_contract_sentence"),
+                    immediate_unlocks=item.get("immediate_unlocks"),
+                    future_unlocks=item.get("future_unlocks"),
+                    longest_path=item.get("longest_path"),
+                    next_milestone_name=item.get("next_milestone_name"),
+                    next_milestone_date=item.get("next_milestone_date"),
+                    days_to_next_milestone=item.get("days_to_next_milestone")
                 )
+                
+                # The Score Breakdown is already included by RiskScoringEngine.format_reasoning
+                    
+                original_reasoning = item.get('reasoning') or item.get('reason', '')
+                if original_reasoning:
+                    # Clean up duplicate 'Description:' prefixes if any
+                    original_reasoning = original_reasoning.replace("Description:\n", "").replace("Description:\r\n", "")
+                    formatted = f"Why is this a risk?\n{original_reasoning}\n\n------------------------\n{formatted}"
+                    
                 if 'reasoning' in item:
                     item['reasoning'] = formatted
                 if 'reason' in item:
@@ -766,7 +876,6 @@ class RiskEvaluationAgent:
 
         out_of_scope_activities = dedup_items(out_of_scope_activities, "activity")
         tracker_items = dedup_items(tracker_items, "deliverable")
-
         # 4. Risk Ranking Engine
         timeline_deliverables = RiskRankingEngine.rank_risks(tracker_items, category_priorities)
         
@@ -856,6 +965,9 @@ class RiskEvaluationAgent:
                 print(f"Warning: Could not persist deliverable progress record: {e}")
 
 
+        # Fetch the visibility threshold once
+        visibility_threshold = RiskConfigurationService.get_visibility_threshold()
+
         # Persist Out-of-Scope risks to tracker
         for oos_item in out_of_scope_result.get("activities", []):
             oos_name = oos_item.get('activity', 'Unknown')  # Already canonical from pipeline
@@ -876,7 +988,13 @@ class RiskEvaluationAgent:
             full_reasoning  = oos_item.get('reason', f'Activity: {oos_name}')
             
             is_resolved = (item_risk_score == 0) or (oos_item.get('current_status') in ['COMPLETED', 'RESOLVED'])
-            target_status = 'RESOLVED' if is_resolved else 'OPEN'
+            
+            if is_resolved:
+                target_status = 'RESOLVED'
+            elif item_risk_score < visibility_threshold:
+                target_status = 'RESOLVED'
+            else:
+                target_status = 'OPEN'
 
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, 'ACTIVITY',
@@ -913,11 +1031,30 @@ class RiskEvaluationAgent:
             full_reasoning  = deliv.get('reasoning', f"Deliverable: {deliv_name}")
 
             actual_risk_cat = deliv.get('dependency_status', 'DELAY')
-            item_type = 'BLOCKER' if actual_risk_cat in ['BLOCKED', 'DEPENDENCY'] else 'ACTION_ITEM'
+            # Preserve the LLM's original classification for logic, but map to valid DB ENUM
+            raw_entity_type = deliv.get('entity_type', 'ACTIVITY').upper()
+            if raw_entity_type == 'MILESTONE':
+                item_type = 'ACTIVITY'
+            elif raw_entity_type in ['SCOPE_REQUEST', 'SCOPE_CREEP', 'CHANGE_REQUEST']:
+                item_type = 'NEW_REQUEST'
+            elif raw_entity_type == 'DEPENDENCY':
+                # Map to BLOCKER only if it actually blocks something or is explicitly flagged
+                if actual_risk_cat in ['WAITING_DEPENDENCY', 'EXECUTION_BLOCKER', 'ROOT_CAUSE_BLOCKER']:
+                    item_type = 'BLOCKER'
+                else:
+                    item_type = 'ACTIVITY'
+            elif raw_entity_type in ['ACTION_ITEM', 'DECISION', 'RISK_MENTIONED']:
+                item_type = raw_entity_type
+            else:
+                item_type = 'ACTIVITY'
             
             # Auto-resolve logic: if score drops to 0, dependency status is RESOLVED, or status is COMPLETED
             is_resolved = (item_risk_score == 0) or (actual_risk_cat == 'RESOLVED') or (deliv.get('current_status') == 'COMPLETED')
-            target_status = 'RESOLVED' if is_resolved else 'OPEN'
+            
+            if is_resolved:
+                target_status = 'RESOLVED'
+            else:
+                target_status = 'OPEN'
 
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, item_type,
@@ -925,7 +1062,9 @@ class RiskEvaluationAgent:
                 1.0, full_reasoning, True,
                 title=card_title, reference_id=ref_id,
                 priority_order=deliv.get('priority_order'),
-                status=target_status
+                status=target_status,
+                risk_source=deliv.get('risk_source', 'OBSERVED'),
+                recommended_action=deliv.get('recommended_action')
             )
 
             # Use alert threshold from DB config (not hardcoded 70)
@@ -970,7 +1109,7 @@ class RiskEvaluationAgent:
                 WHERE project_id = %s 
                 AND status = 'OPEN' 
                 AND reference_id IN ({format_strings})
-                AND risk_category IN ('ROOT_CAUSE', 'DIRECT_EXECUTION_BLOCKER', 'TRANSITIVE_EXECUTION_BLOCKER', 'TECHNICAL_DEPENDENCY')
+                AND risk_category IN ('ROOT_CAUSE', 'EXECUTION_BLOCKER', 'TECHNICAL_DEPENDENCY')
             """, (project_id, *completed_milestone_ids))
             
             completed_risks = db_cursor.fetchall()

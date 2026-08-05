@@ -591,6 +591,306 @@ CREATE INDEX idx_workflow_project ON workflow_runs(project_id);
 CREATE INDEX idx_episodic_project ON episodic_memory(project_id, created_at);
 CREATE INDEX idx_audit_project ON audit_logs(project_id, created_at);
 
+CREATE TABLE `action_items` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `document_id` bigint DEFAULT NULL,
+  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `owner` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `due_date` date DEFAULT NULL,
+  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
+  `metadata` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `resolved_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uuid` (`uuid`)
+) ENGINE=InnoDB AUTO_INCREMENT=19 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `alert_rule_config` (
+  `severity` varchar(20) NOT NULL,
+  `send_email` tinyint(1) NOT NULL DEFAULT '0',
+  `min_score_threshold` int NOT NULL DEFAULT '70',
+  PRIMARY KEY (`severity`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `business_rule_config` (
+  `rule_code` varchar(60) NOT NULL,
+  `rule_description` text NOT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT '1',
+  PRIMARY KEY (`rule_code`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `category_assignment_rules` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `entity_type` varchar(50) NOT NULL,
+  `dependency_source` varchar(50) DEFAULT NULL,
+  `status` varchar(50) DEFAULT NULL,
+  `result_category` varchar(50) NOT NULL,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=13 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `change_requests` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `document_id` bigint DEFAULT NULL,
+  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
+  `metadata` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `resolved_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uuid` (`uuid`)
+) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `dependencies` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `document_id` bigint DEFAULT NULL,
+  `name` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `owner` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
+  `metadata` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `resolved_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uuid` (`uuid`)
+) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `entity_history` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `entity_uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `document_id` bigint DEFAULT NULL,
+  `action` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `previous_status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `new_status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `changes` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=76 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `entity_links` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `project_id` bigint NOT NULL,
+  `source_type` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `source_uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `target_type` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `target_uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `relationship_type` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `confidence` float DEFAULT NULL,
+  `reason` text COLLATE utf8mb4_unicode_ci,
+  `valid_from` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `valid_to` timestamp NULL DEFAULT NULL,
+  `is_active` tinyint(1) DEFAULT '1',
+  `created_by` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=64 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `entity_registry` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `canonical_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `aliases` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uuid` (`uuid`)
+) ENGINE=InnoDB AUTO_INCREMENT=108 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `entity_types` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `name` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `name` (`name`)
+) ENGINE=InnoDB AUTO_INCREMENT=26 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `impact_matrix` (
+  `impact_level` varchar(20) NOT NULL,
+  `score_addition` int NOT NULL,
+  PRIMARY KEY (`impact_level`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `issues` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `document_id` bigint DEFAULT NULL,
+  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
+  `metadata` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `resolved_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uuid` (`uuid`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `milestone_dependencies` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `project_id` bigint NOT NULL,
+  `parent_milestone_id` bigint NOT NULL,
+  `child_milestone_id` bigint NOT NULL,
+  `dependency_type` enum('FINISH_TO_START','START_TO_START','FINISH_TO_FINISH','START_TO_FINISH') DEFAULT 'FINISH_TO_START',
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `project_id` (`project_id`),
+  KEY `parent_milestone_id` (`parent_milestone_id`),
+  KEY `child_milestone_id` (`child_milestone_id`),
+  CONSTRAINT `milestone_dependencies_ibfk_1` FOREIGN KEY (`project_id`) REFERENCES `projects` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `milestone_dependencies_ibfk_2` FOREIGN KEY (`parent_milestone_id`) REFERENCES `project_milestones` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `milestone_dependencies_ibfk_3` FOREIGN KEY (`child_milestone_id`) REFERENCES `project_milestones` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB AUTO_INCREMENT=238 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `milestone_type_config` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `code` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `label` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `code` (`code`)
+) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `milestones` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `project_id` bigint NOT NULL,
+  `document_id` bigint DEFAULT NULL,
+  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
+  `metadata` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `resolved_at` timestamp NULL DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uuid` (`uuid`)
+) ENGINE=InnoDB AUTO_INCREMENT=15 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `project_milestones` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `project_id` bigint NOT NULL,
+  `baseline_id` bigint NOT NULL,
+  `name` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `planned_date` date DEFAULT NULL,
+  `sequence` int DEFAULT '0',
+  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'PENDING',
+  `milestone_type_id` int DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  KEY `project_id` (`project_id`),
+  KEY `baseline_id` (`baseline_id`),
+  KEY `milestone_type_id` (`milestone_type_id`),
+  CONSTRAINT `project_milestones_ibfk_1` FOREIGN KEY (`project_id`) REFERENCES `projects` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `project_milestones_ibfk_2` FOREIGN KEY (`baseline_id`) REFERENCES `scope_baselines` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `project_milestones_ibfk_3` FOREIGN KEY (`milestone_type_id`) REFERENCES `milestone_type_config` (`id`) ON DELETE SET NULL
+) ENGINE=InnoDB AUTO_INCREMENT=314 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `rag_chat_messages` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `session_id` bigint NOT NULL,
+  `role` enum('USER','ASSISTANT') COLLATE utf8mb4_unicode_ci NOT NULL,
+  `content` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  `citations_json` json DEFAULT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `fk_rag_message_session` (`session_id`),
+  CONSTRAINT `fk_rag_message_session` FOREIGN KEY (`session_id`) REFERENCES `rag_chat_sessions` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB AUTO_INCREMENT=75 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `rag_chat_sessions` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `project_id` bigint NOT NULL,
+  `session_name` varchar(255) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `created_by` bigint NOT NULL,
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `fk_rag_session_project` (`project_id`),
+  KEY `fk_rag_session_user` (`created_by`),
+  CONSTRAINT `fk_rag_session_project` FOREIGN KEY (`project_id`) REFERENCES `projects` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_rag_session_user` FOREIGN KEY (`created_by`) REFERENCES `users` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB AUTO_INCREMENT=26 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `risk_category_priority` (
+  `category` varchar(50) NOT NULL,
+  `priority_order` int NOT NULL,
+  PRIMARY KEY (`category`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `risk_parameter_config` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `parameter_code` varchar(50) NOT NULL,
+  `parameter_name` varchar(100) NOT NULL,
+  `enabled` tinyint(1) NOT NULL DEFAULT '1',
+  `weight` float NOT NULL,
+  `max_score` int NOT NULL,
+  `evaluation_type` varchar(20) NOT NULL DEFAULT 'NUMERIC',
+  `description` text,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `parameter_code` (`parameter_code`)
+) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `risk_threshold_config` (
+  `severity` varchar(20) NOT NULL,
+  `min_score` int NOT NULL,
+  `max_score` int NOT NULL,
+  PRIMARY KEY (`severity`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `schema_version` (
+  `version` int NOT NULL,
+  `description` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `applied_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`version`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `scope_category_config` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `code` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `label` varchar(100) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `description` text COLLATE utf8mb4_unicode_ci,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `code` (`code`)
+) ENGINE=InnoDB AUTO_INCREMENT=6 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `scope_milestone_mapping` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `scope_item_id` bigint NOT NULL,
+  `milestone_id` bigint NOT NULL,
+  `weight` decimal(5,2) DEFAULT '1.00',
+  PRIMARY KEY (`id`),
+  KEY `scope_item_id` (`scope_item_id`),
+  KEY `milestone_id` (`milestone_id`),
+  CONSTRAINT `scope_milestone_mapping_ibfk_1` FOREIGN KEY (`scope_item_id`) REFERENCES `scope_items` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `scope_milestone_mapping_ibfk_2` FOREIGN KEY (`milestone_id`) REFERENCES `project_milestones` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB AUTO_INCREMENT=303 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `tracker_items` (
+  `id` bigint NOT NULL AUTO_INCREMENT,
+  `project_id` bigint NOT NULL,
+  `source_document_id` bigint NOT NULL,
+  `item_type` enum('ACTIVITY','NEW_REQUEST','CHANGE_REQUEST','BLOCKER','ACTION_ITEM','DECISION','RISK_MENTIONED','DEPENDENCY') COLLATE utf8mb4_unicode_ci NOT NULL,
+  `reference_id` bigint DEFAULT NULL,
+  `title` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `is_out_of_scope` tinyint(1) DEFAULT NULL,
+  `risk_score` int DEFAULT '0',
+  `risk_level` enum('LOW','MEDIUM','HIGH','CRITICAL') COLLATE utf8mb4_unicode_ci DEFAULT 'LOW',
+  `risk_category` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'GENERAL',
+  `risk_origin` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
+  `confidence` decimal(5,4) DEFAULT NULL,
+  `reasoning` text COLLATE utf8mb4_unicode_ci,
+  `requires_escalation` tinyint(1) DEFAULT NULL,
+  `status` enum('OPEN','RESOLVED') COLLATE utf8mb4_unicode_ci NOT NULL DEFAULT 'OPEN',
+  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
+  `resolution` text COLLATE utf8mb4_unicode_ci,
+  `resolved_by` bigint DEFAULT NULL,
+  `resolved_at` timestamp NULL DEFAULT NULL,
+  `priority_order` int DEFAULT NULL,
+  `risk_source` enum('OBSERVED','DERIVED','MANUAL','SYSTEM') COLLATE utf8mb4_unicode_ci DEFAULT 'OBSERVED',
+  `previous_highest_score` int DEFAULT '0',
+  `recommended_action` text COLLATE utf8mb4_unicode_ci,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB AUTO_INCREMENT=558 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 DELIMITER //
 
 CREATE PROCEDURE truncate_all_tables_except_users_and_master()

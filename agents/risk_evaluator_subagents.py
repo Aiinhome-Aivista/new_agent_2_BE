@@ -28,7 +28,7 @@ class ActivityExtractorAgent:
         prompt = get_activity_extractor_prompt(document_text, active_tracker_block)
         result = LLMService.generate_json(prompt)
         return {
-            "activities": result.get("activities", []),
+            "extractions": result.get("extractions", []),
             "resolved_items": result.get("resolved_items", [])
         }
 

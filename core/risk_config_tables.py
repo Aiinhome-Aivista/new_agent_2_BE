@@ -30,15 +30,14 @@ def create_risk_config_tables():
         INSERT IGNORE INTO risk_parameter_config
             (parameter_code, parameter_name, enabled, weight, max_score, evaluation_type, description)
         VALUES
-            ('EXECUTION_PRIORITY',   'Execution Priority',    TRUE, 1.0, 35, 'NUMERIC', 'Primary execution urgency'),
-            ('CASCADE_IMPACT',       'Cascade Impact',        TRUE, 1.0, 20, 'NUMERIC', 'Number of downstream milestones affected'),
-            ('DATE_PROXIMITY',       'Date Proximity',        TRUE, 1.0, 15, 'NUMERIC', 'Urgency relative to today\\'s date'),
-            ('ROOT_CAUSE',           'Root Cause',            TRUE, 1.0, 15, 'BOOLEAN', 'Primary execution blocker'),
-            ('CUSTOMER_DEPENDENCY',  'Customer Dependency',   TRUE, 1.0, 10, 'BOOLEAN', 'Waiting for customer input'),
-            ('TECHNICAL_DEPENDENCY', 'Technical Dependency',  TRUE, 1.0,  5, 'BOOLEAN', 'Internal technical blocker'),
-            ('BUSINESS_IMPACT',      'Business Impact',       TRUE, 1.0,  5, 'ENUM',    'Business consequence'),
-            ('SCOPE_CREEP',          'Scope Creep',           TRUE, 1.0,  5, 'BOOLEAN', 'Contractual impact'),
-            ('CONFIDENCE',           'Evidence Confidence',   TRUE, 1.0,  2, 'NUMERIC', 'Extraction confidence')
+            ('EXECUTION_UNLOCK_IMPACT', 'Execution Unlock Impact', TRUE, 1.0, 35, 'NUMERIC', 'Immediate next milestone blockages'),
+            ('SCHEDULE_URGENCY',        'Schedule Urgency',        TRUE, 1.0, 10, 'NUMERIC', 'Urgency relative to next milestone'),
+            ('ROOT_CAUSE',              'Root Cause',              TRUE, 1.0, 20, 'BOOLEAN', 'Primary execution blocker'),
+            ('CASCADE_DEPTH',           'Cascade Depth',           FALSE, 1.0, 0, 'NUMERIC', 'Number of future downstream milestones affected'),
+            ('BUSINESS_IMPACT',         'Business Impact',         TRUE, 1.0, 20, 'NUMERIC', 'Business consequence'),
+            ('DEPENDENCY',              'Dependency',              TRUE, 1.0, 25, 'NUMERIC', 'Customer or Technical dependency'),
+            ('CONFIDENCE',              'Evidence Confidence',     TRUE, 1.0,  5, 'NUMERIC', 'Extraction confidence'),
+            ('RISK_HISTORY',            'Risk History',            TRUE, 1.0,  5, 'NUMERIC', 'Historical occurrence of risk')
         """)
 
         # ── 1.5 Risk Category Priority ───────────────────────────────────────

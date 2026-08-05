@@ -77,7 +77,7 @@ class MilestoneDependencyService:
             if parent_id not in milestone_data:
                 continue
             parent = milestone_data[parent_id]
-            is_incomplete = parent['status'] not in ['COMPLETED', 'CANCELLED']
+            is_incomplete = str(parent['status']).upper() not in ['COMPLETED', 'CANCELLED']
             
             blocked_names = [
                 milestone_data[cid]['name'] 

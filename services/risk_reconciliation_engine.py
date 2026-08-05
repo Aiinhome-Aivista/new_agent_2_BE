@@ -61,7 +61,7 @@ class RiskReconciliationEngine:
         "EXECUTION": ExecutionBlockerResolver(),
         "EXECUTION_BLOCKER": ExecutionBlockerResolver(),
         "DIRECT_EXECUTION_BLOCKER": ExecutionBlockerResolver(),
-        "TRANSITIVE_EXECUTION_BLOCKER": ExecutionBlockerResolver(),
+        "EXECUTION_BLOCKER": ExecutionBlockerResolver(),
         "CUSTOMER": CustomerDependencyResolver(),
         "CUSTOMER_DEPENDENCY": CustomerDependencyResolver(),
         "TECHNICAL": TechnicalDependencyResolver(),

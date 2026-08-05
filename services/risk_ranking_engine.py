@@ -5,9 +5,9 @@ class RiskRankingEngine:
     CATEGORY_TIER = {
         "ROOT_CAUSE":                  1,
         "CUSTOMER_DEPENDENCY":         2,
-        "DIRECT_EXECUTION_BLOCKER":    3,
-        "TRANSITIVE_EXECUTION_BLOCKER": 4,
-        "EXECUTION_BLOCKER":           5,   # legacy fallback
+        "DIRECT_EXECUTION_BLOCKER":    4,
+        "TRANSITIVE_EXECUTION_BLOCKER": 5,
+        "EXECUTION_BLOCKER":           3,
         "TECHNICAL_DEPENDENCY":        6,
         "SCOPE_CREEP":                 7,
         "DELAY":                       8,
@@ -38,8 +38,8 @@ class RiskRankingEngine:
             exec_score  = item.get("execution_priority_score", 0)
             cascade     = item.get("cascade_count", 0)
 
-            # Return (tier ASC, score DESC, cascade DESC)
-            return (tier, -exec_score, -cascade)
+            # Return (-score, tier, -cascade) so score is the primary driver
+            return (-exec_score, tier, -cascade)
 
         eligible_items = [
             i for i in tracker_items

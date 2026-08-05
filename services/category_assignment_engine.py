@@ -80,7 +80,7 @@ class CategoryAssignmentEngine:
             return "CUSTOMER_DEPENDENCY"
 
         # 3. Milestone-specific graph-first logic
-        if entity_type == "MILESTONE":
+        if entity_type in ["MILESTONE", "DEPENDENCY", "ACTIVITY"]:
 
             if is_root_cause:
                 return "ROOT_CAUSE"
@@ -94,9 +94,9 @@ class CategoryAssignmentEngine:
 
                 # Critical path → distinguish direct vs transitive
                 if is_direct_blocker:
-                    return "DIRECT_EXECUTION_BLOCKER"
+                    return "EXECUTION_BLOCKER"
                 else:
-                    return "TRANSITIVE_EXECUTION_BLOCKER"
+                    return "EXECUTION_BLOCKER"
 
         # ── 3. Rule matrix (DB-driven) ────────────────────────────────────────
         for rule in rules:
