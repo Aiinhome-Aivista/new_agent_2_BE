@@ -79,17 +79,23 @@ class ProjectStateSnapshot:
     def __init__(self, db_cursor, project_id: int):
         self.milestone_statuses = {}
         self.milestone_id_to_name = {}
+        self.milestone_dates = {}
         
-        db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
+        db_cursor.execute("SELECT id, name, status, planned_date FROM project_milestones WHERE project_id = %s", (project_id,))
         for r in db_cursor.fetchall():
             m_id = r['id'] if isinstance(r, dict) else r[0]
             name = r['name'] if isinstance(r, dict) else r[1]
             status = r['status'] if isinstance(r, dict) else r[2]
+            planned_date = r.get('planned_date') if isinstance(r, dict) else r[3]
             self.milestone_statuses[m_id] = (status or "UNKNOWN").upper().replace(" ", "_")
             self.milestone_id_to_name[m_id] = name
+            self.milestone_dates[m_id] = planned_date
 
     def get_status(self, m_id: int) -> str:
         return self.milestone_statuses.get(m_id, "UNKNOWN").replace(" ", "_")
+        
+    def get_date(self, m_id: int):
+        return self.milestone_dates.get(m_id)
 
 
 class DependencyExecutionStateResolver:
@@ -101,15 +107,15 @@ class DependencyExecutionStateResolver:
         results = {}
         
         # Build reverse graph for cascade computation
-        reverse_graph = {}
+        forward_graph = {}
         for m, deps in backward_graph.items():
-            if m not in reverse_graph:
-                reverse_graph[m] = []
+            if m not in forward_graph:
+                forward_graph[m] = []
             for dep in deps:
-                if dep not in reverse_graph:
-                    reverse_graph[dep] = []
-                if m not in reverse_graph[dep]:
-                    reverse_graph[dep].append(m)
+                if dep not in forward_graph:
+                    forward_graph[dep] = []
+                if m not in forward_graph[dep]:
+                    forward_graph[dep].append(m)
                     
         def get_all_downstream(node, visited=None):
             if visited is None:
@@ -118,30 +124,100 @@ class DependencyExecutionStateResolver:
                 return set()
             visited.add(node)
             downstream = set()
-            for child in reverse_graph.get(node, []):
+            for child in forward_graph.get(node, []):
                 downstream.add(child)
                 downstream.update(get_all_downstream(child, visited))
             return downstream
+
+        # Compute dependency chain weight (downstream chain length)
+        memo_dist = {}
+        def get_downstream_chain_length(node):
+            if node in memo_dist:
+                return memo_dist[node]
+            children = forward_graph.get(node, [])
+            if not children:
+                memo_dist[node] = 0
+                return 0
+            max_dist = max(get_downstream_chain_length(c) for c in children) + 1
+            memo_dist[node] = max_dist
+            return max_dist
+
+        for node in snapshot.milestone_statuses.keys():
+            get_downstream_chain_length(node)
+
+        # Critical path heuristics (nodes on the absolute longest path)
+        max_graph_dist = max(memo_dist.values()) if memo_dist else 0
+        critical_nodes = set()
+        if max_graph_dist > 0:
+            current_nodes = [n for n, d in memo_dist.items() if d == max_graph_dist]
+            while current_nodes:
+                next_nodes = []
+                for n in current_nodes:
+                    critical_nodes.add(n)
+                    children = forward_graph.get(n, [])
+                    if children:
+                        max_c_dist = max(memo_dist.get(c, 0) for c in children)
+                        for c in children:
+                            if memo_dist.get(c, 0) == max_c_dist:
+                                next_nodes.append(c)
+                current_nodes = next_nodes
 
         for milestone_id, status in snapshot.milestone_statuses.items():
             downstream_set = get_all_downstream(milestone_id)
             cascade_count = len(downstream_set)
             
-            # Root cause heuristic: Is it blocking things, but isn't blocked itself?
-            is_root_cause = False
-            if status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED", "PENDING"]:
-                is_root_cause = True
+            # Root cause heuristic: Is it the EARLIEST actionable blocker?
+            earliest_root_cause = False
+            if cascade_count > 0 and status not in ["COMPLETED", "RESOLVED"]:
+                earliest_root_cause = True
                 for dep in backward_graph.get(milestone_id, []):
                     dep_status = snapshot.get_status(dep)
-                    if dep_status in ["BLOCKED", "DELAYED", "IN_PROGRESS", "NOT_STARTED", "PENDING"]:
-                        is_root_cause = False
+                    # If any predecessor is incomplete, this is a downstream consequence, not the earliest root.
+                    if dep_status not in ["COMPLETED", "RESOLVED"]:
+                        earliest_root_cause = False
                         break
+                        
+            # Determine if completing this IMMEDIATELY unlocks downstream work
+            distance_to_next_executable = 999
+            for child in forward_graph.get(milestone_id, []):
+                child_ready = True
+                for dep in backward_graph.get(child, []):
+                    if dep != milestone_id and snapshot.get_status(dep) not in ["COMPLETED", "RESOLVED"]:
+                        child_ready = False
+                        break
+                if child_ready:
+                    distance_to_next_executable = 1
+                    break
+                        
+            # Find next downstream deadline
+            earliest_date = None
+            next_downstream_name = None
+            for child in forward_graph.get(milestone_id, []):
+                child_date = snapshot.get_date(child)
+                if child_date:
+                    from datetime import datetime
+                    if isinstance(child_date, str):
+                        try:
+                            child_date = datetime.strptime(child_date.split(' ')[0], "%Y-%m-%d").date()
+                        except:
+                            continue
+                    elif hasattr(child_date, 'date'):
+                        child_date = child_date.date()
+                    
+                    if not earliest_date or child_date < earliest_date:
+                        earliest_date = child_date
+                        next_downstream_name = snapshot.milestone_id_to_name.get(child)
                         
             results[milestone_id] = {
                 "cascade_count": cascade_count,
                 "downstream_milestones": list(downstream_set),
-                "is_root_cause": is_root_cause,
-                "direct_downstream_milestones": reverse_graph.get(milestone_id, [])
+                "earliest_root_cause": earliest_root_cause,
+                "distance_to_next_executable": distance_to_next_executable,
+                "direct_downstream_milestones": forward_graph.get(milestone_id, []),
+                "downstream_chain_length": memo_dist.get(milestone_id, 0),
+                "critical_path": milestone_id in critical_nodes,
+                "next_downstream_date": earliest_date,
+                "next_downstream_name": next_downstream_name
             }
             
         return results

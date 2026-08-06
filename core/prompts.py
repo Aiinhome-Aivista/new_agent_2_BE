@@ -231,9 +231,10 @@ RULES:
 2. STATUS EXTRACTION:
    - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, or UNKNOWN.
 
-3. BLOCKED BY:
+3. BLOCKED BY & BLOCKS:
    - If the activity is blocked or waiting on something, list exactly what it is blocked by as an array of strings (e.g., ["API Credentials", "VPN"]).
    - If not blocked, return an empty array [].
+   - If the activity explicitly BLOCKS or delays another downstream milestone/activity, list those items in the "blocks" array. If it doesn't block anything, return [].
 
 4. PROGRESS:
    - Extract progress percentage if explicitly mentioned (e.g., 70 for 70%). Otherwise, null.
@@ -256,6 +257,7 @@ Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER
     "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|UNKNOWN",
     "progress": 70,
     "blocked_by": ["Item 1", "Item 2"],
+    "blocks": ["Downstream Item 1"],
     "evidence_text": "Exact quote from document proving this status/blocker.",
     "reasoning": "2-3 sentences explaining the business impact and risk.",
     "recommended_action": "Specific actionable recommendation to resolve this item, if blocked or delayed, else null"

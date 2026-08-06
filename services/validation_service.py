@@ -23,9 +23,10 @@ class ValidationService:
         for cand in enriched:
             status = cand.get('status', 'OPEN')
             is_root_cause = cand.get('is_root_cause', False)
-            cascade_count = cand.get('cascade_count', 0)
+            blocked_work_count = cand.get('blocked_work_count', 0)
             blocked_by = cand.get('blocked_by', [])
             entity_type = cand.get('entity_type', 'ACTIVITY')
+            dependency_source = cand.get('dependency_source', 'ENGINEERING')
             
             # Default fallback
             risk_cat = "GENERAL"
@@ -35,45 +36,31 @@ class ValidationService:
             elif entity_type in ['CHANGE_REQUEST', 'SCOPE_REQUEST', 'ISSUE']:
                 risk_cat = entity_type
             elif entity_type == 'ACTION_ITEM':
-                if cascade_count > 0:
+                if blocked_work_count > 0:
                     risk_cat = "EXECUTION_BLOCKER"
                 else:
                     risk_cat = "ACTION_ITEM"
             elif 'CHANGE_REQUEST' in cand.get('risk_cat', ''):
                 risk_cat = "CHANGE_REQUEST"
-            elif is_root_cause and cascade_count > 0:
+            elif is_root_cause and blocked_work_count > 0:
                 risk_cat = "ROOT_CAUSE_BLOCKER"
-            elif len(blocked_by) > 0 and cascade_count > 0:
+            elif len(blocked_by) > 0 and blocked_work_count > 0:
                 # Blocks downstream but is also waiting for something upstream
                 risk_cat = "WAITING_DEPENDENCY"
-            elif len(blocked_by) > 0 and cascade_count == 0:
+            elif len(blocked_by) > 0 and blocked_work_count == 0:
                 # Is waiting for something, but doesn't block anything downstream
-                is_customer = False
-                customer_kws = ["customer", "client", "business", "vendor", "external", "third party"]
-                for bb in blocked_by:
-                    bb_str = str(bb).lower()
-                    if any(kw in bb_str for kw in customer_kws):
-                        is_customer = True
-                        break
-                risk_cat = "CUSTOMER_DEPENDENCY" if is_customer else "INTERNAL_DEPENDENCY"
-            elif cascade_count > 0 and not blocked_by:
+                risk_cat = "CUSTOMER_DEPENDENCY" if dependency_source == "CUSTOMER" else "INTERNAL_DEPENDENCY"
+            elif blocked_work_count > 0 and not blocked_by:
                 # Blocks downstream (is a root cause, but maybe milestone level)
                 risk_cat = "EXECUTION_BLOCKER"
-            elif status == "IN_PROGRESS" or (status == "OPEN" and cascade_count == 0):
+            elif status == "IN_PROGRESS" or (status == "OPEN" and blocked_work_count == 0):
                 risk_cat = "IN_PROGRESS_RISK"
             else:
                 if status == "BLOCKED":
-                    if cascade_count > 0:
+                    if blocked_work_count > 0:
                         risk_cat = "EXECUTION_BLOCKER"
                     else:
-                        is_customer = False
-                        customer_kws = ["customer", "client", "business", "vendor", "external", "third party"]
-                        for bb in blocked_by:
-                            bb_str = str(bb).lower()
-                            if any(kw in bb_str for kw in customer_kws):
-                                is_customer = True
-                                break
-                        risk_cat = "CUSTOMER_DEPENDENCY" if is_customer else "INTERNAL_DEPENDENCY"
+                        risk_cat = "CUSTOMER_DEPENDENCY" if dependency_source == "CUSTOMER" else "INTERNAL_DEPENDENCY"
                 else:
                     risk_cat = "IN_PROGRESS_RISK"
             

@@ -192,19 +192,6 @@ class RiskEvaluationAgent:
                 print(f"  [Gate] Dropping PROGRESS_UPDATE: {name}")
                 continue
                 
-            if classification in ["ACTION_ITEM", "DECISION", "CHANGE_REQUEST"]:
-                item_type = "ACTION_ITEM"
-                if classification == "DECISION": item_type = "DECISION"
-                if classification == "CHANGE_REQUEST": item_type = "NEW_REQUEST"
-                
-                TrackerAuditAgent.persist_tracker_item(
-                    db_cursor, project_id, document_id, item_type,
-                    False, 0, 'LOW', 'GENERAL',
-                    1.0, f"Captured as {classification}", False,
-                    title=name, status='OPEN', risk_source='OBSERVED'
-                )
-                print(f"  [Gate] Bypassed Risk Engine for {classification}: {name}")
-                continue
             # ───────────────────────────────────────────────────
 
             # Resolve canonical title against full baseline RIGHT NOW, before anything else
@@ -530,16 +517,19 @@ class RiskEvaluationAgent:
 
             dep_data = dep_analysis_results.get(m_id, {})
             cascade_count = dep_data.get("cascade_count", 0)
-            is_root_cause = dep_data.get("is_root_cause", False)
+            earliest_root_cause = dep_data.get("earliest_root_cause", False)
+            critical_path = dep_data.get("critical_path", False)
+            downstream_chain_length = dep_data.get("downstream_chain_length", 0)
+            distance_to_next_executable = dep_data.get("distance_to_next_executable", 999)
             
             if cascade_count == 0 and len(blocks) > 0:
                 cascade_count = len(blocks)
-                is_root_cause = True
+                earliest_root_cause = True
                 if "downstream_milestones" not in dep_data:
                     dep_data["downstream_milestones"] = blocks
 
             if status == "COMPLETED":
-                is_root_cause = False
+                earliest_root_cause = False
                 blocked_by = []
                 dependency_source = None
                 cascade_count = 0
@@ -557,6 +547,12 @@ class RiskEvaluationAgent:
 
             # Removed CategoryAssignmentEngine logic. We will use ValidationService instead.
             risk_cat = "GENERAL"
+            
+            is_execution_blocker = False
+            if entity_type == "ACTION_ITEM" and (cascade_count > 0 or earliest_root_cause):
+                is_execution_blocker = True
+                risk_cat = "EXECUTION_BLOCKER"
+                
             is_scope_creep = False
             downstream_names = []
 
@@ -608,6 +604,13 @@ class RiskEvaluationAgent:
                         
             if earliest_date:
                 days_to_next_milestone = (earliest_date - today).days
+                
+            # Override next milestone with accurate data from the graph if available
+            graph_next_date = dep_data.get("next_downstream_date")
+            if graph_next_date:
+                next_milestone_name = dep_data.get("next_downstream_name")
+                next_milestone_date_str = str(graph_next_date)
+                days_to_next_milestone = (graph_next_date - today).days
 
             original_contract_sentence = ""
             for si in all_baseline_items:
@@ -639,7 +642,8 @@ class RiskEvaluationAgent:
                 "entity_type": entity_type,
                 "status": status,
                 "blocked_by": blocked_by,
-                "is_root_cause": is_root_cause,
+                "blocks": blocks,
+                "is_root_cause": earliest_root_cause,
                 "cascade_count": cascade_count,
                 "days_overdue": days_overdue,
                 "days_until_due": days_until_due,
@@ -659,7 +663,12 @@ class RiskEvaluationAgent:
                 "recommended_action": result.get("recommended_action"),
                 "p_date_str": p_date_str,
                 "llm_confidence": llm_confidence,
-                "should_create_risk": should_create_risk
+                "should_create_risk": should_create_risk,
+                "critical_path": critical_path,
+                "downstream_chain_length": downstream_chain_length,
+                "distance_to_next_executable": distance_to_next_executable,
+                "is_execution_blocker": is_execution_blocker,
+                "earliest_executable_work": immediate_unlocks
             })
 
         # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
@@ -697,8 +706,8 @@ class RiskEvaluationAgent:
                 continue
 
 
-            # Determine dynamic business impact based on graph cascade_count
-            cascade = item.get("cascade_count", 0)
+            # Determine dynamic business impact based on graph blocked_work_count
+            cascade = item.get("blocked_work_count", 0)
             if cascade >= 4:
                 b_impact = "CRITICAL"
             elif cascade >= 2:
@@ -711,22 +720,28 @@ class RiskEvaluationAgent:
             score_result = RiskScoringEngine.calculate(
                 status=item["status"],
                 blocked_by=item["blocked_by"],
-                is_root_cause=item["is_root_cause"],
-                cascade_count=item["cascade_count"],
-                days_overdue=item["days_overdue"],
-                days_until_due=item["days_until_due"],
-                is_scope_creep=item["is_scope_creep"],
+                earliest_root_cause=item.get("is_root_cause", False),
+                cascade_depth=item.get("cascade_depth", 0),
+                blocked_work_count=item.get("blocked_work_count", 0),
+                execution_unlock_count=item.get("execution_unlock_count", 0),
+                critical_chain=item.get("critical_chain", False),
+                dependency_source=item.get("dependency_source", "ENGINEERING"),
+                days_overdue=item.get("days_overdue", 0),
+                days_until_due=item.get("days_until_due", 999),
+                is_scope_creep=item.get("is_scope_creep", False),
                 confidence=1.0,
                 business_impact=b_impact,
                 params=risk_params,
                 impact_matrix=impact_matrix,
                 item_name=item["canonical_title"],
                 category=item["risk_cat"],
-                immediate_unlocks=item["immediate_unlocks"],
-                future_unlocks=item["future_unlocks"],
-                next_milestone_name=item["next_milestone_name"],
-                next_milestone_date=item["next_milestone_date"],
-                days_to_next_milestone=item["days_to_next_milestone"]
+                immediate_unlocks=item.get("immediate_unlocks", []),
+                future_unlocks=item.get("future_unlocks", []),
+                next_milestone_name=item.get("next_milestone_name", None),
+                next_milestone_date=item.get("next_milestone_date", None),
+                days_to_next_milestone=item.get("days_to_next_milestone", None),
+                critical_path=item.get("critical_path", False),
+                distance_to_next_executable=item.get("distance_to_next_executable", 999),
             )
             
             exec_score = score_result["execution_priority_score"]
@@ -734,6 +749,7 @@ class RiskEvaluationAgent:
             execution_priority = score_result.get("execution_priority", 0)
             cascade_priority = score_result.get("cascade_priority", 0)
             schedule_priority = score_result.get("schedule_priority", 0)
+            execution_reasons = score_result.get("execution_reasons", [])
             severity = RiskConfigurationService.classify_severity(exec_score, risk_thresholds)
             
             full_reasoning = item.get('reasoning', '')
@@ -766,6 +782,7 @@ class RiskEvaluationAgent:
                     "execution_priority": execution_priority,
                     "cascade_priority": cascade_priority,
                     "schedule_priority": schedule_priority,
+                    "execution_reasons": execution_reasons,
                     "mom_evidence": item["evidence"],
                     "original_contract_sentence": item.get("original_contract_sentence", "")
                 })
@@ -773,18 +790,6 @@ class RiskEvaluationAgent:
                 # Correct entity_type if LLM misclassified an in-scope item as SCOPE_REQUEST
                 if item.get("matched_baseline_item") and item.get("entity_type") == "SCOPE_REQUEST":
                     item["entity_type"] = "MILESTONE"
-
-                # FILTER: Do not surface Action Items or Pure Downstream Consequences as top-level risk cards.
-                # Exception: If an Action Item is a root cause or has downstream cascade impact, it MUST be surfaced.
-                is_standalone_risk = True
-                if item.get("entity_type") == "ACTION_ITEM" and not item.get("is_root_cause") and item.get("cascade_count", 0) == 0:
-                    is_standalone_risk = False
-                elif len(item.get("blocked_by", [])) > 0 and item.get("cascade_count", 0) == 0 and not item.get("is_root_cause"):
-                    is_standalone_risk = False
-                        
-                if not is_standalone_risk:
-                    print(f"  [Filter] Suppressing non-actionable risk from top-level UI: {item['canonical_title']}")
-                    continue
 
                 tracker_items.append({
                     "deliverable": item["canonical_title"],
@@ -836,10 +841,16 @@ class RiskEvaluationAgent:
                         if item_evidence and item_evidence not in new_evidence:
                             new_evidence += f"\n\n{item_evidence}"
                         item['mom_evidence'] = new_evidence
-                        # Inherit the highest priority scores
                         item['execution_priority'] = max(item.get('execution_priority', 0), existing.get('execution_priority', 0))
                         item['cascade_priority'] = max(item.get('cascade_priority', 0), existing.get('cascade_priority', 0))
                         item['schedule_priority'] = max(item.get('schedule_priority', 0), existing.get('schedule_priority', 0))
+                        
+                        merged_reasons = list(item.get('execution_reasons', []))
+                        for r in existing.get('execution_reasons', []):
+                            if r not in merged_reasons:
+                                merged_reasons.append(r)
+                        item['execution_reasons'] = merged_reasons
+                        
                         merged[key] = item
                     else:
                         existing_evidence = existing.get('mom_evidence', '')
@@ -847,10 +858,15 @@ class RiskEvaluationAgent:
                         if item_evidence and item_evidence not in existing_evidence:
                             existing_evidence += f"\n\n{item_evidence}"
                         existing['mom_evidence'] = existing_evidence
-                        # Inherit the highest priority scores
                         existing['execution_priority'] = max(existing.get('execution_priority', 0), item.get('execution_priority', 0))
                         existing['cascade_priority'] = max(existing.get('cascade_priority', 0), item.get('cascade_priority', 0))
                         existing['schedule_priority'] = max(existing.get('schedule_priority', 0), item.get('schedule_priority', 0))
+                        
+                        merged_reasons = list(existing.get('execution_reasons', []))
+                        for r in item.get('execution_reasons', []):
+                            if r not in merged_reasons:
+                                merged_reasons.append(r)
+                        existing['execution_reasons'] = merged_reasons
                         
             final_list = list(merged.values())
             for item in final_list:
@@ -882,7 +898,7 @@ class RiskEvaluationAgent:
                     entity_type=item.get("entity_type"),
                     status=item.get("current_status"),
                     progress=item.get("progress"),
-                    is_root_cause=item.get("is_root_cause"),
+                    earliest_root_cause=item.get("is_root_cause"),
                     cascade_count=item.get("cascade_count"),
                     blocked_by=item.get("blockers"),
                     blocking=item.get("blocking_names"),
@@ -898,7 +914,8 @@ class RiskEvaluationAgent:
                     days_to_next_milestone=item.get("days_to_next_milestone"),
                     execution_priority=item.get("execution_priority", 0),
                     cascade_priority=item.get("cascade_priority", 0),
-                    schedule_priority=item.get("schedule_priority", 0)
+                    schedule_priority=item.get("schedule_priority", 0),
+                    execution_reasons=item.get("execution_reasons", [])
                 )
                 
                 # The Score Breakdown is already included by RiskScoringEngine.format_reasoning
