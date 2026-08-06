@@ -1,4 +1,4 @@
-import json
+﻿import json
 import re
 from typing import Callable, Optional
 from services.llm_service import LLMService
@@ -27,13 +27,13 @@ def _normalize(text: str) -> str:
 def _strip_date_from_title(title: str) -> str:
     """
     Remove date suffixes from tracker titles.
-    e.g. "UAT - 15 May 2026" → "UAT"
-         "Go Live - 30 June 2026" → "Go Live"
+    e.g. "UAT - 15 May 2026" ΓåÆ "UAT"
+         "Go Live - 30 June 2026" ΓåÆ "Go Live"
     """
     # Remove " - DD Month YYYY" or " - Month YYYY" or " - YYYY-MM-DD" patterns
-    cleaned = re.sub(r'\s*[-–]\s*\d{1,2}\s+\w+\s+\d{4}', '', title)
-    cleaned = re.sub(r'\s*[-–]\s*\d{4}-\d{2}-\d{2}', '', cleaned)
-    cleaned = re.sub(r'\s*[-–]\s*\w+\s+\d{4}', '', cleaned)
+    cleaned = re.sub(r'\s*[-ΓÇô]\s*\d{1,2}\s+\w+\s+\d{4}', '', title)
+    cleaned = re.sub(r'\s*[-ΓÇô]\s*\d{4}-\d{2}-\d{2}', '', cleaned)
+    cleaned = re.sub(r'\s*[-ΓÇô]\s*\w+\s+\d{4}', '', cleaned)
     return cleaned.strip()
 
 
@@ -52,7 +52,7 @@ def _resolve_tracker_title(activity_name: str, matched_baseline_item: str,
 def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
     """
     STEP 3: Deterministic Scope Matching.
-    Tries exact → normalized → substring → token overlap in that order.
+    Tries exact ΓåÆ normalized ΓåÆ substring ΓåÆ token overlap in that order.
     
     Returns (scope_item_dict, confidence_score 0-100, match_type)
     If no match found, returns (None, 0, None).
@@ -124,7 +124,7 @@ class RiskEvaluationAgent:
             if emit:
                 emit(step, pct)
 
-        # ── Load config from DB via caching service (Phase 2 inputs) ──────────
+        # ΓöÇΓöÇ Load config from DB via caching service (Phase 2 inputs) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         # These come from risk_parameter_config, risk_threshold_config, etc.
         # Config changes take effect immediately without deployment.
         risk_params    = RiskConfigurationService.get_parameters(db_cursor)
@@ -138,14 +138,14 @@ class RiskEvaluationAgent:
         # Fetch ALL baseline items (IN_SCOPE + OUT_OF_SCOPE) for canonical name resolution.
         all_baseline_items = ProjectKnowledgeService.get_full_baseline(db_cursor, project_id)
 
-        # Build dependency graph ONCE — used for both scoring and LLM context injection.
+        # Build dependency graph ONCE ΓÇö used for both scoring and LLM context injection.
         # This reads deliverable_progress.dependencies to find which items block others.
         dependency_graph = MilestoneDependencyService.build_rich_dependency_graph(db_cursor, project_id)
         dependency_context_block = ProjectKnowledgeService.get_dependency_context_block(dependency_graph)
         if dependency_context_block:
             print(f"  [DependencyRisk] Detected blocking relationships:\n{dependency_context_block}")
 
-        # STEP 2: Extract activities once — LLM CALL #1
+        # STEP 2: Extract activities once ΓÇö LLM CALL #1
         _emit("Extracting Activities", 35)
         
         # If the new pipeline already extracted facts, use them!
@@ -170,14 +170,14 @@ class RiskEvaluationAgent:
             
         resolved_items = extraction_result.get("resolved_items", [])
 
-        # ── Post-extraction: resolve canonical title immediately, then deduplicate ──
+        # ΓöÇΓöÇ Post-extraction: resolve canonical title immediately, then deduplicate ΓöÇΓöÇ
         # Root cause fix: deduplication must happen on the CANONICAL title, not the raw
         # normalized activity string. Otherwise "Evaluate SAP Integration Request" and
         # "SAP Integration Request Assessment" produce two different norm_keys and both
         # survive into the pipeline, creating duplicate tracker records.
         #
         # Pipeline:
-        #   raw_activity → _resolve_tracker_title → canonical_title → dedup by canonical
+        #   raw_activity ΓåÆ _resolve_tracker_title ΓåÆ canonical_title ΓåÆ dedup by canonical
         seen_canonical = set()
         cleaned_activities = []  # list of {activity, canonical_title, is_in_scope, source_sentence}
         for item in raw_activities:
@@ -187,7 +187,7 @@ class RiskEvaluationAgent:
             if not name:
                 continue
 
-            # ── PHASE 1 CLASSIFICATION GATE (EARLY INTERCEPT) ──
+            # ΓöÇΓöÇ PHASE 1 CLASSIFICATION GATE (EARLY INTERCEPT) ΓöÇΓöÇ
             if classification == "PROGRESS_UPDATE":
                 print(f"  [Gate] Dropping PROGRESS_UPDATE: {name}")
                 continue
@@ -205,18 +205,18 @@ class RiskEvaluationAgent:
                 )
                 print(f"  [Gate] Bypassed Risk Engine for {classification}: {name}")
                 continue
-            # ───────────────────────────────────────────────────
+            # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
             # Resolve canonical title against full baseline RIGHT NOW, before anything else
             canonical_title, is_in_scope = _resolve_tracker_title(
                 name, None, scope_items, all_baseline_items
             )
 
-            # Dedup key is the canonical title — so "SAP Integration Request Assessment"
-            # and "Evaluate SAP Integration Request" both resolve to "SAP Integration" → merged
+            # Dedup key is the canonical title ΓÇö so "SAP Integration Request Assessment"
+            # and "Evaluate SAP Integration Request" both resolve to "SAP Integration" ΓåÆ merged
             dedup_key = _normalize(canonical_title)
             if dedup_key in seen_canonical:
-                print(f"  [Dedup] Merged '{name}' → already seen as '{canonical_title}'")
+                print(f"  [Dedup] Merged '{name}' ΓåÆ already seen as '{canonical_title}'")
                 continue
             seen_canonical.add(dedup_key)
 
@@ -230,9 +230,9 @@ class RiskEvaluationAgent:
                 "blocks": item.get("blocks", [])
             })
 
-        # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
+        # ΓöÇΓöÇ STEP 3: Deterministic Scope Matching (no LLM) ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         # High-confidence matches used to bypass the LLM, but now ALL items go to LLM for risk diagnosis.
-        # Ambiguous activities → go to hybrid retrieval + LLM.
+        # Ambiguous activities ΓåÆ go to hybrid retrieval + LLM.
         deterministic_in_scope = []   # Keeping empty for prompt compatibility later
         ambiguous_activities = []      # Need ChromaDB + LLM evaluation
 
@@ -264,7 +264,7 @@ class RiskEvaluationAgent:
                     "extraction_confidence": extraction_confidence
                 })
             else:
-                # Ambiguous — needs deeper analysis
+                # Ambiguous ΓÇö needs deeper analysis
                 ambiguous_activities.append({
                     "activity": activity_name,
                     "classification_type": act_item["classification_type"],
@@ -300,7 +300,7 @@ class RiskEvaluationAgent:
                 "extraction_confidence": item.get("extraction_confidence", 100)
             })
 
-        # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
+        # STEP 5: Batch LLM Risk Evaluation ΓÇö LLM CALL #2
         _emit("Running In-Scope Evaluation Agent", 55)
         llm_risk_results = []
         if activities_with_contexts:
@@ -433,7 +433,7 @@ class RiskEvaluationAgent:
         # 5. Derived Execution State
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
         
-        # ── RISK RECONCILIATION ENGINE ───────────────────────────────────────
+        # ΓöÇΓöÇ RISK RECONCILIATION ENGINE ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
         # Deterministically resolve existing OPEN risks if their originating condition has cleared.
         db_cursor.execute("SELECT * FROM tracker_items WHERE project_id = %s AND status = 'OPEN'", (project_id,))
         # Fix: map tuples to dictionaries since db_cursor is a standard tuple cursor
@@ -457,7 +457,7 @@ class RiskEvaluationAgent:
                 status='RESOLVED', resolve_only=True
             )
             print(f"  [Reconciliation] Auto-resolved stale risk: {risk.get('title')} ({res_type})")
-        # ─────────────────────────────────────────────────────────────────────
+        # ΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇΓöÇ
 
         tracker_items = []
         out_of_scope_activities = []
@@ -468,7 +468,7 @@ class RiskEvaluationAgent:
         today = datetime.now().date()
         category_priorities = RiskConfigurationService.get_category_priorities(db_cursor)
 
-        # ── PHASE A: PRE-PROCESSING & CANDIDATE GENERATION ──
+        # ΓöÇΓöÇ PHASE A: PRE-PROCESSING & CANDIDATE GENERATION ΓöÇΓöÇ
         all_activities = []
         for i, result in enumerate(llm_risk_results):
             activity_name = result.get("activity", "Unknown")
@@ -662,7 +662,7 @@ class RiskEvaluationAgent:
                 "should_create_risk": should_create_risk
             })
 
-        # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
+        # ΓöÇΓöÇ PHASE B: DEDUPLICATION & VALIDATION GATE ΓöÇΓöÇ
         # Deduplicate activities by canonical_title before building the dependency graph
         deduplicated_activities = {}
         for activity in all_activities:
@@ -682,7 +682,7 @@ class RiskEvaluationAgent:
         enriched_activities = ValidationService.enrich_candidates(unique_activities)
 
                                 
-        # ── PHASE C: RISK SCORING & AGGREGATION ──
+        # ΓöÇΓöÇ PHASE C: RISK SCORING & AGGREGATION ΓöÇΓöÇ
         for idx, item in enumerate(enriched_activities):
             if item["status"] in ["COMPLETED", "RESOLVED"]:
                 continue
@@ -731,9 +731,6 @@ class RiskEvaluationAgent:
             
             exec_score = score_result["execution_priority_score"]
             breakdown = score_result["score_breakdown"]
-            execution_priority = score_result.get("execution_priority", 0)
-            cascade_priority = score_result.get("cascade_priority", 0)
-            schedule_priority = score_result.get("schedule_priority", 0)
             severity = RiskConfigurationService.classify_severity(exec_score, risk_thresholds)
             
             full_reasoning = item.get('reasoning', '')
@@ -755,7 +752,7 @@ class RiskEvaluationAgent:
                     "cascade_count": item["cascade_count"],
                     "blockers": item["blocked_by"],
                     "blocking_names": item["downstream_names"],
-                    "direct_blocking_names": item.get("direct_blocking_names", []),
+                    "direct_blocking_names": item["direct_blocking_names"],
                     "immediate_unlocks": item.get("immediate_unlocks", []),
                     "future_unlocks": item.get("future_unlocks", []),
                     "longest_path": item.get("longest_path", []),
@@ -763,11 +760,8 @@ class RiskEvaluationAgent:
                     "next_milestone_date": item["next_milestone_date"],
                     "days_to_next_milestone": item["days_to_next_milestone"],
                     "score_breakdown": breakdown,
-                    "execution_priority": execution_priority,
-                    "cascade_priority": cascade_priority,
-                    "schedule_priority": schedule_priority,
                     "mom_evidence": item["evidence"],
-                    "original_contract_sentence": item.get("original_contract_sentence", "")
+                    "original_contract_sentence": item["original_contract_sentence"]
                 })
             else:
                 # Correct entity_type if LLM misclassified an in-scope item as SCOPE_REQUEST
@@ -775,9 +769,8 @@ class RiskEvaluationAgent:
                     item["entity_type"] = "MILESTONE"
 
                 # FILTER: Do not surface Action Items or Pure Downstream Consequences as top-level risk cards.
-                # Exception: If an Action Item is a root cause or has downstream cascade impact, it MUST be surfaced.
                 is_standalone_risk = True
-                if item.get("entity_type") == "ACTION_ITEM" and not item.get("is_root_cause") and item.get("cascade_count", 0) == 0:
+                if item.get("entity_type") == "ACTION_ITEM":
                     is_standalone_risk = False
                 elif len(item.get("blocked_by", [])) > 0 and item.get("cascade_count", 0) == 0 and not item.get("is_root_cause"):
                     is_standalone_risk = False
@@ -807,17 +800,14 @@ class RiskEvaluationAgent:
                     "risk_score": exec_score,
                     "reasoning": full_reasoning,
                     "blocking_names": item["downstream_names"],
-                    "direct_blocking_names": item.get("direct_blocking_names", []),
+                    "direct_blocking_names": item["direct_blocking_names"],
                     "immediate_unlocks": item["immediate_unlocks"],
                     "future_unlocks": item["future_unlocks"],
                     "next_milestone_name": item["next_milestone_name"],
                     "days_to_next_milestone": item["days_to_next_milestone"],
                     "score_breakdown": breakdown,
-                    "execution_priority": execution_priority,
-                    "cascade_priority": cascade_priority,
-                    "schedule_priority": schedule_priority,
                     "mom_evidence": item["evidence"],
-                    "original_contract_sentence": item.get("original_contract_sentence", ""),
+                    "original_contract_sentence": item["original_contract_sentence"],
                     "recommended_action": item["recommended_action"]
                 })
 
@@ -836,10 +826,6 @@ class RiskEvaluationAgent:
                         if item_evidence and item_evidence not in new_evidence:
                             new_evidence += f"\n\n{item_evidence}"
                         item['mom_evidence'] = new_evidence
-                        # Inherit the highest priority scores
-                        item['execution_priority'] = max(item.get('execution_priority', 0), existing.get('execution_priority', 0))
-                        item['cascade_priority'] = max(item.get('cascade_priority', 0), existing.get('cascade_priority', 0))
-                        item['schedule_priority'] = max(item.get('schedule_priority', 0), existing.get('schedule_priority', 0))
                         merged[key] = item
                     else:
                         existing_evidence = existing.get('mom_evidence', '')
@@ -847,34 +833,9 @@ class RiskEvaluationAgent:
                         if item_evidence and item_evidence not in existing_evidence:
                             existing_evidence += f"\n\n{item_evidence}"
                         existing['mom_evidence'] = existing_evidence
-                        # Inherit the highest priority scores
-                        existing['execution_priority'] = max(existing.get('execution_priority', 0), item.get('execution_priority', 0))
-                        existing['cascade_priority'] = max(existing.get('cascade_priority', 0), item.get('cascade_priority', 0))
-                        existing['schedule_priority'] = max(existing.get('schedule_priority', 0), item.get('schedule_priority', 0))
                         
             final_list = list(merged.values())
             for item in final_list:
-                
-                # Apply PMO UI Labels (Category overrides)
-                e_type = item.get("entity_type", "")
-                ep = item.get("execution_priority", 0)
-                cp = item.get("cascade_priority", 0)
-                sp = item.get("schedule_priority", 0)
-                
-                if e_type in ["SCOPE_REQUEST", "CHANGE_REQUEST"]:
-                    item["category"] = "SCOPE_CHANGE"
-                elif ep >= 90:
-                    item["category"] = "EXECUTION_BLOCKER"
-                elif cp > 0:
-                    item["category"] = "CRITICAL_PATH_RISK"
-                elif sp >= 50:
-                    item["category"] = "SCHEDULE_RISK"
-                elif e_type == "ACTION_ITEM":
-                    item["category"] = "ACTION_ITEM"
-                else:
-                    # Fallback to whatever was originally assigned
-                    pass
-
                 formatted = RiskScoringEngine.format_reasoning(
                     score=item.get("risk_score"),
                     severity=item.get("risk") or item.get("risk_level"),
@@ -895,10 +856,7 @@ class RiskEvaluationAgent:
                     longest_path=item.get("longest_path"),
                     next_milestone_name=item.get("next_milestone_name"),
                     next_milestone_date=item.get("next_milestone_date"),
-                    days_to_next_milestone=item.get("days_to_next_milestone"),
-                    execution_priority=item.get("execution_priority", 0),
-                    cascade_priority=item.get("cascade_priority", 0),
-                    schedule_priority=item.get("schedule_priority", 0)
+                    days_to_next_milestone=item.get("days_to_next_milestone")
                 )
                 
                 # The Score Breakdown is already included by RiskScoringEngine.format_reasoning
@@ -934,7 +892,7 @@ class RiskEvaluationAgent:
         out_of_scope_result = {"activities": out_of_scope_activities}
         timeline_result = {"deliverables": timeline_deliverables}
 
-        # STEP 7: Aggregation — LLM CALL #3
+        # STEP 7: Aggregation ΓÇö LLM CALL #3
         _emit("Calculating Risk Score", 80)
         from core.prompts import get_risk_aggregation_prompt
         aggregation_prompt = get_risk_aggregation_prompt(
@@ -1023,7 +981,7 @@ class RiskEvaluationAgent:
                     ref_id = act_id
                     break
 
-            # Phase 2 scores already calculated — read directly from the item
+            # Phase 2 scores already calculated ΓÇö read directly from the item
             item_risk_score = oos_item.get('risk_score', 50)
             item_risk_level = oos_item.get('risk_level', 'MEDIUM')
             confidence_val  = oos_item.get('confidence', 70) / 100.0
@@ -1067,7 +1025,7 @@ class RiskEvaluationAgent:
                     ref_id = act_id
                     break
 
-            # Phase 2 scores already calculated — read directly from item
+            # Phase 2 scores already calculated ΓÇö read directly from item
             item_risk_score = deliv.get('risk_score', 40)
             item_risk_level = deliv.get('risk', 'MEDIUM')
             full_reasoning  = deliv.get('reasoning', f"Deliverable: {deliv_name}")

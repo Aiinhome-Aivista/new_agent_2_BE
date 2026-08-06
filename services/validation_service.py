@@ -32,8 +32,13 @@ class ValidationService:
             
             if status in ['COMPLETED', 'RESOLVED']:
                 risk_cat = "RESOLVED"
-            elif entity_type in ['CHANGE_REQUEST', 'SCOPE_REQUEST', 'ACTION_ITEM', 'ISSUE']:
+            elif entity_type in ['CHANGE_REQUEST', 'SCOPE_REQUEST', 'ISSUE']:
                 risk_cat = entity_type
+            elif entity_type == 'ACTION_ITEM':
+                if cascade_count > 0:
+                    risk_cat = "EXECUTION_BLOCKER"
+                else:
+                    risk_cat = "ACTION_ITEM"
             elif 'CHANGE_REQUEST' in cand.get('risk_cat', ''):
                 risk_cat = "CHANGE_REQUEST"
             elif is_root_cause and cascade_count > 0:

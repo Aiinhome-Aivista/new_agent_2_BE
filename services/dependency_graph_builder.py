@@ -31,10 +31,12 @@ class DependencyGraphBuilder:
                     blocker_lower = blocker.lower().strip()
                     matched_name = blocker
                     # Try to find a matching candidate
+                    found = False
                     for cand_name in name_to_candidate.keys():
                         cand_name_lower = cand_name.lower().strip()
                         if blocker_lower in cand_name_lower or cand_name_lower in blocker_lower:
                             matched_name = cand_name
+                            found = True
                             break
                     graph[matched_name].append(name)
                     # Also update the original list so the UI shows the canonical connection
@@ -42,6 +44,32 @@ class DependencyGraphBuilder:
                         # Replace in place safely
                         idx = cand['blocked_by'].index(blocker)
                         cand['blocked_by'][idx] = matched_name
+                        
+                    # If this blocker is purely textual and doesn't exist as a candidate, auto-spawn it as an ACTION_ITEM
+                    if not found and matched_name not in name_to_candidate:
+                        name_to_candidate[matched_name] = {
+                            "activity": matched_name,
+                            "canonical_title": matched_name,
+                            "entity_type": "ACTION_ITEM",
+                            "status": "OPEN", # Active operational task
+                            "blocked_by": [],
+                            "evidence": f"Identified as a blocker for {name}.",
+                            "reasoning": f"This operational action item is preventing progress on {name}.",
+                            "recommended_action": f"Resolve this item to immediately unblock {name}.",
+                            "should_create_risk": True,
+                            "is_scope_creep": False,
+                            "llm_confidence": 100.0,
+                            "progress": 0,
+                            "p_date_str": None,
+                            "days_overdue": 0,
+                            "days_until_due": 0,
+                            "cascade_count": 0,
+                            "is_root_cause": True,
+                            "next_milestone_name": None,
+                            "next_milestone_date": None,
+                            "days_to_next_milestone": None,
+                            "original_contract_sentence": ""
+                        }
                     
         # Traverse graph to find all downstream elements
         def get_all_downstream(start_node):

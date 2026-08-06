@@ -26,20 +26,20 @@ class RiskRankingEngine:
         """
 
         def sort_key(item):
-            cat = item.get("category", "GENERAL")
-
-            # Use CATEGORY_TIER first; fall back to the DB priority table,
-            # then to a safe default of 10.
-            tier = cls.CATEGORY_TIER.get(
-                cat,
-                category_priorities.get(cat, 10)
-            )
-
-            exec_score  = item.get("execution_priority_score", 0)
-            cascade     = item.get("cascade_count", 0)
-
-            # Return (-score, tier, -cascade) so score is the primary driver
-            return (-exec_score, tier, -cascade)
+            # 1. Execution Priority (Highest first)
+            exec_pri = item.get("execution_priority", 0)
+            
+            # 2. Cascade Priority (Highest first)
+            casc_pri = item.get("cascade_priority", 0)
+            
+            # 3. Schedule Priority (Highest first)
+            sched_pri = item.get("schedule_priority", 0)
+            
+            # 4. Risk Score (Highest first) - Legacy tiebreaker
+            risk_score = item.get("execution_priority_score", 0)
+            
+            # Return negative values for DESC sorting
+            return (-exec_pri, -casc_pri, -sched_pri, -risk_score)
 
         eligible_items = [
             i for i in tracker_items

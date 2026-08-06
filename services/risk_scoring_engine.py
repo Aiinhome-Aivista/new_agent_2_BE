@@ -65,6 +65,50 @@ class RiskScoringEngine:
                 score_breakdown[param_code] = round(pts)
                 total_score += pts
 
+        # --- NEW PRIORITY ENGINE ---
+        
+        # 1. Execution Priority
+        execution_priority = 0
+        if category in ["ROOT_CAUSE_BLOCKER", "EXECUTION_BLOCKER"]:
+            execution_priority = 100
+        elif is_root_cause and cascade_count > 0:
+            execution_priority = 100
+        elif cascade_count > 0 and len(blocked_by) == 0:
+            execution_priority = 100
+        elif cascade_count > 0:
+            execution_priority = 60
+        elif is_root_cause:
+            execution_priority = 90
+            
+        # 2. Cascade Priority
+        cascade_priority = cascade_count
+        
+        # 3. Schedule Priority
+        schedule_priority = 0
+        days_to_use = None
+        if days_until_due is not None and days_until_due < 9999:
+            days_to_use = days_until_due
+        elif days_to_next_milestone is not None:
+            days_to_use = days_to_next_milestone
+            
+        if days_to_use is not None:
+            if days_to_use <= 0:
+                schedule_priority = 100
+            elif days_to_use <= 7:
+                schedule_priority = 90
+            elif days_to_use <= 14:
+                schedule_priority = 80
+            elif days_to_use <= 30:
+                schedule_priority = 60
+            elif days_to_use <= 60:
+                schedule_priority = 40
+            else:
+                schedule_priority = 20
+        else:
+            schedule_priority = 10
+
+        # Legacy score breakdown calculation for backwards compatibility (can be phased out later)
+
         # EXECUTION_UNLOCK_IMPACT (30)
         # Ratio based on immediate downstream blocks. Unblocking 1 gives 50%, 2 gives 75%, >=3 gives 100%
         has_immediate = bool(immediate_unlocks)
@@ -149,9 +193,15 @@ class RiskScoringEngine:
         
         final_score = min(round(total_score), 100)
         
+        # Final result wrapper
         return {
             "execution_priority_score": final_score,
-            "score_breakdown": score_breakdown
+            "score": total_score,
+            "execution_priority": execution_priority,
+            "cascade_priority": cascade_priority,
+            "schedule_priority": schedule_priority,
+            "score_breakdown": score_breakdown,
+            "is_root_cause": is_root_cause
         }
 
     @classmethod
@@ -177,6 +227,9 @@ class RiskScoringEngine:
         next_milestone_name: str = None,
         next_milestone_date: str = None,
         days_to_next_milestone: int = None,
+        execution_priority: int = 0,
+        cascade_priority: int = 0,
+        schedule_priority: int = 0,
     ) -> str:
         """
         Formats the full evidence-backed reasoning string stored in tracker_items.reasoning
@@ -281,15 +334,47 @@ class RiskScoringEngine:
                 lines.append(f"• {b}")
             lines.append("")
 
-        # Score Breakdown
+        # Multi-Dimensional Priority Engine
         lines.append("------------------------")
-        lines.append("Score Breakdown")
-        lines.append("")
-        if breakdown:
-            for k, v in breakdown.items():
-                lines.append(f"{k.replace('_', ' ').title().ljust(25)} {v}")
+        
+        def render_stars(val):
+            if val >= 90: return "★★★★★"
+            elif val >= 70: return "★★★★☆"
+            elif val >= 50: return "★★★☆☆"
+            elif val >= 30: return "★★☆☆☆"
+            elif val > 0: return "★☆☆☆☆"
+            else: return "☆☆☆☆☆"
+            
+        lines.append("Execution Priority")
+        lines.append(render_stars(execution_priority))
+        if execution_priority >= 90:
+            lines.append("Blocks the next scheduled activity")
+        elif execution_priority > 0:
+            lines.append("Blocks downstream work")
         else:
-            lines.append("• (No risk signals detected)")
+            lines.append("Does not block immediate work")
+        lines.append("")
+        
+        lines.append("Cascade Impact")
+        # For cascade priority, scale to stars (e.g. 1 = 20, 5+ = 100)
+        cascade_scaled = min(cascade_priority * 20, 100)
+        lines.append(render_stars(cascade_scaled))
+        if cascade_priority > 0:
+            lines.append(f"Blocks {cascade_priority} downstream dependency/dependencies")
+        else:
+            lines.append("No downstream cascade impact")
+        lines.append("")
+        
+        lines.append("Schedule Urgency")
+        lines.append(render_stars(schedule_priority))
+        if schedule_priority >= 80:
+            lines.append("Start date is imminent or overdue")
+        elif schedule_priority >= 50:
+            lines.append("Start date is approaching")
+        elif schedule_priority > 10:
+            lines.append("Sufficient float in schedule")
+        else:
+            lines.append("No schedule urgency")
         lines.append("")
 
         if original_contract_sentence:
