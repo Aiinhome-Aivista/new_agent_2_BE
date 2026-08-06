@@ -9,7 +9,7 @@ def test():
     db = get_db_connection()
     cursor = db.cursor(dictionary=True)
     try:
-        cursor.execute("SELECT storage_key, document_name FROM documents WHERE id = 166")
+        cursor.execute("SELECT storage_key, document_name FROM documents WHERE id = 14")
         doc = cursor.fetchone()
         import os
         ext = os.path.splitext(doc["storage_key"])[1].lower()
@@ -19,7 +19,7 @@ def test():
         print(f"DEBUG: doc_text snippet = {doc_text[:200]}")
         
         # We need to hook the RiskEvaluationAgent to print what's going on!
-        result = RiskEvaluationAgent.evaluate_document(69, 166, doc_text, cursor)
+        result = RiskEvaluationAgent.evaluate_document(8, 14, doc_text, cursor)
         print("EVALUATION RESULT:")
         print(json.dumps(result, indent=2))
     except Exception as e:

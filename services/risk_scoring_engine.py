@@ -34,114 +34,100 @@ class RiskScoringEngine:
         critical_path: bool = False,
         distance_to_next_executable: int = 999,
         earliest_root_cause: bool = False,
+        dependency_owner: str = "Internal",
+        resolution_effort: str = "M",
+        business_criticality: str = "Medium",
+        business_phase: str = "Execution",
+        criticality_score: float = 0.0,
+        parallel_stream: str = "Stream 1"
     ) -> dict:
         """
-        Calculates Execution Priority and Final Risk Score using dynamic PMO weights.
+        Dual Metric Architecture: Calculates Execution Priority AND Risk Severity separately.
         """
         execution_reasons = []
         
-        # 1. Dynamic Execution Priority Weights
-        # -------------------------------------
-        weight_root_cause = 40 if earliest_root_cause else 0
+        # 1. Effort Multiplier
+        effort_mult = {"XS": 1.5, "S": 1.2, "M": 1.0, "L": 0.8, "XL": 0.5}.get(resolution_effort, 1.0)
+        
+        # 2. Execution Band Determination
+        band = 7
+        band_name = "Change Request"
+        min_prio, max_prio = 0, 20
+
+        is_waiting = len(blocked_by) > 0 and not earliest_root_cause
+        
+        if is_scope_creep or category == "CHANGE_REQUEST":
+            band = 7
+            band_name = "Change Request"
+            min_prio, max_prio = 0, 20
+        elif earliest_root_cause and (criticality_score >= 75.0 or execution_unlock_count >= 2 or blocked_work_count >= 3):
+            band = 1
+            band_name = "Immediate Root Cause"
+            min_prio, max_prio = 90, 100
+        elif earliest_root_cause and execution_unlock_count > 0:
+            band = 2
+            band_name = "Execution Blocker"
+            min_prio, max_prio = 80, 89
+        elif is_waiting and criticality_score >= 50.0:
+            band = 3
+            band_name = "Critical Path Waiting"
+            min_prio, max_prio = 70, 79
+        elif not is_waiting and len(blocked_by) == 0 and blocked_work_count == 0:
+            band = 4
+            band_name = "Independent Execution"
+            min_prio, max_prio = 60, 69
+        elif is_waiting and blocked_work_count > 0:
+            band = 5
+            band_name = "Waiting Dependency"
+            min_prio, max_prio = 45, 59
+        elif is_waiting and blocked_work_count == 0:
+            band = 6
+            band_name = "Downstream Consequence"
+            min_prio, max_prio = 25, 44
+        else:
+            band = 4
+            band_name = "Independent Risk"
+            min_prio, max_prio = 60, 69
+
+        # PMO Reasoning for UI
         if earliest_root_cause:
             execution_reasons.append("✓ Earliest Root Cause")
-            
-        weight_blocked_work = min(blocked_work_count * 5, 20)
-        if blocked_work_count > 0:
-            execution_reasons.append(f"✓ Blocked Work: {blocked_work_count} downstream tasks")
-            
-        weight_unlock = min(execution_unlock_count * 10, 20)
         if execution_unlock_count > 0:
-            execution_reasons.append(f"✓ Immediate Unlock: Will unblock {execution_unlock_count} tasks immediately")
-            
-        weight_critical = 0
-        if critical_chain:
-            weight_critical = 15
-            execution_reasons.append("✓ Critical Chain: Impacts terminal milestone")
-        elif critical_path:
-            weight_critical = 10
-            execution_reasons.append("✓ Critical Path: Longest sequence of dependent tasks")
+            execution_reasons.append(f"✓ Unlocks {execution_unlock_count} immediate tasks")
+        if cascade_depth > 0:
+            execution_reasons.append(f"✓ Cascade Depth: {cascade_depth}")
+        if criticality_score >= 75.0:
+            execution_reasons.append("✓ On the Critical Path to Go-Live")
+        if resolution_effort in ["XS", "S"]:
+            execution_reasons.append("✓ Quick Resolution Effort")
 
-        weight_dep_source = 0
-        if earliest_root_cause:
-            if dependency_source in ["CUSTOMER", "VENDOR", "SECURITY"]:
-                weight_dep_source = 15
-                execution_reasons.append(f"✓ External Blocker ({dependency_source})")
-            elif dependency_source == "PMO":
-                weight_dep_source = 10
-                execution_reasons.append(f"✓ Internal Blocker (PMO)")
-            else:
-                weight_dep_source = 5
-                execution_reasons.append(f"✓ Engineering Blocker")
-
-        # Independent Task vs Waiting vs Pure Downstream
-        weight_base = 0
-        if earliest_root_cause:
-            pass # handled above
-        elif len(blocked_by) == 0 and blocked_work_count == 0 and category != "CHANGE_REQUEST":
-            weight_base = 30
-            execution_reasons.append("✓ Independent Task")
-        elif len(blocked_by) > 0 and blocked_work_count > 0:
-            weight_base = 20
-            execution_reasons.append("✓ Waiting Dependency")
-        elif len(blocked_by) > 0 and blocked_work_count == 0:
-            weight_base = 10
-            execution_reasons.append("✓ Pure Downstream Consequence")
-        elif category == "CHANGE_REQUEST":
-            weight_base = 5
-            execution_reasons.append("✓ Scope Change Request")
-
-        execution_priority = weight_root_cause + weight_blocked_work + weight_unlock + weight_critical + weight_dep_source + weight_base
-        execution_priority = min(execution_priority, 100)
-
-        # 2. Schedule Urgency / Impact
-        schedule_impact = 0
-        days_to_use = days_to_next_milestone if days_to_next_milestone is not None else days_until_due
+        # 3. Execution Priority (Driven by unlocks, cascade depth, and effort)
+        base_priority_points = (execution_unlock_count * 5) + (cascade_depth * 3) + (criticality_score * 0.2)
+        adjusted_points = base_priority_points * effort_mult
         
+        band_range = max_prio - min_prio
+        scaled_addition = min(adjusted_points, band_range)
+        
+        execution_priority = min_prio + scaled_addition
+        execution_priority = max(min(round(execution_priority), 100), 0)
+
+        # 4. Risk Severity (Driven by Schedule Urgency, Business Criticality, and Owner)
+        days_to_use = days_to_next_milestone if days_to_next_milestone is not None else days_until_due
+        schedule_impact = 0
         if days_to_use is not None:
-            if days_to_use <= 0:
-                schedule_impact = 100
-                msg = f"({next_milestone_name})" if next_milestone_name else ""
-                execution_reasons.append(f"✓ Schedule: Blocks overdue milestone {msg}")
-            elif days_to_use <= 7:
-                schedule_impact = 80
-                msg = f"({next_milestone_name})" if next_milestone_name else ""
-                execution_reasons.append(f"✓ Schedule: Blocks upcoming milestone {msg}")
-            elif days_to_use <= 14:
-                schedule_impact = 60
-            elif days_to_use <= 30:
-                schedule_impact = 40
-            else:
-                schedule_impact = 20
+            if days_to_use <= 0: schedule_impact = 100
+            elif days_to_use <= 7: schedule_impact = 80
+            elif days_to_use <= 14: schedule_impact = 60
+            elif days_to_use <= 30: schedule_impact = 40
+            else: schedule_impact = 20
             
-        # 3. Business Impact
-        b_score_ratio = 0.0
-        if business_impact:
-            impact_key = business_impact.upper()
-            fallbacks = {"CRITICAL": 1.0, "HIGH": 0.8, "MEDIUM": 0.5, "LOW": 0.2}
-            b_score_ratio = fallbacks.get(impact_key, 0.0)
-            
+        b_score_ratio = {"Mission Critical": 1.0, "High": 0.8, "Medium": 0.5, "Low": 0.2}.get(business_criticality, 0.5)
         business_impact_score = b_score_ratio * 100
         
-        confidence_score = confidence * 100 if confidence <= 1.0 else confidence
-        evidence_score = 100 if status in ["BLOCKED", "DELAYED"] else 60
+        owner_impact = 100 if dependency_owner in ["Customer", "Vendor"] else 50
         
-        # RISK SCORE ENGINE (60/15/10/10/5 weights)
-        final_score = (
-            (execution_priority * 0.60) +
-            (schedule_impact * 0.15) +
-            (business_impact_score * 0.10) +
-            (evidence_score * 0.10) +
-            (confidence_score * 0.05)
-        )
-        
-        # Enforce ranking rules (Execution Blockers must surface at the top of severity too)
-        if earliest_root_cause and dependency_source in ["CUSTOMER", "VENDOR"]:
-            final_score = max(final_score, 90)
-        elif earliest_root_cause:
-            final_score = max(final_score, 80)
-            
-        final_score = min(round(final_score), 100)
+        risk_severity = (schedule_impact * 0.40) + (business_impact_score * 0.40) + (owner_impact * 0.20)
+        risk_severity = max(min(round(risk_severity), 100), 0)
 
         # Remove duplicate execution reasons
         unique_reasons = []
@@ -150,14 +136,20 @@ class RiskScoringEngine:
                 unique_reasons.append(r)
 
         return {
-            "execution_priority_score": final_score,
-            "score": final_score,
             "execution_priority": execution_priority,
+            "risk_severity": risk_severity,
             "cascade_priority": cascade_depth,
             "schedule_priority": schedule_impact,
-            "score_breakdown": {},
+            "score_breakdown": {
+                "Execution Band": band_name,
+                "Criticality Score": round(criticality_score, 1),
+                "Resolution Effort": resolution_effort,
+                "Business Criticality": business_criticality,
+                "Dependency Owner": dependency_owner
+            },
             "earliest_root_cause": earliest_root_cause,
-            "execution_reasons": unique_reasons
+            "execution_reasons": unique_reasons,
+            "execution_band_name": band_name
         }
 
     @classmethod
@@ -229,10 +221,11 @@ class RiskScoringEngine:
         lines.append("Execution Chain")
         lines.append("")
         
-        raw_chain = longest_path if longest_path else (immediate_unlocks or []) + (future_unlocks or [])
+        # Only use longest_path which is strictly ordered by graph traversal
+        raw_chain = longest_path if longest_path else []
         chain_items = []
         
-        for item in (raw_chain or []):
+        for item in raw_chain:
             if not item:
                 continue
             name = None
@@ -265,9 +258,21 @@ class RiskScoringEngine:
                     lines.append("↓")
             
             lines.append("")
-            lines.append(f"Total Unlocked Milestones: {len(unique_chain)}")
+            immediate_count = len(immediate_unlocks) if immediate_unlocks else 0
+            lines.append("Immediate Unlock")
+            lines.append(f"{immediate_count}")
+            lines.append("")
+            lines.append("Cascade Impact")
+            lines.append(f"{cascade_count}")
             
-        lines.append("")
+        # Score Breakdown
+        if breakdown:
+            lines.append("------------------------")
+            lines.append("Score Breakdown")
+            for k, v in breakdown.items():
+                k_title = k.replace("_", " ").title()
+                lines.append(f"{k_title}: {v}")
+            lines.append("")
             
         if next_milestone_name:
             lines.append("------------------------")

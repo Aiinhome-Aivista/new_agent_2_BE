@@ -36,7 +36,9 @@ def truncate_all_except_users():
             'risk_threshold_config',
             'business_rule_config',
             'impact_matrix',
-            'alert_rule_config'
+            'alert_rule_config',
+            'progress_status_config',
+            'progress_source_config'
         ]
         for table in tables:
             if table.lower() not in preserve_tables:

@@ -114,6 +114,17 @@ class RiskEvaluationAgent:
     DETERMINISTIC_CONFIDENCE_THRESHOLD = 85
 
     @classmethod
+    def _pm_decision(cls, priority: int, owner: str) -> str:
+        if priority >= 80:
+            if owner == "Customer": return "Escalate to customer today"
+            elif owner == "Vendor": return "Review vendor SLA and follow up"
+            else: return "Assign internal engineering resource ASAP"
+        elif priority >= 60:
+            return "Monitor and align resources for upcoming sprint"
+        else:
+            return "Track execution progress"
+
+    @classmethod
     def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
                           activity_map: dict = None, request_map: dict = None,
                           emit: Optional[Callable[[str, int], None]] = None) -> dict:
@@ -402,7 +413,7 @@ class RiskEvaluationAgent:
             progress_records = DeliverableTimelineEvaluationAgent.evaluate_progress(
                 approved_baseline_items=scope_items, 
                 document_text=document_text, 
-                risk_eval_output=[]  # Running before risk engine now
+                risk_eval_output=[]  # Running without risk engine bias to capture PROGRESS_UPDATEs
             )
             pending_progress_records = progress_records
         except Exception as e:
@@ -510,7 +521,7 @@ class RiskEvaluationAgent:
                     db_cursor, project_id, document_id, "DEPENDENCY",
                     False, 0, 'LOW', 'GENERAL',
                     1.0, f"Captured as DEPENDENCY (Status: {status})", False,
-                    title=canonical_title, reference_id=existing_ref_id, status='OPEN', risk_source='OBSERVED'
+                    title=canonical_title, reference_id=existing_ref_id, status='NOT_STARTED', risk_source='OBSERVED'
                 )
                 print(f"  [Gate] Bypassed Risk Engine for non-blocking DEPENDENCY: {canonical_title}")
                 continue
@@ -729,8 +740,8 @@ class RiskEvaluationAgent:
                 days_overdue=item.get("days_overdue", 0),
                 days_until_due=item.get("days_until_due", 999),
                 is_scope_creep=item.get("is_scope_creep", False),
-                confidence=1.0,
-                business_impact=b_impact,
+                confidence=item.get("llm_confidence", 1.0),
+                business_impact=item.get("business_impact", "MEDIUM"),
                 params=risk_params,
                 impact_matrix=impact_matrix,
                 item_name=item["canonical_title"],
@@ -742,15 +753,23 @@ class RiskEvaluationAgent:
                 days_to_next_milestone=item.get("days_to_next_milestone", None),
                 critical_path=item.get("critical_path", False),
                 distance_to_next_executable=item.get("distance_to_next_executable", 999),
+                dependency_owner=item.get("dependency_owner", "Internal"),
+                resolution_effort=item.get("resolution_effort", "M"),
+                business_criticality=item.get("business_criticality", "Medium"),
+                business_phase=item.get("business_phase", "Execution"),
+                criticality_score=item.get("criticality_score", 0.0),
+                parallel_stream=item.get("parallel_stream", "Stream 1")
             )
             
-            exec_score = score_result["execution_priority_score"]
+            exec_prio = score_result["execution_priority"]
+            risk_sev = score_result["risk_severity"]
+            
             breakdown = score_result["score_breakdown"]
-            execution_priority = score_result.get("execution_priority", 0)
+            execution_priority = exec_prio
             cascade_priority = score_result.get("cascade_priority", 0)
             schedule_priority = score_result.get("schedule_priority", 0)
             execution_reasons = score_result.get("execution_reasons", [])
-            severity = RiskConfigurationService.classify_severity(exec_score, risk_thresholds)
+            severity = RiskConfigurationService.classify_severity(risk_sev, risk_thresholds)
             
             full_reasoning = item.get('reasoning', '')
             
@@ -762,7 +781,7 @@ class RiskEvaluationAgent:
                     "reason": full_reasoning,
                     "similar_deliverable": item["canonical_title"],
                     "confidence": 100,
-                    "risk_score": exec_score,
+                    "risk_score": risk_sev,
                     "risk_level": severity,
                     "category": item["risk_cat"],
                     "current_status": item["status"],
@@ -800,7 +819,7 @@ class RiskEvaluationAgent:
                     "delay_days": item["days_overdue"],
                     "blockers": item["blocked_by"],
                     "confidence": item["llm_confidence"],
-                    "execution_priority_score": exec_score,
+                    "execution_priority_score": exec_prio,
                     "dependency_status": item["risk_cat"],
                     "category": item["risk_cat"],
                     "risk_source": "DERIVED" if item["risk_cat"] in ["EXECUTION_BLOCKER", "ROOT_CAUSE", "TECHNICAL_DEPENDENCY"] else "OBSERVED",
@@ -809,7 +828,7 @@ class RiskEvaluationAgent:
                     "days_overdue": item["days_overdue"],
                     "days_until_due": item["days_until_due"],
                     "risk": severity,
-                    "risk_score": exec_score,
+                    "risk_score": risk_sev,
                     "reasoning": full_reasoning,
                     "blocking_names": item["downstream_names"],
                     "direct_blocking_names": item.get("direct_blocking_names", []),
@@ -821,10 +840,18 @@ class RiskEvaluationAgent:
                     "execution_priority": execution_priority,
                     "cascade_priority": cascade_priority,
                     "schedule_priority": schedule_priority,
+                    "execution_reasons": execution_reasons,
                     "mom_evidence": item["evidence"],
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
-                    "recommended_action": item["recommended_action"]
+                    "recommended_action": item.get("recommended_action") or cls._pm_decision(execution_priority, item.get("dependency_owner", "Internal")),
+                    "business_phase": item.get("business_phase"),
+                    "dependency_owner": item.get("dependency_owner"),
+                    "parallel_stream": item.get("parallel_stream")
                 })
+
+        # PM Decision Engine Helper
+        # ... Wait, I can't easily inject a class method here if I just append. I will inject a local helper above the loop, or use a lambda.
+        # Actually, let's just do it inline here for safety since I am replacing inside the loop.
 
         # Deduplicate tracker_items by deliverable name
         def dedup_items(items_list, key_field):
@@ -869,7 +896,55 @@ class RiskEvaluationAgent:
                         existing['execution_reasons'] = merged_reasons
                         
             final_list = list(merged.values())
-            for item in final_list:
+            
+            # EXECUTION QUEUE BUILDER (Strict Graph Traversal)
+            root_causes = [item for item in final_list if item.get('is_root_cause', False)]
+            effort_rank = {"XS": 5, "S": 4, "M": 3, "L": 2, "XL": 1}
+            root_causes.sort(key=lambda x: (
+                x.get('cascade_count', 0),
+                effort_rank.get(x.get('score_breakdown', {}).get('Resolution Effort', 'M'), 3)
+            ), reverse=True)
+            
+            queue = []
+            visited = set()
+            item_map = {item['deliverable']: item for item in final_list}
+            
+            def traverse(node_name):
+                if node_name in visited or node_name not in item_map:
+                    return
+                queue.append(item_map[node_name])
+                visited.add(node_name)
+                direct_blocks = item_map[node_name].get('direct_blocking_names', [])
+                direct_blocks_sorted = sorted(
+                    [b for b in direct_blocks if b in item_map],
+                    key=lambda b: item_map[b].get('cascade_count', 0),
+                    reverse=True
+                )
+                for b in direct_blocks_sorted:
+                    traverse(b)
+
+            for rc in root_causes:
+                traverse(rc['deliverable'])
+                
+            remaining = [item for item in final_list if item['deliverable'] not in visited]
+            remaining.sort(key=lambda x: (
+                x.get('cascade_count', 0),
+                effort_rank.get(x.get('score_breakdown', {}).get('Resolution Effort', 'M'), 3)
+            ), reverse=True)
+            queue.extend(remaining)
+            
+            final_list = queue
+            
+            for i, item in enumerate(final_list):
+                rank = i + 1
+                new_priority = max(100 - ((rank - 1) * 3), 10)
+                
+                # Override the point-based priority with deterministic queue priority
+                if item.get('is_root_cause'):
+                    new_priority = max(new_priority, 90) # Root causes always at least 90
+                
+                item['execution_priority'] = new_priority
+                item['recommended_action'] = cls._pm_decision(new_priority, item.get('dependency_owner', 'Internal'))
                 
                 # Apply PMO UI Labels (Category overrides)
                 e_type = item.get("entity_type", "")
@@ -888,7 +963,6 @@ class RiskEvaluationAgent:
                 elif e_type == "ACTION_ITEM":
                     item["category"] = "ACTION_ITEM"
                 else:
-                    # Fallback to whatever was originally assigned
                     pass
 
                 formatted = RiskScoringEngine.format_reasoning(
@@ -917,12 +991,9 @@ class RiskEvaluationAgent:
                     schedule_priority=item.get("schedule_priority", 0),
                     execution_reasons=item.get("execution_reasons", [])
                 )
-                
-                # The Score Breakdown is already included by RiskScoringEngine.format_reasoning
                     
                 original_reasoning = item.get('reasoning') or item.get('reason', '')
                 if original_reasoning:
-                    # Clean up duplicate 'Description:' prefixes if any
                     original_reasoning = original_reasoning.replace("Description:\n", "").replace("Description:\r\n", "")
                     formatted = f"Why is this a risk?\n{original_reasoning}\n\n------------------------\n{formatted}"
                     
@@ -1185,6 +1256,44 @@ class RiskEvaluationAgent:
                 
         # General Risks remain open unless mentioned (handled by not updating them)
 
+        import json
+        db_cursor.execute("""
+            INSERT INTO risk_evaluations 
+            (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            project_id, document_id, risk_score, overall_risk, summary,
+            json.dumps(recommendations), json.dumps(sub_agent_results)
+        ))
+        
+        risk_eval_id = db_cursor.lastrowid
+
+        # Determine baseline version for progress tracking
+        db_cursor.execute("SELECT version FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
+        bv_row = db_cursor.fetchone()
+        baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
+
+        # Deliverable Progress: now insert with the valid risk_eval_id
+        from repositories.baseline_repository import BaselineRepository
+        for pr in pending_progress_records:
+            try:
+                BaselineRepository.insert_deliverable_progress(
+                    db=db_cursor._connection,
+                    project_id=project_id,
+                    scope_item_id=pr.get("scope_item_id"),
+                    source_document_id=document_id,
+                    risk_evaluation_id=risk_eval_id,
+                    baseline_version=baseline_version,
+                    status_code=pr.get("progress_status", "UNKNOWN"),
+                    progress_percentage=pr.get("progress_percentage"),
+                    execution_summary=pr.get("execution_summary", ""),
+                    dependencies=pr.get("dependencies", []),
+                    resolved_items=extraction_result.get("resolved_items", []),
+                    confidence=pr.get("confidence", 1.0),
+                    evidence_text=pr.get("evidence_text", "")
+                )
+            except Exception as e:
+                print(f"Warning: Could not persist deliverable progress record: {e}")
 
         _emit("Completed", 100)
         return {

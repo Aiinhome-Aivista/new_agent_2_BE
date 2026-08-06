@@ -23,7 +23,7 @@ class TrackerAuditAgent:
                              is_out_of_scope: bool, risk_score: int, risk_level: str,
                              risk_category: str, confidence: float, reasoning: str,
                              requires_escalation: bool, title: str = None, reference_id: int = None,
-                             priority_order: int = None, status: str = 'OPEN',
+                             priority_order: int = None, status: str = 'NOT_STARTED',
                              resolve_only: bool = False, risk_source: str = 'OBSERVED',
                              recommended_action: str = None) -> int:
         """

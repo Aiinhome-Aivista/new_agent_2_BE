@@ -3,155 +3,153 @@ import collections
 class DependencyGraphBuilder:
     @classmethod
     def build_and_enrich(cls, candidates: list) -> list:
-        """
-        Builds a deterministic dependency graph mapping blocked relationships.
-        Calculates PMO Execution Metrics:
-        - cascade_depth: Length of the longest path downstream
-        - blocked_work_count: Total unique downstream items
-        - execution_unlock_count: Items that become immediately executable
-        - critical_chain: Whether this path reaches a terminal milestone
-        - dependency_source: CUSTOMER, ENGINEERING, VENDOR, SECURITY, PMO
-        - earliest_root_cause: True if this item has downstream impacts but no active upstream blockers
-        """
+        # ALIAS REGISTRY
+        alias_registry = {
+            "credentials": "Production CRM API Credentials",
+            "api credentials": "Production CRM API Credentials",
+            "production crm api credentials": "Production CRM API Credentials",
+            "crm": "CRM Integration",
+            "crm integration": "CRM Integration",
+            "sso": "Azure AD SSO",
+            "azure ad": "Azure AD SSO",
+            "azure ad sso": "Azure AD SSO",
+            "vpn": "Production VPN Access",
+            "production vpn access": "Production VPN Access",
+            "production vpn": "Production VPN Access",
+            "sit": "System Integration Testing",
+            "system integration testing": "System Integration Testing",
+            "uat": "User Acceptance Testing",
+            "user acceptance testing": "User Acceptance Testing",
+            "prod": "Production Deployment",
+            "production deployment": "Production Deployment",
+            "kt": "Knowledge Transfer",
+            "knowledge transfer": "Knowledge Transfer",
+            "backend apis": "Backend APIs",
+            "analytics dashboard": "Analytics Dashboard",
+            "security review": "Security Review",
+            "audit logs": "Audit Logs",
+            "qa validation": "QA Validation",
+            "user management": "User Management"
+        }
+
+        def normalize_name(name):
+            if not name:
+                return name
+            n_lower = str(name).lower().strip()
+            if n_lower in alias_registry:
+                return alias_registry[n_lower]
+            for alias, canonical in alias_registry.items():
+                if alias in n_lower:
+                    return canonical
+            return name
+
         name_to_candidate = {}
         for cand in candidates:
-            name = cand.get('activity')
-            if not name:
+            raw_name = cand.get('activity')
+            if not raw_name:
                 continue
-            name_to_candidate[name] = cand
+            canonical_name = normalize_name(raw_name)
+            cand['activity'] = canonical_name
+            cand['canonical_title'] = canonical_name
             if 'blocked_by' not in cand:
                 cand['blocked_by'] = []
             
-        # PASS 1: Invert 'blocks' array into 'blocked_by' array on downstream items
-        for cand in candidates:
-            name = cand.get('activity')
-            if not name:
-                continue
-            blocks = cand.get('blocks', [])
-            if isinstance(blocks, list):
-                for blocked_item in blocks:
-                    blocked_lower = blocked_item.lower().strip()
-                    matched_name = blocked_item
-                    found = False
-                    for cand_name in name_to_candidate.keys():
-                        cand_name_lower = cand_name.lower().strip()
-                        if blocked_lower in cand_name_lower or cand_name_lower in blocked_lower:
-                            matched_name = cand_name
-                            found = True
-                            break
-                    
-                    if found:
-                        if name not in name_to_candidate[matched_name]['blocked_by']:
-                            name_to_candidate[matched_name]['blocked_by'].append(name)
-                    else:
-                        # Auto-spawn the blocked item if it doesn't exist
-                        pass
+            # Entity type overrides
+            if canonical_name in ["Azure AD SSO", "System Integration Testing", "User Acceptance Testing", "Production Deployment", "Knowledge Transfer"]:
+                cand['entity_type'] = "MILESTONE"
+                
+            name_to_candidate[canonical_name] = cand
 
-        # PASS 1.5: Enforce Expected Project Dependency Chains (PMO Logic & Normalization)
-        # 1. Normalize credentials
+        # PASS 1: Normalize existing blocked_by and blocks
         for cand in name_to_candidate.values():
+            # blocked_by
             if 'blocked_by' in cand:
                 new_blocked_by = []
                 for b in cand['blocked_by']:
-                    if b.lower().strip() == 'credentials' or b.lower().strip() == 'api credentials':
-                        b = 'Production CRM API Credentials'
-                    new_blocked_by.append(b)
+                    new_blocked_by.append(normalize_name(b))
                 cand['blocked_by'] = list(set(new_blocked_by))
-        
-        # 2. Enforce known project execution chains
-        expected_edges = [
-            ("Production CRM API Credentials", "CRM Integration"),
-            ("Production VPN Access", "CRM Integration"),
-            ("Production VPN Access", "SIT"),
-            ("CRM Integration", "Azure AD SSO"),
-            ("Azure AD SSO", "SIT"),
-            ("SIT", "UAT"),
-            ("UAT", "Production Deployment"),
-            ("UAT", "Production"),
-            ("Production Deployment", "Knowledge Transfer"),
-            ("Production", "Knowledge Transfer"),
-            ("Backend APIs", "Analytics Dashboard"),
-            ("Security Review", "Audit Logs"),
-            ("QA Validation", "User Management")
-        ]
-        
-        for blocker, blocked in expected_edges:
-            # find actual keys that match these
-            blocker_key = None
-            blocked_key = None
             
-            for k in name_to_candidate.keys():
-                k_lower = k.lower().strip()
-                if blocker.lower() in k_lower or k_lower in blocker.lower():
-                    blocker_key = k
-                if blocked.lower() in k_lower or k_lower in blocked.lower():
-                    blocked_key = k
-            
-            if blocker_key and blocked_key:
-                if blocker_key not in name_to_candidate[blocked_key]['blocked_by']:
-                    name_to_candidate[blocked_key]['blocked_by'].append(blocker_key)
-        
-        # PASS 2: Build the Graph
-        graph = collections.defaultdict(list)
-        for name, cand in list(name_to_candidate.items()):
-            blocked_by = cand.get('blocked_by', [])
-            if isinstance(blocked_by, list):
-                for i in range(len(blocked_by)):
-                    blocker = blocked_by[i]
-                    blocker_lower = blocker.lower().strip()
-                    matched_name = blocker
-                    found = False
-                    for cand_name in name_to_candidate.keys():
-                        cand_name_lower = cand_name.lower().strip()
-                        if blocker_lower in cand_name_lower or cand_name_lower in blocker_lower:
-                            matched_name = cand_name
-                            found = True
-                            break
-                    
-                    if not found and matched_name not in name_to_candidate:
-                        name_to_candidate[matched_name] = {
-                            "activity": matched_name,
-                            "canonical_title": matched_name,
-                            "entity_type": "ACTION_ITEM",
-                            "status": "OPEN",
-                            "blocked_by": [],
-                            "evidence": f"Identified as a blocker for {name}.",
-                            "reasoning": f"This operational action item is preventing progress on {name}.",
-                            "recommended_action": f"Resolve this item to immediately unblock {name}.",
-                            "should_create_risk": True,
-                            "is_scope_creep": False,
-                            "llm_confidence": 100.0,
-                            "progress": 0,
-                            "p_date_str": None,
-                            "days_overdue": 0,
-                            "days_until_due": 0,
-                            "next_milestone_name": None,
-                            "next_milestone_date": None,
-                            "days_to_next_milestone": None,
-                            "original_contract_sentence": ""
-                        }
-                    
-                    graph[matched_name].append(name)
-                    if matched_name != blocker:
-                        cand['blocked_by'][i] = matched_name
+            # blocks
+            if 'blocks' in cand:
+                new_blocks = []
+                for b in cand['blocks']:
+                    new_blocks.append(normalize_name(b))
+                cand['blocks'] = list(set(new_blocks))
 
-        # Helper Functions
-        def get_all_downstream(start_node):
+        # Build graph purely from LLM extractions (No hardcoded expected edges)
+        forward_graph = collections.defaultdict(set)
+        backward_graph = collections.defaultdict(set)
+
+        for name, cand in name_to_candidate.items():
+            conf = cand.get('llm_confidence', 1.0)
+            if conf < 0.5:
+                continue # Ignore highly uncertain nodes as blockers
+                
+            for b in cand.get('blocked_by', []):
+                b_conf = name_to_candidate.get(b, {}).get('llm_confidence', 1.0)
+                if b_conf >= 0.5:
+                    backward_graph[name].add(b)
+                    forward_graph[b].add(name)
+            for b in cand.get('blocks', []):
+                b_conf = name_to_candidate.get(b, {}).get('llm_confidence', 1.0)
+                if b_conf >= 0.5:
+                    forward_graph[name].add(b)
+                    backward_graph[b].add(name)
+
+        # VALIDATE GRAPH: Remove self loops
+        for node in list(forward_graph.keys()):
+            if node in forward_graph[node]:
+                forward_graph[node].remove(node)
+
+        # Spawn missing dummy nodes for external blockers
+        all_nodes = set(name_to_candidate.keys()) | set(forward_graph.keys()) | set(backward_graph.keys())
+        for node in all_nodes:
+            if node not in name_to_candidate:
+                name_to_candidate[node] = {
+                    "activity": node,
+                    "canonical_title": node,
+                    "entity_type": "ACTION_ITEM",
+                    "status": "NOT_STARTED",
+                    "blocked_by": [],
+                    "evidence": f"Identified as a blocker or downstream entity in execution chain.",
+                    "reasoning": f"This operational item is part of the dependency graph.",
+                    "recommended_action": f"Track execution progress.",
+                    "should_create_risk": True,
+                    "is_scope_creep": False,
+                    "llm_confidence": 1.0,
+                    "progress": 0,
+                    "p_date_str": None,
+                    "days_overdue": 0,
+                    "days_until_due": 0,
+                    "next_milestone_name": None,
+                    "next_milestone_date": None,
+                    "days_to_next_milestone": None,
+                    "original_contract_sentence": ""
+                }
+                
+        # Sync the nodes' blocked_by arrays to strictly match the valid backward graph
+        for name, cand in name_to_candidate.items():
+            cand['blocked_by'] = list(backward_graph[name])
+
+        # Graph Traversal Helpers
+        terminal_keywords = ['production', 'deployment', 'go live', 'go-live', 'launch', 'release', 'kt', 'knowledge transfer']
+
+        def get_forward_path(start_node):
             visited = set()
             queue = collections.deque([start_node])
             while queue:
                 curr = queue.popleft()
-                for neighbor in graph.get(curr, []):
+                for neighbor in forward_graph.get(curr, []):
                     if neighbor not in visited:
                         visited.add(neighbor)
                         queue.append(neighbor)
             return list(visited)
 
-        def get_longest_path(start_node):
+        def get_longest_forward_path(start_node):
             max_path = []
             def dfs(curr_node, current_path, visited):
                 nonlocal max_path
-                neighbors = graph.get(curr_node, [])
+                neighbors = forward_graph.get(curr_node, [])
                 if not neighbors:
                     if len(current_path) > len(max_path):
                         max_path = list(current_path)
@@ -166,85 +164,180 @@ class DependencyGraphBuilder:
             dfs(start_node, [], set())
             return max_path
 
-        terminal_keywords = ['production', 'deployment', 'go live', 'go-live', 'launch', 'release', 'kt', 'knowledge transfer']
-
-        # PASS 3: Calculate Metrics
-        for name, cand in name_to_candidate.items():
-            immediate = graph.get(name, [])
-            all_downstream = get_all_downstream(name)
-            longest_path = get_longest_path(name)
-            
-            future = [f for f in all_downstream if f not in immediate]
-            
-            cand['immediate_unlocks'] = immediate
-            cand['future_unlocks'] = future
-            cand['longest_path'] = longest_path
-            cand['downstream_names'] = all_downstream
-            
-            cand['blocked_work_count'] = len(all_downstream)
-            cand['cascade_depth'] = len(longest_path)
-            cand['is_direct_blocker'] = len(immediate) > 0
-            
-            # critical_chain
-            has_terminal = False
-            for d_node in all_downstream:
-                d_lower = d_node.lower()
-                if any(tk in d_lower for tk in terminal_keywords):
-                    has_terminal = True
-                    break
-            cand['critical_chain'] = has_terminal
-
-            # execution_unlock_count
-            unlocked = set()
-            queue = collections.deque([name])
-            unresolved_blockers = {}
-            for n, c in name_to_candidate.items():
-                unresolved_blockers[n] = [
-                    b for b in c.get('blocked_by', []) 
-                    if name_to_candidate.get(b, {}).get('status', 'OPEN') not in ['RESOLVED', 'COMPLETED']
-                ]
-            
+        def get_distance_to_terminal(start_node):
+            if any(tk in start_node.lower() for tk in terminal_keywords):
+                return 0
+            visited = {start_node: 0}
+            queue = collections.deque([start_node])
+            min_dist = 999
             while queue:
                 curr = queue.popleft()
-                for neighbor in graph.get(curr, []):
-                    if neighbor in unresolved_blockers and curr in unresolved_blockers[neighbor]:
-                        unresolved_blockers[neighbor].remove(curr)
-                        if len(unresolved_blockers[neighbor]) == 0:
-                            unlocked.add(neighbor)
-                            queue.append(neighbor)
-            cand['execution_unlock_count'] = len(unlocked)
+                dist = visited[curr]
+                if any(tk in curr.lower() for tk in terminal_keywords):
+                    if dist < min_dist:
+                        min_dist = dist
+                for neighbor in forward_graph.get(curr, []):
+                    if neighbor not in visited:
+                        visited[neighbor] = dist + 1
+                        queue.append(neighbor)
+            return min_dist
 
-            # earliest_root_cause
-            has_unresolved_blockers = len(unresolved_blockers.get(name, [])) > 0
-            if len(all_downstream) > 0 and not has_unresolved_blockers:
+        # Identify Parallel Streams (Disconnected Subgraphs)
+        stream_id = 1
+        node_to_stream = {}
+        visited_nodes = set()
+        for node in all_nodes:
+            if node not in visited_nodes:
+                stream_queue = collections.deque([node])
+                current_stream = set()
+                while stream_queue:
+                    curr = stream_queue.popleft()
+                    if curr not in current_stream:
+                        current_stream.add(curr)
+                        visited_nodes.add(curr)
+                        for neighbor in forward_graph.get(curr, []):
+                            if neighbor not in current_stream:
+                                stream_queue.append(neighbor)
+                        for neighbor in backward_graph.get(curr, []):
+                            if neighbor not in current_stream:
+                                stream_queue.append(neighbor)
+                for stream_node in current_stream:
+                    node_to_stream[stream_node] = f"Stream {stream_id}"
+                stream_id += 1
+
+        # PASS 3: Calculate PMO Metrics
+        for name, cand in name_to_candidate.items():
+            immediate = list(forward_graph.get(name, set()))
+            longest_path = get_longest_forward_path(name)
+            
+            cand['parents'] = list(backward_graph.get(name, set()))
+            cand['children'] = immediate
+            cand['longest_path'] = longest_path
+            cand['parallel_stream'] = node_to_stream.get(name, "Stream 1")
+            
+            cand['downstream_names'] = get_forward_path(name)
+            cand['direct_blocking_names'] = immediate
+            
+            cand['blocked_work_count'] = len(get_forward_path(name))
+            cand['cascade_depth'] = len(longest_path)
+            cand['distance_to_terminal'] = get_distance_to_terminal(name)
+            
+            # Criticality Score (0-100)
+            # Base logic: cascade_depth * 10, bonus if distance_to_terminal is small
+            crit_score = min(cand['cascade_depth'] * 15, 80)
+            if cand['distance_to_terminal'] < 999:
+                crit_score += max(20 - (cand['distance_to_terminal'] * 5), 0)
+            cand['criticality_score'] = min(crit_score, 100.0)
+            cand['critical_path'] = cand['criticality_score'] >= 75.0
+            cand['critical_chain'] = cand['distance_to_terminal'] < 999
+
+            unresolved_blockers = {
+                n: [b for b in backward_graph.get(n, set()) if name_to_candidate.get(b, {}).get('status', 'NOT_STARTED') not in ['RESOLVED', 'COMPLETED']]
+                for n in name_to_candidate.keys()
+            }
+            
+            has_unresolved_upstream = len(unresolved_blockers.get(name, [])) > 0
+            # Multiple root causes natively supported: any node with blocked_work but 0 upstream unresolved blockers
+            if cand['blocked_work_count'] > 0 and not has_unresolved_upstream:
                 cand['is_root_cause'] = True
             else:
                 cand['is_root_cause'] = False
-                
-            # distance_to_next_executable
-            if cand['execution_unlock_count'] > 0:
+            cand['earliest_root_cause'] = cand['is_root_cause']
+
+            # Immediate Unlock Count
+            unlocked = set()
+            queue = collections.deque([name])
+            sim_blockers = {k: list(v) for k, v in unresolved_blockers.items()}
+            
+            while queue:
+                curr = queue.popleft()
+                for neighbor in forward_graph.get(curr, []):
+                    if neighbor in sim_blockers and curr in sim_blockers[neighbor]:
+                        sim_blockers[neighbor].remove(curr)
+                        if len(sim_blockers[neighbor]) == 0:
+                            unlocked.add(neighbor)
+                            queue.append(neighbor)
+                            
+            cand['immediate_unlock_count'] = len(unlocked)
+            cand['execution_unlock_count'] = len(unlocked)
+            cand['immediate_unlocks'] = list(unlocked)
+            cand['future_unlocks'] = [x for x in cand['downstream_names'] if x not in unlocked]
+            
+            if cand['immediate_unlock_count'] > 0:
                 cand['distance_to_next_executable'] = 1
             elif cand['blocked_work_count'] > 0:
                 cand['distance_to_next_executable'] = cand['cascade_depth']
             else:
                 cand['distance_to_next_executable'] = 999
                 
-            # Create compatibility aliases for RiskEvaluationAgent
-            cand['cascade_count'] = cand['blocked_work_count']
-            cand['critical_path'] = cand['critical_chain']
-            cand['earliest_root_cause'] = cand['is_root_cause']
+            # PMO Fields
+            # 1. Dependency Owner
+            ev = (cand.get('evidence') or '').lower()
+            if any(k in ev for k in ['customer', 'client', 'sponsor']):
+                cand['dependency_owner'] = 'Customer'
+            elif any(k in ev for k in ['vendor', '3rd party', 'third-party', 'external provider']):
+                cand['dependency_owner'] = 'Vendor'
+            else:
+                cand['dependency_owner'] = 'Internal'
 
+            # 2. Resolution Effort Proxy
+            # Simple heuristic based on title length or keywords
+            title_lower = name.lower()
+            if any(k in title_lower for k in ['api', 'database', 'migration', 'architecture']):
+                cand['resolution_effort'] = 'L'
+            elif any(k in title_lower for k in ['credentials', 'access', 'vpn']):
+                cand['resolution_effort'] = 'S'
+            elif any(k in title_lower for k in ['review', 'validation', 'testing']):
+                cand['resolution_effort'] = 'M'
+            else:
+                cand['resolution_effort'] = 'M'
+                
+            # 3. Business Criticality
+            if any(k in title_lower for k in ['production', 'go live', 'crm', 'security']):
+                cand['business_criticality'] = 'Mission Critical'
+            elif any(k in title_lower for k in ['uat', 'testing', 'migration']):
+                cand['business_criticality'] = 'High'
+            else:
+                cand['business_criticality'] = 'Medium'
+                
+            # 4. Business Phase
+            term_node = longest_path[-1].lower() if longest_path else title_lower
+            if any(k in term_node for k in ['design', 'planning', 'requirements']):
+                cand['business_phase'] = 'Planning'
+            elif any(k in term_node for k in ['api', 'development', 'backend']):
+                cand['business_phase'] = 'Development'
+            elif any(k in term_node for k in ['sit', 'integration']):
+                cand['business_phase'] = 'Integration'
+            elif any(k in term_node for k in ['uat', 'testing', 'qa']):
+                cand['business_phase'] = 'Testing'
+            elif any(k in term_node for k in ['production', 'deployment', 'release']):
+                cand['business_phase'] = 'Deployment'
+            else:
+                cand['business_phase'] = 'Execution'
+            
+            cand['blocked'] = has_unresolved_upstream
+            cand['waiting'] = cand['blocked'] and not cand['is_root_cause']
+            cand['cascade_count'] = cand['blocked_work_count']
+            
             # dependency_source
             evidence_lower = (cand.get('evidence', '') + ' ' + cand.get('reasoning', '') + ' ' + str(cand.get('activity', ''))).lower()
             if any(k in evidence_lower for k in ['customer', 'client', 'credentials', 'vpn', 'access', 'external']):
                 cand['dependency_source'] = 'CUSTOMER'
+                cand['external_dependency'] = True
             elif any(k in evidence_lower for k in ['vendor', 'third party', 'third-party', 'partner']):
                 cand['dependency_source'] = 'VENDOR'
+                cand['external_dependency'] = True
             elif any(k in evidence_lower for k in ['security', 'audit', 'compliance', 'review']):
                 cand['dependency_source'] = 'SECURITY'
+                cand['external_dependency'] = False
             elif any(k in evidence_lower for k in ['pmo', 'management', 'approval']):
                 cand['dependency_source'] = 'PMO'
+                cand['external_dependency'] = False
             else:
                 cand['dependency_source'] = 'ENGINEERING'
+                cand['external_dependency'] = False
 
+            cand['blocked'] = has_unresolved_upstream
+            cand['waiting'] = cand['blocked'] and not cand['is_root_cause']
+            
         return list(name_to_candidate.values())
