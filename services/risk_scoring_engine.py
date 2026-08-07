@@ -252,18 +252,9 @@ class RiskScoringEngine:
                     unique_chain.append(item)
                     seen.add(item)
             
-            for i, item in enumerate(unique_chain):
-                lines.append(f"{item}")
-                if i < len(unique_chain) - 1:
-                    lines.append("↓")
-            
+            chain_str = " -> ".join(unique_chain)
+            lines.append(chain_str)
             lines.append("")
-            immediate_count = len(immediate_unlocks) if immediate_unlocks else 0
-            lines.append("Immediate Unlock")
-            lines.append(f"{immediate_count}")
-            lines.append("")
-            lines.append("Cascade Impact")
-            lines.append(f"{cascade_count}")
             
         # Score Breakdown
         if breakdown:
@@ -291,9 +282,15 @@ class RiskScoringEngine:
             lines.append("")
             
         if mom_evidence:
-            lines.append("------------------------")
-            lines.append("Evidence (MoM)")
-            lines.append(f'"{mom_evidence}"')
+            clean_evidence = mom_evidence.replace("Evidence (MoM)", "").replace("Evidence:", "").strip()
+            # Also remove leading/trailing quotes if they exist
+            if clean_evidence.startswith('"') and clean_evidence.endswith('"'):
+                clean_evidence = clean_evidence[1:-1].strip()
+            
+            if clean_evidence:
+                lines.append("------------------------")
+                lines.append("Evidence (MoM)")
+                lines.append(f'"{clean_evidence}"')
 
         return "\n".join(lines).strip()
 

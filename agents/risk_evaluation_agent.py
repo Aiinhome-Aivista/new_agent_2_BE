@@ -114,11 +114,27 @@ class RiskEvaluationAgent:
     DETERMINISTIC_CONFIDENCE_THRESHOLD = 85
 
     @classmethod
-    def _pm_decision(cls, priority: int, owner: str) -> str:
+    def _pm_decision(cls, priority: int, owner: str, is_root_cause: bool = False, longest_path: list = None) -> str:
+        chain = " -> ".join([str(x) for x in longest_path]) if longest_path else ""
+        
+        if is_root_cause and priority >= 80:
+            if owner == "Customer": 
+                rec = "Escalate to customer immediately. Request ETA. Current project execution is blocked."
+            elif owner == "Vendor": 
+                rec = "Escalate to vendor immediately. Current project execution is blocked."
+            else: 
+                rec = "Assign internal engineering resource ASAP. Current project execution is blocked."
+                
+            rec += " Target completion dates may slip if unresolved."
+                
+            if chain:
+                rec += f"\nExpected unlock: {chain}"
+            return rec
+            
         if priority >= 80:
-            if owner == "Customer": return "Escalate to customer today"
-            elif owner == "Vendor": return "Review vendor SLA and follow up"
-            else: return "Assign internal engineering resource ASAP"
+            if owner == "Customer": return "Escalate to customer today. Target completion dates may slip if unresolved."
+            elif owner == "Vendor": return "Review vendor SLA and follow up. Target completion dates may slip if unresolved."
+            else: return "Assign internal engineering resource ASAP. Target completion dates may slip if unresolved."
         elif priority >= 60:
             return "Monitor and align resources for upcoming sprint"
         else:
@@ -428,6 +444,34 @@ class RiskEvaluationAgent:
         forward_graph, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
         
+        # 4a. Deterministic Graph Completion for Prerequisites
+        # If an extracted activity is semantically matched to a milestone, but isn't that exact milestone,
+        # we treat it as a prerequisite blocking that milestone.
+        for i, result in enumerate(llm_risk_results):
+            canonical_title = result.get("_canonical_title", "")
+            activity_name = result.get("activity", "")
+            m_id = get_milestone_id(canonical_title)
+            
+            if m_id and canonical_title:
+                matched_name = state_snapshot.milestone_id_to_name.get(m_id)
+                # Compare canonical_title vs matched_name to see if it's a prerequisite rather than the milestone itself
+                if matched_name and canonical_title.strip().lower() != matched_name.strip().lower():
+                    # It's a prerequisite blocking m_id!
+                    v_node = f"VIRTUAL_{canonical_title}"
+                    
+                    if m_id not in forward_graph.get(v_node, []):
+                        forward_graph.setdefault(v_node, []).append(m_id)
+                    if v_node not in backward_graph.get(m_id, []):
+                        backward_graph.setdefault(m_id, []).append(v_node)
+                        
+                    # Also record its status in snapshot
+                    v_status = result.get("status", "UNKNOWN").upper().replace(" ", "_")
+                    state_snapshot.milestone_statuses[v_node] = v_status
+                    state_snapshot.milestone_id_to_name[v_node] = canonical_title
+                    
+        # Re-run static analysis to include virtual nodes
+        dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
+        
         # 4b. Graph-First PMO Execution Queue Ordering
         from services.execution_queue_builder import ExecutionQueueBuilder
         execution_queue_order, node_metrics = ExecutionQueueBuilder.build_queue(state_snapshot, backward_graph, forward_graph)
@@ -536,7 +580,12 @@ class RiskEvaluationAgent:
                 print(f"  [Gate] Bypassed Risk Engine for non-blocking DEPENDENCY: {canonical_title}")
                 continue
 
-            dep_data = dep_analysis_results.get(m_id, {})
+            m_id_for_metrics = m_id
+            v_node = f"VIRTUAL_{canonical_title}"
+            if v_node in dep_analysis_results:
+                m_id_for_metrics = v_node
+                
+            dep_data = dep_analysis_results.get(m_id_for_metrics, {})
             cascade_count = dep_data.get("cascade_count", 0)
             earliest_root_cause = dep_data.get("earliest_root_cause", False)
             critical_path = dep_data.get("critical_path", False)
@@ -692,7 +741,7 @@ class RiskEvaluationAgent:
                 "is_execution_blocker": is_execution_blocker,
                 "earliest_executable_work": immediate_unlocks,
                 "longest_path": longest_path,
-                "m_id": m_id
+                "m_id": m_id_for_metrics
             })
 
         # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
@@ -812,8 +861,8 @@ class RiskEvaluationAgent:
             )
             
             queue_order = 9999
-            if item.get("m_id") in execution_queue_order:
-                queue_order = execution_queue_order.index(item.get("m_id"))
+            if m_id_for_metrics in execution_queue_order:
+                queue_order = execution_queue_order.index(m_id_for_metrics)
             
             if item["is_scope_creep"]:
                 out_of_scope_activities.append({
@@ -886,7 +935,7 @@ class RiskEvaluationAgent:
                     "execution_reasons": execution_reasons,
                     "mom_evidence": item["evidence"],
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
-                    "recommended_action": item.get("recommended_action") or cls._pm_decision(execution_priority, item.get("dependency_owner", "Internal")),
+                    "recommended_action": item.get("recommended_action") or cls._pm_decision(execution_priority, item.get("dependency_owner", "Internal"), item["is_root_cause"], item.get("longest_path", [])),
                     "business_phase": item.get("business_phase"),
                     "queue_order": queue_order,
                     "longest_path": item.get("longest_path", []),
@@ -989,7 +1038,7 @@ class RiskEvaluationAgent:
                     new_priority = max(new_priority, 90) # Root causes always at least 90
                 
                 item['execution_priority'] = new_priority
-                item['recommended_action'] = cls._pm_decision(new_priority, item.get('dependency_owner', 'Internal'))
+                item['recommended_action'] = cls._pm_decision(new_priority, item.get('dependency_owner', 'Internal'), item.get('is_root_cause', False), item.get('longest_path', []))
                 
                 # Apply PMO UI Labels (Category overrides)
                 e_type = item.get("entity_type", "")
