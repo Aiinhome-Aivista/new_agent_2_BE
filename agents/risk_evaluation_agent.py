@@ -425,8 +425,18 @@ class RiskEvaluationAgent:
         state_snapshot = ProjectStateSnapshot(db_cursor, project_id)
         
         # 4. Dependency Execution State Resolver (Static Graph)
-        _, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
+        forward_graph, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
+        
+        # 4b. Graph-First PMO Execution Queue Ordering
+        from services.execution_queue_builder import ExecutionQueueBuilder
+        execution_queue_order, node_metrics = ExecutionQueueBuilder.build_queue(state_snapshot, backward_graph, forward_graph)
+        
+        # Add ExecutionQueueBuilder metrics into dep_analysis_results so they reach the scoring engine
+        for m_id, metrics in node_metrics.items():
+            if m_id not in dep_analysis_results:
+                dep_analysis_results[m_id] = {}
+            dep_analysis_results[m_id]["immediate_unlocks"] = metrics["immediate_unlocks"]
         
         # 5. Derived Execution State
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
@@ -532,6 +542,7 @@ class RiskEvaluationAgent:
             critical_path = dep_data.get("critical_path", False)
             downstream_chain_length = dep_data.get("downstream_chain_length", 0)
             distance_to_next_executable = dep_data.get("distance_to_next_executable", 999)
+            longest_path = dep_data.get("longest_path", [])
             
             if cascade_count == 0 and len(blocks) > 0:
                 cascade_count = len(blocks)
@@ -679,7 +690,9 @@ class RiskEvaluationAgent:
                 "downstream_chain_length": downstream_chain_length,
                 "distance_to_next_executable": distance_to_next_executable,
                 "is_execution_blocker": is_execution_blocker,
-                "earliest_executable_work": immediate_unlocks
+                "earliest_executable_work": immediate_unlocks,
+                "longest_path": longest_path,
+                "m_id": m_id
             })
 
         # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
@@ -771,7 +784,36 @@ class RiskEvaluationAgent:
             execution_reasons = score_result.get("execution_reasons", [])
             severity = RiskConfigurationService.classify_severity(risk_sev, risk_thresholds)
             
-            full_reasoning = item.get('reasoning', '')
+            full_reasoning = RiskScoringEngine.format_reasoning(
+                score=exec_prio,
+                severity=severity,
+                category=item["risk_cat"],
+                entity_type=item["entity_type"],
+                status=item["status"],
+                progress=item["progress"],
+                earliest_root_cause=item["is_root_cause"],
+                cascade_count=item["cascade_count"],
+                blocked_by=item["blocked_by"],
+                blocking=item["downstream_names"],
+                direct_blocking=item.get("direct_blocking_names", []),
+                breakdown=breakdown,
+                mom_evidence=item["evidence"],
+                original_contract_sentence=item.get("original_contract_sentence", ""),
+                immediate_unlocks=item.get("immediate_unlocks", []),
+                future_unlocks=item.get("future_unlocks", []),
+                longest_path=item.get("longest_path", []),
+                next_milestone_name=item.get("next_milestone_name", None),
+                next_milestone_date=item.get("next_milestone_date", None),
+                days_to_next_milestone=item.get("days_to_next_milestone", None),
+                execution_priority=execution_priority,
+                cascade_priority=cascade_priority,
+                schedule_priority=schedule_priority,
+                execution_reasons=execution_reasons
+            )
+            
+            queue_order = 9999
+            if item.get("m_id") in execution_queue_order:
+                queue_order = execution_queue_order.index(item.get("m_id"))
             
             if item["is_scope_creep"]:
                 out_of_scope_activities.append({
@@ -824,6 +866,7 @@ class RiskEvaluationAgent:
                     "category": item["risk_cat"],
                     "risk_source": "DERIVED" if item["risk_cat"] in ["EXECUTION_BLOCKER", "ROOT_CAUSE", "TECHNICAL_DEPENDENCY"] else "OBSERVED",
                     "is_root_cause": item["is_root_cause"],
+                    "m_id": item.get("m_id"),
                     "cascade_count": item["cascade_count"],
                     "days_overdue": item["days_overdue"],
                     "days_until_due": item["days_until_due"],
@@ -845,6 +888,8 @@ class RiskEvaluationAgent:
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
                     "recommended_action": item.get("recommended_action") or cls._pm_decision(execution_priority, item.get("dependency_owner", "Internal")),
                     "business_phase": item.get("business_phase"),
+                    "queue_order": queue_order,
+                    "longest_path": item.get("longest_path", []),
                     "dependency_owner": item.get("dependency_owner"),
                     "parallel_stream": item.get("parallel_stream")
                 })

@@ -59,35 +59,35 @@ class RiskScoringEngine:
         if is_scope_creep or category == "CHANGE_REQUEST":
             band = 7
             band_name = "Change Request"
-            min_prio, max_prio = 0, 20
-        elif earliest_root_cause and (criticality_score >= 75.0 or execution_unlock_count >= 2 or blocked_work_count >= 3):
+            min_prio, max_prio = 0, 9
+        elif earliest_root_cause and (criticality_score >= 50.0 or cascade_depth >= 3):
             band = 1
-            band_name = "Immediate Root Cause"
+            band_name = "Critical Path Root Cause"
             min_prio, max_prio = 90, 100
-        elif earliest_root_cause and execution_unlock_count > 0:
+        elif is_waiting and (criticality_score >= 50.0 or cascade_depth >= 3):
             band = 2
-            band_name = "Execution Blocker"
-            min_prio, max_prio = 80, 89
-        elif is_waiting and criticality_score >= 50.0:
-            band = 3
             band_name = "Critical Path Waiting"
+            min_prio, max_prio = 80, 89
+        elif earliest_root_cause and cascade_depth >= 2:
+            band = 3
+            band_name = "Major Independent Execution"
             min_prio, max_prio = 70, 79
-        elif not is_waiting and len(blocked_by) == 0 and blocked_work_count == 0:
+        elif earliest_root_cause:
             band = 4
-            band_name = "Independent Execution"
-            min_prio, max_prio = 60, 69
-        elif is_waiting and blocked_work_count > 0:
+            band_name = "Minor Root Cause"
+            min_prio, max_prio = 50, 69
+        elif is_waiting and cascade_depth > 0:
             band = 5
             band_name = "Waiting Dependency"
-            min_prio, max_prio = 45, 59
-        elif is_waiting and blocked_work_count == 0:
+            min_prio, max_prio = 30, 49
+        elif is_waiting:
             band = 6
             band_name = "Downstream Consequence"
-            min_prio, max_prio = 25, 44
+            min_prio, max_prio = 10, 29
         else:
             band = 4
             band_name = "Independent Risk"
-            min_prio, max_prio = 60, 69
+            min_prio, max_prio = 40, 49
 
         # PMO Reasoning for UI
         if earliest_root_cause:

@@ -131,19 +131,30 @@ class DependencyExecutionStateResolver:
 
         # Compute dependency chain weight (downstream chain length)
         memo_dist = {}
-        def get_downstream_chain_length(node):
+        memo_path = {}
+        def get_downstream_chain(node):
             if node in memo_dist:
-                return memo_dist[node]
+                return memo_dist[node], memo_path[node]
             children = forward_graph.get(node, [])
             if not children:
                 memo_dist[node] = 0
-                return 0
-            max_dist = max(get_downstream_chain_length(c) for c in children) + 1
-            memo_dist[node] = max_dist
-            return max_dist
+                memo_path[node] = []
+                return 0, []
+            
+            max_dist = -1
+            best_path = []
+            for c in children:
+                c_dist, c_path = get_downstream_chain(c)
+                if c_dist > max_dist:
+                    max_dist = c_dist
+                    best_path = [c] + c_path
+                    
+            memo_dist[node] = max_dist + 1
+            memo_path[node] = best_path
+            return memo_dist[node], memo_path[node]
 
         for node in snapshot.milestone_statuses.keys():
-            get_downstream_chain_length(node)
+            get_downstream_chain(node)
 
         # Critical path heuristics (nodes on the absolute longest path)
         max_graph_dist = max(memo_dist.values()) if memo_dist else 0
@@ -215,6 +226,7 @@ class DependencyExecutionStateResolver:
                 "distance_to_next_executable": distance_to_next_executable,
                 "direct_downstream_milestones": forward_graph.get(milestone_id, []),
                 "downstream_chain_length": memo_dist.get(milestone_id, 0),
+                "longest_path": [snapshot.milestone_id_to_name.get(n, str(n)) for n in memo_path.get(milestone_id, []) if snapshot.milestone_id_to_name.get(n)],
                 "critical_path": milestone_id in critical_nodes,
                 "next_downstream_date": earliest_date,
                 "next_downstream_name": next_downstream_name

@@ -26,20 +26,23 @@ class RiskRankingEngine:
         """
 
         def sort_key(item):
-            # 1. Execution Priority (Highest first)
+            # 1. Graph Topological Order (queue_order) - Lowest number first
+            q_order = item.get("queue_order", 9999)
+            
+            # 2. Execution Priority (Highest first) - Tiebreaker
             exec_pri = item.get("execution_priority", 0)
             
-            # 2. Cascade Priority (Highest first)
+            # 3. Cascade Priority (Highest first)
             casc_pri = item.get("cascade_priority", 0)
             
-            # 3. Schedule Priority (Highest first)
+            # 4. Schedule Priority (Highest first)
             sched_pri = item.get("schedule_priority", 0)
             
-            # 4. Risk Score (Highest first) - Legacy tiebreaker
+            # 5. Risk Score (Highest first) - Legacy tiebreaker
             risk_score = item.get("execution_priority_score", 0)
             
-            # Return negative values for DESC sorting
-            return (-exec_pri, -casc_pri, -sched_pri, -risk_score)
+            # Return tuple for sorting
+            return (q_order, -exec_pri, -casc_pri, -sched_pri, -risk_score)
 
         eligible_items = [
             i for i in tracker_items
