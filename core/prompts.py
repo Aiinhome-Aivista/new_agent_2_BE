@@ -794,3 +794,83 @@ Rules:
 5. Output ONLY valid JSON. No markdown blocks.
 """
 
+
+# ==========================================
+# RECURRING DELIVERABLE EXTRACTION PROMPTS
+# ==========================================
+def get_recurrence_extraction_prompt(items_for_prompt: list) -> str:
+    import json
+    return f"""You are an expert contract analyst specialising in recurring commitment detection.
+
+Analyse the following array of IN_SCOPE project scope items from an Engagement Letter (EL).
+Your task is to determine whether each item represents a RECURRING commitment (one that must be delivered repeatedly over the engagement period).
+
+Items to analyse:
+{json.dumps(items_for_prompt, indent=2)}
+
+RULES:
+1. An item is RECURRING only if the EL explicitly commits the vendor/team to deliver it repeatedly at a defined frequency.
+   Examples of RECURRING:
+   - "Developer shall provide a monthly improvement to the application."
+   - "Vendor shall submit a monthly progress report."
+   - "Weekly security monitoring shall be performed."
+   - "Quarterly performance review shall be completed."
+   - "Annual architecture review shall be delivered."
+
+2. An item is NOT RECURRING if it is:
+   - A one-time deliverable with a specific deadline.
+   - A general description of project activities (e.g., "The team may discuss progress in monthly meetings").
+   - A monitoring/meeting activity not tied to a contractual deliverable output.
+   - Incidentally mentioned with a time period (e.g., "monthly steering committee discussed CRM progress").
+
+3. FREQUENCY — If recurring, identify the frequency as exactly one of:
+   "WEEKLY" | "MONTHLY" | "QUARTERLY" | "YEARLY"
+   Normalize semantic variants:
+   - "every month", "monthly", "each month", "per month" → MONTHLY
+   - "every week", "weekly", "each week" → WEEKLY
+   - "every quarter", "quarterly", "once per quarter" → QUARTERLY
+   - "every year", "annually", "annual", "yearly" → YEARLY
+
+4. DATE BOUNDS — Extract explicit start/end dates only if the EL text directly states them.
+   DO NOT invent or infer dates. Return null if not explicitly stated.
+   Dates must be in YYYY-MM-DD format.
+
+5. CONFIDENCE — Your confidence that this IS a recurring deliverable commitment (0.0–1.0).
+   Use 0.9+ only when the evidence is unambiguous (explicit "shall provide monthly X").
+   Use 0.5–0.75 for likely recurring but with some ambiguity.
+   Use <0.5 for doubtful cases.
+
+6. DO NOT calculate individual occurrence dates. That is handled separately.
+
+Output strictly as a JSON ARRAY of objects, one per input item, matching the input "id":
+[
+  {{
+    "id": "0",
+    "is_recurring": true,
+    "frequency": "MONTHLY",
+    "commitment_title": "Application Improvement",
+    "start_date": null,
+    "end_date": null,
+    "confidence": 0.95,
+    "reasoning": "EL explicitly states 'Developer shall provide a monthly improvement' — clear recurring vendor obligation."
+  }},
+  {{
+    "id": "1",
+    "is_recurring": false,
+    "frequency": null,
+    "commitment_title": null,
+    "start_date": null,
+    "end_date": null,
+    "confidence": 0.0,
+    "reasoning": "One-time CRM integration deliverable with a specific deadline — not recurring."
+  }}
+]
+
+Rules for output:
+- "is_recurring" MUST be a boolean.
+- "frequency" MUST be one of "WEEKLY","MONTHLY","QUARTERLY","YEARLY" or null.
+- "start_date" and "end_date" MUST be "YYYY-MM-DD" strings or null.
+- "confidence" MUST be a float between 0.0 and 1.0.
+- Output ONLY the JSON array. No markdown blocks, no explanations outside JSON.
+"""
+

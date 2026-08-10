@@ -204,7 +204,7 @@ class BaselineRepository:
         if not baseline:
             cursor.close()
             return None
-        cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (baseline["id"],))
+        cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s ORDER BY id ASC", (baseline["id"],))
         items = cursor.fetchall()
         
         for item in items:
@@ -217,6 +217,25 @@ class BaselineRepository:
                 ORDER BY dp.id DESC LIMIT 1
             """, (item["id"],))
             item["latest_progress"] = cursor.fetchone()
+            # Attach recurring occurrences to parent items
+            if item.get("is_recurring") and not item.get("parent_scope_item_id"):
+                cursor.execute("""
+                    SELECT * FROM scope_items
+                    WHERE parent_scope_item_id = %s
+                    ORDER BY deadline ASC
+                """, (item["id"],))
+                occurrences = cursor.fetchall()
+                for occ in occurrences:
+                    cursor.execute("""
+                        SELECT dp.*, psc.label as status_label
+                        FROM deliverable_progress dp
+                        LEFT JOIN progress_status_config psc ON dp.status_code = psc.status_code
+                        WHERE dp.scope_item_id = %s ORDER BY dp.id DESC LIMIT 1
+                    """, (occ["id"],))
+                    occ["latest_progress"] = cursor.fetchone()
+                item["recurring_occurrences"] = occurrences
+            else:
+                item["recurring_occurrences"] = []
             
         cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (baseline["id"],))
         deliverables = cursor.fetchall()
@@ -239,7 +258,11 @@ class BaselineRepository:
         
         cursor.close()
         
-        baseline["scope_items"] = items
+        # Separate parent recurring items from their child occurrences in the flat list
+        # (child occurrences are already attached to their parent via recurring_occurrences)
+        top_level_items = [i for i in items if not i.get("parent_scope_item_id")]
+        
+        baseline["scope_items"] = top_level_items
         baseline["deliverables"] = deliverables
         baseline["milestones"] = milestones
         return baseline
@@ -477,4 +500,53 @@ class BaselineRepository:
             sql = f"UPDATE scope_items SET {', '.join(updates)} WHERE id = %s AND project_id = %s"
             cursor.execute(sql, tuple(params))
         cursor.close()
+
+    # -----------------------------------------------------------------------
+    # RECURRING DELIVERABLE HELPERS
+    # -----------------------------------------------------------------------
+
+    @staticmethod
+    def get_recurring_parents(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> List[Dict[str, Any]]:
+        """Return all recurring parent scope items for a baseline."""
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            """SELECT * FROM scope_items
+               WHERE baseline_id = %s AND is_recurring = 1 AND parent_scope_item_id IS NULL""",
+            (baseline_id,)
+        )
+        items = cursor.fetchall()
+        cursor.close()
+        return items
+
+    @staticmethod
+    def get_recurring_children(db: mysql.connector.connection.MySQLConnection, parent_id: int) -> List[Dict[str, Any]]:
+        """Return all generated occurrence rows for a given parent."""
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM scope_items WHERE parent_scope_item_id = %s ORDER BY deadline ASC",
+            (parent_id,)
+        )
+        items = cursor.fetchall()
+        cursor.close()
+        return items
+
+    @staticmethod
+    def delete_future_occurrences_after_date(
+        db: mysql.connector.connection.MySQLConnection,
+        parent_id: int,
+        after_date: str
+    ) -> int:
+        """Hard-delete future occurrences that have NO progress recorded (for shortened projects)."""
+        cursor = db.cursor()
+        cursor.execute(
+            """DELETE si FROM scope_items si
+               LEFT JOIN deliverable_progress dp ON dp.scope_item_id = si.id
+               WHERE si.parent_scope_item_id = %s
+                 AND si.deadline > %s
+                 AND dp.id IS NULL""",
+            (parent_id, after_date)
+        )
+        affected = cursor.rowcount
+        cursor.close()
+        return affected
 

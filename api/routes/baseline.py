@@ -19,6 +19,7 @@ from services.scope_deduplicator import ScopeDeduplicator
 from services.normalization_service import NormalizationService
 from services.milestone_dependency_extractor import MilestoneDependencyExtractor
 from services.milestone_dependency_service import MilestoneDependencyService
+from services.recurring_deliverable_service import RecurringDeliverableService
 
 # pyrefly: ignore [missing-import]
 import mysql.connector
@@ -306,6 +307,27 @@ def run_baseline_pipeline(project_id: int, document_id: int):
             MilestoneDependencyService.generate_sequential_dependencies(cursor, project_id)
         cursor.close()
         
+        # ── Step 6.5: Detect and expand recurring commitments ──
+        emit("Detecting Recurring Commitments", 93)
+        try:
+            # Fetch the project record to get start/end dates
+            proj_cursor = thread_conn.cursor(dictionary=True)
+            proj_cursor.execute("SELECT id, start_date, end_date FROM projects WHERE id = %s", (project_id,))
+            project_record = proj_cursor.fetchone() or {}
+            proj_cursor.close()
+
+            RecurringDeliverableService.process_recurring_commitments(
+                db=thread_conn,
+                baseline_id=baseline_id,
+                project_id=project_id,
+                scope_items=extracted_data.get("scope_items", []),
+                project=project_record,
+            )
+        except Exception as rec_err:
+            import traceback
+            print(f"[Recurring] Non-fatal error during recurring commitment processing: {rec_err}")
+            traceback.print_exc()
+
         # UPSERT deliverables
         existing_deliverables = BaselineRepository.get_deliverables_for_diff(thread_conn, baseline_id)
         for item in extracted_data.get("deliverables", []):
