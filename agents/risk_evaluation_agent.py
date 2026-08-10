@@ -440,7 +440,25 @@ class RiskEvaluationAgent:
         # 4. Project State Snapshot (Immutable)
         state_snapshot = ProjectStateSnapshot(db_cursor, project_id)
         
-        # 4. Dependency Execution State Resolver (Static Graph)
+        # 4a. Commitment Monitoring Engine (Proactive Risk Synthesis)
+        from services.commitment_monitoring_engine import CommitmentMonitoringEngine
+        commitment_risks = CommitmentMonitoringEngine.evaluate(state_snapshot, llm_risk_results, all_baseline_items, project_id)
+        if commitment_risks:
+            print(f"  [CommitmentMonitor] Synthesized {len(commitment_risks)} missing update risks.")
+            llm_risk_results.extend(commitment_risks)
+            
+            # Pad activities_with_contexts to align with llm_risk_results indices
+            for cr in commitment_risks:
+                activities_with_contexts.append({
+                    "activity": cr["activity"],
+                    "canonical_title": cr["_canonical_title"],
+                    "classification_type": "RISK",
+                    "extraction_confidence": 100,
+                    "is_in_scope": True,
+                    "matched_si": {"name": cr["_canonical_title"]}
+                })
+        
+        # 4b. Dependency Execution State Resolver (Static Graph)
         forward_graph, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
         
@@ -480,7 +498,17 @@ class RiskEvaluationAgent:
         for m_id, metrics in node_metrics.items():
             if m_id not in dep_analysis_results:
                 dep_analysis_results[m_id] = {}
-            dep_analysis_results[m_id]["immediate_unlocks"] = metrics["immediate_unlocks"]
+            dep_analysis_results[m_id].update({
+                "immediate_unlocks": metrics.get("immediate_unlocks", 0),
+                "cascade_count": metrics.get("cascade_nodes", 0),
+                "critical_path": metrics.get("critical_path", False),
+                "downstream_chain_length": metrics.get("critical_path_length", 0),
+                "longest_path": [state_snapshot.milestone_id_to_name.get(p, p) for p in metrics.get("longest_path", [])],
+                "execution_level": metrics.get("execution_level", 0),
+                "execution_index": metrics.get("execution_index", 0),
+                "days_remaining": metrics.get("days_remaining", 999),
+                "earliest_root_cause": metrics.get("is_root", False)
+            })
         
         # 5. Derived Execution State
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
@@ -726,7 +754,8 @@ class RiskEvaluationAgent:
                 "next_milestone_date": next_milestone_date_str,
                 "days_to_next_milestone": days_to_next_milestone,
                 "original_contract_sentence": original_contract_sentence,
-                "reasoning": reasoning,
+                "reasoning": result.get("reasoning", ""),
+                "narratives": result.get("narratives", {}),
                 "direct_blocking_names": direct_blocking_names,
                 "downstream_names": downstream_names,
                 "evidence": evidence,
@@ -761,7 +790,7 @@ class RiskEvaluationAgent:
         
         from services.validation_service import ValidationService
         print(f"  [ValidationGate] Enriching {len(unique_activities)} unique activities...")
-        enriched_activities = ValidationService.enrich_candidates(unique_activities)
+        enriched_activities = ValidationService.enrich_candidates(unique_activities, scope_items=all_baseline_items)
 
                                 
         # ── PHASE C: RISK SCORING & AGGREGATION ──
@@ -894,7 +923,8 @@ class RiskEvaluationAgent:
                     "schedule_priority": schedule_priority,
                     "execution_reasons": execution_reasons,
                     "mom_evidence": item["evidence"],
-                    "original_contract_sentence": item.get("original_contract_sentence", "")
+                    "original_contract_sentence": item.get("original_contract_sentence", ""),
+                    "narratives": item.get("narratives", {})
                 })
             else:
                 # Correct entity_type if LLM misclassified an in-scope item as SCOPE_REQUEST
@@ -935,6 +965,7 @@ class RiskEvaluationAgent:
                     "execution_reasons": execution_reasons,
                     "mom_evidence": item["evidence"],
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
+                    "narratives": item.get("narratives", {}),
                     "recommended_action": item.get("recommended_action") or cls._pm_decision(execution_priority, item.get("dependency_owner", "Internal"), item["is_root_cause"], item.get("longest_path", [])),
                     "business_phase": item.get("business_phase"),
                     "queue_order": queue_order,
@@ -990,112 +1021,6 @@ class RiskEvaluationAgent:
                         existing['execution_reasons'] = merged_reasons
                         
             final_list = list(merged.values())
-            
-            # EXECUTION QUEUE BUILDER (Strict Graph Traversal)
-            root_causes = [item for item in final_list if item.get('is_root_cause', False)]
-            effort_rank = {"XS": 5, "S": 4, "M": 3, "L": 2, "XL": 1}
-            root_causes.sort(key=lambda x: (
-                x.get('cascade_count', 0),
-                effort_rank.get(x.get('score_breakdown', {}).get('Resolution Effort', 'M'), 3)
-            ), reverse=True)
-            
-            queue = []
-            visited = set()
-            item_map = {item['deliverable']: item for item in final_list}
-            
-            def traverse(node_name):
-                if node_name in visited or node_name not in item_map:
-                    return
-                queue.append(item_map[node_name])
-                visited.add(node_name)
-                direct_blocks = item_map[node_name].get('direct_blocking_names', [])
-                direct_blocks_sorted = sorted(
-                    [b for b in direct_blocks if b in item_map],
-                    key=lambda b: item_map[b].get('cascade_count', 0),
-                    reverse=True
-                )
-                for b in direct_blocks_sorted:
-                    traverse(b)
-
-            for rc in root_causes:
-                traverse(rc['deliverable'])
-                
-            remaining = [item for item in final_list if item['deliverable'] not in visited]
-            remaining.sort(key=lambda x: (
-                x.get('cascade_count', 0),
-                effort_rank.get(x.get('score_breakdown', {}).get('Resolution Effort', 'M'), 3)
-            ), reverse=True)
-            queue.extend(remaining)
-            
-            final_list = queue
-            
-            for i, item in enumerate(final_list):
-                rank = i + 1
-                new_priority = max(100 - ((rank - 1) * 3), 10)
-                
-                # Override the point-based priority with deterministic queue priority
-                if item.get('is_root_cause'):
-                    new_priority = max(new_priority, 90) # Root causes always at least 90
-                
-                item['execution_priority'] = new_priority
-                item['recommended_action'] = cls._pm_decision(new_priority, item.get('dependency_owner', 'Internal'), item.get('is_root_cause', False), item.get('longest_path', []))
-                
-                # Apply PMO UI Labels (Category overrides)
-                e_type = item.get("entity_type", "")
-                ep = item.get("execution_priority", 0)
-                cp = item.get("cascade_priority", 0)
-                sp = item.get("schedule_priority", 0)
-                
-                if e_type in ["SCOPE_REQUEST", "CHANGE_REQUEST"]:
-                    item["category"] = "SCOPE_CHANGE"
-                elif ep >= 90:
-                    item["category"] = "EXECUTION_BLOCKER"
-                elif cp > 0:
-                    item["category"] = "CRITICAL_PATH_RISK"
-                elif sp >= 50:
-                    item["category"] = "SCHEDULE_RISK"
-                elif e_type == "ACTION_ITEM":
-                    item["category"] = "ACTION_ITEM"
-                else:
-                    pass
-
-                formatted = RiskScoringEngine.format_reasoning(
-                    score=item.get("risk_score"),
-                    severity=item.get("risk") or item.get("risk_level"),
-                    category=item.get("category"),
-                    entity_type=item.get("entity_type"),
-                    status=item.get("current_status"),
-                    progress=item.get("progress"),
-                    earliest_root_cause=item.get("is_root_cause"),
-                    cascade_count=item.get("cascade_count"),
-                    blocked_by=item.get("blockers"),
-                    blocking=item.get("blocking_names"),
-                    direct_blocking=item.get("direct_blocking_names"),
-                    breakdown=item.get("score_breakdown"),
-                    mom_evidence=item.get("mom_evidence"),
-                    original_contract_sentence=item.get("original_contract_sentence"),
-                    immediate_unlocks=item.get("immediate_unlocks"),
-                    future_unlocks=item.get("future_unlocks"),
-                    longest_path=item.get("longest_path"),
-                    next_milestone_name=item.get("next_milestone_name"),
-                    next_milestone_date=item.get("next_milestone_date"),
-                    days_to_next_milestone=item.get("days_to_next_milestone"),
-                    execution_priority=item.get("execution_priority", 0),
-                    cascade_priority=item.get("cascade_priority", 0),
-                    schedule_priority=item.get("schedule_priority", 0),
-                    execution_reasons=item.get("execution_reasons", [])
-                )
-                    
-                original_reasoning = item.get('reasoning') or item.get('reason', '')
-                if original_reasoning:
-                    original_reasoning = original_reasoning.replace("Description:\n", "").replace("Description:\r\n", "")
-                    formatted = f"Why is this a risk?\n{original_reasoning}\n\n------------------------\n{formatted}"
-                    
-                if 'reasoning' in item:
-                    item['reasoning'] = formatted
-                if 'reason' in item:
-                    item['reason'] = formatted
-                    
             return final_list
 
         out_of_scope_activities = dedup_items(out_of_scope_activities, "activity")
@@ -1103,10 +1028,61 @@ class RiskEvaluationAgent:
         # 4. Risk Ranking Engine
         timeline_deliverables = RiskRankingEngine.rank_risks(tracker_items, category_priorities)
         
-        # Stamp priority_order on each item so the DB query can ORDER BY it
+        # Stamp priority_order on each item so the DB query can ORDER BY it,
+        # and generate PM recommendations / formatted reasoning using finalized priorities.
         for rank_idx, item in enumerate(timeline_deliverables):
             item["priority_order"] = rank_idx + 1
             item["action_priority_score"] = item.get("execution_priority_score", 0)
+            
+            ep = item.get("execution_priority_score", 0)
+            item['recommended_action'] = cls._pm_decision(ep, item.get('dependency_owner', 'Internal'), item.get('is_root_cause', False), item.get('longest_path', []))
+            
+            e_type = item.get("entity_type", "")
+            cp = item.get("cascade_priority", 0)
+            sp = item.get("schedule_priority", 0)
+            
+            if e_type in ["SCOPE_REQUEST", "CHANGE_REQUEST"]:
+                item["category"] = "SCOPE_CHANGE"
+            elif ep >= 90:
+                item["category"] = "EXECUTION_BLOCKER"
+            elif cp > 0:
+                item["category"] = "CRITICAL_PATH_RISK"
+            elif sp >= 50:
+                item["category"] = "SCHEDULE_RISK"
+            elif e_type == "ACTION_ITEM":
+                item["category"] = "ACTION_ITEM"
+                
+            formatted = RiskScoringEngine.format_reasoning(
+                score=item.get("risk_score"),
+                severity=item.get("risk") or item.get("risk_level"),
+                category=item.get("category"),
+                entity_type=item.get("entity_type"),
+                status=item.get("current_status"),
+                progress=item.get("progress"),
+                earliest_root_cause=item.get("is_root_cause"),
+                cascade_count=item.get("cascade_count"),
+                blocked_by=item.get("blockers"),
+                blocking=item.get("blocking_names"),
+                direct_blocking=item.get("direct_blocking_names"),
+                breakdown=item.get("score_breakdown"),
+                mom_evidence=item.get("mom_evidence"),
+                original_contract_sentence=item.get("original_contract_sentence"),
+                narratives=item.get("narratives", {}),
+                immediate_unlocks=item.get("immediate_unlocks"),
+                future_unlocks=item.get("future_unlocks"),
+                longest_path=item.get("longest_path"),
+                next_milestone_name=item.get("next_milestone_name"),
+                next_milestone_date=item.get("next_milestone_date"),
+                days_to_next_milestone=item.get("days_to_next_milestone"),
+                execution_priority=ep,
+                cascade_priority=cp,
+                schedule_priority=sp,
+                execution_reasons=item.get("execution_reasons", [])
+            )
+            if 'reasoning' in item:
+                item['reasoning'] = formatted
+            if 'reason' in item:
+                item['reason'] = formatted
 
         # --- DEBUG: confirm category-first ordering ---
         print("[RankEngine] Ranked order:",
@@ -1131,6 +1107,7 @@ class RiskEvaluationAgent:
         risk_score = final_assessment.get("riskScore", 0)
         summary = final_assessment.get("summary", "")
         highest_action_priority = final_assessment.get("highestActionPriority")
+        project_executive_summary = final_assessment.get("project_executive_summary")
         if highest_action_priority:
             # We can prepend the top priority to recommendations or keep it in the summary object
             pass
@@ -1140,7 +1117,8 @@ class RiskEvaluationAgent:
             "in_scope": in_scope_result,
             "out_of_scope": out_of_scope_result,
             "timeline": timeline_result,
-            "highestActionPriority": highest_action_priority
+            "highestActionPriority": highest_action_priority,
+            "project_executive_summary": project_executive_summary
         }
 
         # STEP 8: Persist to DB
@@ -1288,7 +1266,8 @@ class RiskEvaluationAgent:
                 priority_order=deliv.get('priority_order'),
                 status=target_status,
                 risk_source=deliv.get('risk_source', 'OBSERVED'),
-                recommended_action=deliv.get('recommended_action')
+                recommended_action=deliv.get('recommended_action'),
+                execution_priority_score=deliv.get('execution_priority', deliv.get('execution_priority_score', deliv.get('action_priority_score', 0)))
             )
 
             # Use alert threshold from DB config (not hardcoded 70)

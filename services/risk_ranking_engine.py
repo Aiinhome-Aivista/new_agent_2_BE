@@ -1,53 +1,35 @@
 class RiskRankingEngine:
 
-    # Business priority order — lower number = higher rank in the output.
-    # Items within the same tier are ordered by execution_priority_score DESC.
-    CATEGORY_TIER = {
-        "ROOT_CAUSE":                  1,
-        "CUSTOMER_DEPENDENCY":         2,
-        "DIRECT_EXECUTION_BLOCKER":    4,
-        "TRANSITIVE_EXECUTION_BLOCKER": 5,
-        "EXECUTION_BLOCKER":           3,
-        "TECHNICAL_DEPENDENCY":        6,
-        "SCOPE_CREEP":                 7,
-        "DELAY":                       8,
-        "GENERAL":                     9,
-        "OBSERVATION":                10,
-    }
-
     @classmethod
-    def rank_risks(cls, tracker_items: list, category_priorities: dict) -> list:
+    def rank_risks(cls, tracker_items: list, category_priorities: dict = None) -> list:
         """
-        Graph-first, score-second ranking.
-
-        Primary sort  : business category tier (ROOT_CAUSE first, GENERAL last)
-        Secondary sort : execution_priority_score DESC within the same tier
-        Tertiary sort : cascade_count DESC as a tiebreaker
+        Graph-first ranking.
+        The UI priority score is derived directly from the Topological Execution Queue order.
+        We do NOT sort by risk severity anymore. We sort strictly by queue_order.
         """
-
-        def sort_key(item):
-            # 1. Graph Topological Order (queue_order) - Lowest number first
-            q_order = item.get("queue_order", 9999)
-            
-            # 2. Execution Priority (Highest first) - Tiebreaker
-            exec_pri = item.get("execution_priority", 0)
-            
-            # 3. Cascade Priority (Highest first)
-            casc_pri = item.get("cascade_priority", 0)
-            
-            # 4. Schedule Priority (Highest first)
-            sched_pri = item.get("schedule_priority", 0)
-            
-            # 5. Risk Score (Highest first) - Legacy tiebreaker
-            risk_score = item.get("execution_priority_score", 0)
-            
-            # Return tuple for sorting
-            return (q_order, -exec_pri, -casc_pri, -sched_pri, -risk_score)
-
         eligible_items = [
             i for i in tracker_items
             if i.get("current_status") not in ["COMPLETED", "CANCELLED"]
         ]
+        
+        # Sort by queue_order (ascending)
+        # queue_order 1 = highest execution priority
+        eligible_items.sort(key=lambda x: x.get("queue_order", 9999))
+        
+        # Assign deterministic UI Execution Priority based on ordinal queue position
+        total = len(eligible_items)
+        for idx, item in enumerate(eligible_items):
+            # E.g., if total=10, 1st gets 100, 2nd gets 90, 3rd gets 80, etc. (capped at 100, min 1)
+            # This is exactly what the PM sees in the UI priority badge
+            # A more nuanced formula could be used, but this maps queue strictly to a 1-100 score.
+            # Example: 100 - ( (idx / max(1, total-1)) * 100 )
+            # Let's map it from 100 down to 10
+            if total <= 1:
+                ui_score = 100
+            else:
+                ui_score = 100 - int((idx / (total - 1)) * 90)
+                
+            item["execution_priority_score"] = ui_score
+            item["execution_priority"] = ui_score
 
-        return sorted(eligible_items, key=sort_key)
-
+        return eligible_items

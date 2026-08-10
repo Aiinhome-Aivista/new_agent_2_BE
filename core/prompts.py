@@ -146,6 +146,16 @@ Output MUST be a valid JSON object:
    "overallRisk": "HIGH",
    "riskScore": 72,
    "summary": "2 sentence summary of overall project risk status.",
+   "project_executive_summary": {{
+      "status": "⚠ At Risk",
+      "tracked_items": 15,
+      "critical_risks": 3,
+      "highest_priority": "Production CRM API Credentials",
+      "progress_percent": 27,
+      "new_blockers": 2,
+      "resolved_items": 1,
+      "ai_summary": "The project is progressing as planned, however three customer dependencies are preventing execution of the critical path. Immediate customer action is required to avoid delaying CRM Integration, SIT and Production Deployment."
+   }},
    "highestActionPriority": {{
       "activity": "Name of the Delayed/Blocked item with the highest action_priority_score",
       "status": "In Progress (70%) or similar",
@@ -176,11 +186,14 @@ work activity, deliverable update, action item, or scope request mentioned.
 
 CRITICAL RULES:
 1. DO NOT CLASSIFY the items (do not decide if it's a Risk, Action, Dependency, etc). Your job is PURE FACT EXTRACTION.
-2. Extract the raw statement or entity name.
+2. Extract the raw statement or entity name as `statement`.
 3. Identify any primary action verb associated with the statement.
-4. Identify the owner, assignee, or responsible party if mentioned.
+4. Identify the owner/responsible party: INTERNAL, CUSTOMER, VENDOR, or THIRD_PARTY.
 5. Identify any due date or deadline mentioned.
-6. Identify if this item is explicitly blocking or delaying any other milestones (return the names of the blocked items).
+6. Identify if this item is explicitly blocking or delaying any other deliverables/activities.
+   CRITICAL FOR DEPENDENCIES:
+   - `blocks` and `blocked_by` MUST contain project deliverables/activities ONLY (e.g. ["CRM Integration"], ["Production VPN Access"]).
+   - NEVER put statuses ("Pending review", "Waiting", "Completed", "Blocked"), owners ("Customer", "Internal"), roles, or dates into `blocks` or `blocked_by`.
 7. Preserve the exact original sentence as `source_sentence`.
 8. Ignore greetings, attendance lists, signatures, and agenda headings.
 9. Extract any items that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-1) and the exact evidence sentence.
@@ -192,7 +205,7 @@ Output MUST be valid JSON conforming to the following structure:
     {{
       "statement": "Production VPN Access",
       "verb": "provide",
-      "owner": "Customer",
+      "owner": "CUSTOMER",
       "due_date": "2026-09-09",
       "blocks": ["CRM Integration"],
       "confidence": 0.98,
@@ -229,24 +242,33 @@ RULES:
    c. If NO baseline match exists → use the normalized activity name.
 
 2. STATUS EXTRACTION:
-   - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, or UNKNOWN.
+   - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, WAITING_ON_CUSTOMER, or UNKNOWN.
 
-3. BLOCKED BY & BLOCKS:
-   - If the activity is blocked or waiting on something, list exactly what it is blocked by as an array of strings (e.g., ["API Credentials", "VPN"]).
+3. BLOCKED BY & BLOCKS (STRICT ENTITY ONLY):
+   - `blocked_by` and `blocks` MUST contain valid project deliverables or activities ONLY (e.g. ["Production CRM API Credentials"]).
+   - NEVER include statuses ("Pending review", "Waiting", "Completed"), owners ("Customer", "Vendor", "Internal"), roles ("QA Lead"), dates, or evidence phrases.
    - If not blocked, return an empty array [].
-   - If the activity explicitly BLOCKS or delays another downstream milestone/activity, list those items in the "blocks" array. If it doesn't block anything, return [].
 
-4. PROGRESS:
-   - Extract progress percentage if explicitly mentioned (e.g., 70 for 70%). Otherwise, null.
+4. OWNER:
+   - Extract the entity owner: INTERNAL, CUSTOMER, VENDOR, or THIRD_PARTY.
 
-5. ENTITY TYPE:
+5. PROGRESS:
+   - Extract progress percentage if explicitly mentioned (e.g., 70 for 70%). Otherwise, null. NEVER invent percentages.
+
+6. ENTITY TYPE:
    - Identify what kind of entity this is: MILESTONE, DEPENDENCY, SCOPE_REQUEST, ACTION_ITEM, or RISK.
 
-6. EVIDENCE TEXT:
+7. EVIDENCE TEXT:
    - You MUST provide `evidence_text` for every extracted fact. Every downstream calculation must be traceable back to the original MoM sentence.
 
-7. REASONING:
-   - Provide a 2-3 sentence business-friendly narrative explaining the situation (e.g. "SIT start is delayed by 2 weeks. This will automatically block UAT."). Do not output raw scoring or numeric calculations.
+8. NARRATIVES (PMO Executive View):
+   - You must generate a set of PM-friendly narratives. DO NOT use technical jargon (like "cascade depth" or "immediate unlock").
+   - `executive_summary`: 1-2 sentence PM executive summary of the item and its impact.
+   - `gap_analysis`: Expected (from baseline) vs Actual (from MoM) gap analysis. (e.g. "Expected completion by X, but still pending.")
+   - `why_important`: Non-technical explanation of importance and what will slip if not resolved.
+   - `business_impact.immediate`: What is blocked right now?
+   - `business_impact.future`: What will slip in the future?
+   - `ai_interpretation`: Coherent story interpreting the evidence.
 
 Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
 [
@@ -254,12 +276,22 @@ Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER
     "activity": "Activity name as given",
     "entity_type": "MILESTONE|DEPENDENCY|SCOPE_REQUEST|ACTION_ITEM|RISK",
     "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
-    "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|UNKNOWN",
+    "owner": "INTERNAL|CUSTOMER|VENDOR|THIRD_PARTY",
+    "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|WAITING_ON_CUSTOMER",
     "progress": 70,
-    "blocked_by": ["Item 1", "Item 2"],
+    "blocked_by": ["Item 1"],
     "blocks": ["Downstream Item 1"],
     "evidence_text": "Exact quote from document proving this status/blocker.",
-    "reasoning": "2-3 sentences explaining the business impact and risk.",
+    "narratives": {{
+        "executive_summary": "1-2 sentence summary",
+        "gap_analysis": "Expected vs Actual",
+        "why_important": "Non-technical explanation",
+        "business_impact": {{
+           "immediate": "Immediate impact",
+           "future": "Future impact"
+        }},
+        "ai_interpretation": "AI interpretation of evidence"
+    }},
     "recommended_action": "Specific actionable recommendation to resolve this item, if blocked or delayed, else null"
   }}
 ]

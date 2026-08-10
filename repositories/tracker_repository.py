@@ -35,6 +35,11 @@ class TrackerRepository:
                     conn.commit()
                 except Exception:
                     pass  # already exists
+                try:
+                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN execution_priority_score INT NULL;")
+                    conn.commit()
+                except Exception:
+                    pass  # already exists
                 cursor.close()
                 conn.close()
         except Exception as e:

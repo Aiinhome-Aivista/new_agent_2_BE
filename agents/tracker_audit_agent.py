@@ -25,16 +25,10 @@ class TrackerAuditAgent:
                              requires_escalation: bool, title: str = None, reference_id: int = None,
                              priority_order: int = None, status: str = 'NOT_STARTED',
                              resolve_only: bool = False, risk_source: str = 'OBSERVED',
-                             recommended_action: str = None) -> int:
+                             recommended_action: str = None, execution_priority_score: int = None) -> int:
         """
         Acts as the Tracker & Audit Agent. Deterministically persists state with evidence lineage
         into the `tracker_items` table and logs the action in the `audit_logs` table.
-
-        Key invariants:
-        - risk_origin is IMMUTABLE: set once on creation, never overwritten on updates.
-        - previous_highest_score tracks the peak risk_score across the item's lifetime.
-        - On resolution: risk_score → 0, priority_order → NULL, reasoning → cleared.
-          Historical reasoning is always preserved in audit_logs.
         """
         import re
         norm_title = re.sub(r'[^\w\s]', '', (title or "").lower().strip())
@@ -72,12 +66,7 @@ class TrackerAuditAgent:
             existing_origin   = matched_row['risk_origin']   if isinstance(matched_row, dict) else matched_row[7]
             existing_peak     = matched_row['previous_highest_score'] if isinstance(matched_row, dict) else matched_row[8]
 
-            # ── Immutable origin: once set, never change ──────────────────────
-            # If risk_origin already has a value, keep it; don't overwrite history.
-            risk_origin_value = existing_origin  # always preserve original
-
-            # ── Track the peak risk score across the item's lifetime ──────────
-            # previous_highest_score = max(existing_peak, old_score, new_score)
+            risk_origin_value = existing_origin
             candidate_scores = [s for s in [existing_peak, existing_score, risk_score] if s is not None]
             new_peak = max(candidate_scores) if candidate_scores else risk_score
 
@@ -86,18 +75,17 @@ class TrackerAuditAgent:
             elif status != 'RESOLVED':
                 status = 'OPEN'
 
-            # ── On resolution: score → 0, reasoning → cleared ────────────────
             if status == 'RESOLVED':
                 final_risk_score = 0
-                final_risk_level = existing_level   # preserve historical severity label
-                final_priority   = None             # free up priority rank slot
-                # Clear reasoning; full history is in audit_logs
+                final_exec_score = 0
+                final_risk_level = existing_level
+                final_priority   = None
                 final_reasoning  = None
             else:
                 final_risk_score = risk_score
+                final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
                 final_risk_level = risk_level
                 final_priority   = priority_order if priority_order is not None else existing_priority
-                # Append new reasoning only if genuinely new content
                 if reasoning and (reasoning[:50] not in (existing_reasoning or "")):
                     final_reasoning = (existing_reasoning or "") + "\nUpdate: " + reasoning
                 else:
@@ -105,12 +93,12 @@ class TrackerAuditAgent:
 
             db_cursor.execute("""
                 UPDATE tracker_items
-                SET risk_score = %s, risk_level = %s, confidence = %s, reasoning = %s,
+                SET risk_score = %s, execution_priority_score = %s, risk_level = %s, confidence = %s, reasoning = %s,
                     source_document_id = %s, status = %s, risk_source = %s,
                     priority_order = %s, previous_highest_score = %s, recommended_action = %s
                 WHERE id = %s
             """, (
-                final_risk_score, final_risk_level, confidence, final_reasoning,
+                final_risk_score, final_exec_score, final_risk_level, confidence, final_reasoning,
                 document_id, status, risk_source,
                 final_priority, new_peak, recommended_action, existing_id
             ))
@@ -126,20 +114,20 @@ class TrackerAuditAgent:
                 action_type = 'UPDATED'
         else:
             if resolve_only:
-                return None  # Do not create a new record if we only intend to resolve an existing one.
+                return None
 
-            # 2. First-time INSERT — set risk_origin here; it will never change after this.
             fallback_label = risk_category.replace('_', ' ').title() if risk_category else 'Execution Risk'
             risk_origin_value = _ORIGIN_MAP.get(risk_category, fallback_label)
-            new_peak = risk_score  # initial peak = first observed score
+            new_peak = risk_score
 
             has_priority = priority_order is not None
+            final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
             tracker_sql = """
                 INSERT INTO tracker_items
                 (project_id, source_document_id, item_type, reference_id, title, is_out_of_scope,
-                 risk_score, previous_highest_score, risk_level, risk_category, risk_origin,
+                 risk_score, execution_priority_score, previous_highest_score, risk_level, risk_category, risk_origin,
                  confidence, reasoning, requires_escalation, risk_source{priority_col}, status, recommended_action)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{priority_placeholder}, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{priority_placeholder}, %s, %s)
             """.format(
                 priority_col=", priority_order" if has_priority else "",
                 priority_placeholder=", %s" if has_priority else ""
@@ -147,7 +135,7 @@ class TrackerAuditAgent:
             extra_vals = (priority_order,) if has_priority else ()
             db_cursor.execute(tracker_sql, (
                 project_id, document_id, item_type, reference_id, title, int(is_out_of_scope),
-                risk_score, new_peak, risk_level, risk_category, risk_origin_value,
+                risk_score, final_exec_score, new_peak, risk_level, risk_category, risk_origin_value,
                 confidence, reasoning, int(requires_escalation), risk_source
             ) + extra_vals + (status, recommended_action))
             tracker_id = db_cursor.lastrowid

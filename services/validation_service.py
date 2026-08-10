@@ -17,7 +17,7 @@ class ValidationService:
         # (Assuming baseline matching already happened in extraction phase)
         
         # 1. Build Dependency Graph and detect root causes / cascade counts
-        enriched = DependencyGraphBuilder.build_and_enrich(candidates)
+        enriched = DependencyGraphBuilder.build_and_enrich(candidates, baseline_items=scope_items)
         
         # 2. Assign Semantic Risk Types based on deterministic rules
         for cand in enriched:

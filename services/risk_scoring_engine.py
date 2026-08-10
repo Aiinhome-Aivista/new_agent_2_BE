@@ -178,119 +178,45 @@ class RiskScoringEngine:
         execution_priority: int = 0,
         cascade_priority: int = 0,
         schedule_priority: int = 0,
-        execution_reasons: list = None
+        execution_reasons: list = None,
+        **kwargs
     ) -> str:
         """
         Formats the full evidence-backed reasoning string stored in tracker_items.reasoning
         """
+        if "narratives" in kwargs and kwargs["narratives"]:
+            import json
+            payload = kwargs["narratives"]
+            payload["_type"] = "pmo_narrative"
+            
+            # Mix in legacy properties for the UI to use if it wants
+            if original_contract_sentence:
+                payload["original_contract_sentence"] = original_contract_sentence
+            if mom_evidence:
+                payload["mom_evidence"] = mom_evidence
+            if longest_path:
+                payload["execution_chain"] = longest_path
+                
+            return json.dumps(payload)
+            
+        # Legacy fallback
         lines = []
-        
         if status == 'RESOLVED' or category == 'RESOLVED':
-            lines.append("Current Status")
-            lines.append("• Resolved")
-            lines.append("")
-            lines.append("Evidence")
-            lines.append(f'"{mom_evidence}"')
+            lines.append("Current Status\n• Resolved\n")
+            lines.append(f'Evidence\n"{mom_evidence}"')
             return "\n".join(lines)
             
-        # Status & Progress
-        status_display = status.replace("_", " ").title() if status else "Unknown"
-        lines.append(f"Current Status: {status_display} {f'({progress}%)' if progress is not None else ''}")
-        lines.append("")
+        lines.append(f"Current Status: {status.replace('_', ' ').title()} {f'({progress}%)' if progress is not None else ''}\n")
         
-        # Execution Reasons (New Priority logic)
-        if execution_reasons:
-            lines.append("Execution Reason")
-            for reason in execution_reasons:
-                lines.append(reason)
-            lines.append("")
-
-        # Blocked By
-        if blocked_by:
-            lines.append("------------------------")
-            if entity_type == "DEPENDENCY" or category == "CUSTOMER_DEPENDENCY":
-                lines.append("Dependency / Waiting For")
-            else:
-                lines.append("Blocked By")
-            for b in blocked_by:
-                lines.append(f"• {b}")
-            lines.append("")
-
-        # Execution Chain
-        lines.append("------------------------")
-        lines.append("Execution Chain")
-        lines.append("")
-        
-        # Only use longest_path which is strictly ordered by graph traversal
-        raw_chain = longest_path if longest_path else []
-        chain_items = []
-        
-        for item in raw_chain:
-            if not item:
-                continue
-            name = None
-            if isinstance(item, str):
-                name = item
-            elif isinstance(item, dict):
-                name = item.get("name") or item.get("deliverable") or item.get("activity") or item.get("title")
-            else:
-                try:
-                    name = str(item)
-                except:
-                    pass
-            
-            if name:
-                chain_items.append(name)
-                
-        if not chain_items:
-            lines.append("No downstream dependencies")
-        else:
-            seen = set()
-            unique_chain = []
-            for item in chain_items:
-                if item not in seen:
-                    unique_chain.append(item)
-                    seen.add(item)
-            
-            chain_str = " -> ".join(unique_chain)
-            lines.append(chain_str)
-            lines.append("")
-            
-        # Score Breakdown
-        if breakdown:
-            lines.append("------------------------")
-            lines.append("Score Breakdown")
-            for k, v in breakdown.items():
-                k_title = k.replace("_", " ").title()
-                lines.append(f"{k_title}: {v}")
-            lines.append("")
-            
-        if next_milestone_name:
-            lines.append("------------------------")
-            lines.append("Schedule Urgency")
-            lines.append(f"Next milestone: {next_milestone_name}")
-            if next_milestone_date:
-                lines.append(f"Planned Start: {next_milestone_date}")
-            if days_to_next_milestone is not None:
-                lines.append(f"Starts in: {days_to_next_milestone} days")
-            lines.append("")
-
         if original_contract_sentence:
-            lines.append("------------------------")
-            lines.append("Original Contract")
-            lines.append(f'"{original_contract_sentence}"')
-            lines.append("")
+            lines.append("------------------------\nOriginal Contract\n" + f'"{original_contract_sentence}"\n')
             
         if mom_evidence:
-            clean_evidence = mom_evidence.replace("Evidence (MoM)", "").replace("Evidence:", "").strip()
-            # Also remove leading/trailing quotes if they exist
-            if clean_evidence.startswith('"') and clean_evidence.endswith('"'):
-                clean_evidence = clean_evidence[1:-1].strip()
+            clean = mom_evidence.replace("Evidence (MoM)", "").replace("Evidence:", "").strip()
+            if clean.startswith('"') and clean.endswith('"'): clean = clean[1:-1].strip()
+            # Deduplicate if mom_evidence is identical to original_contract_sentence
+            if not original_contract_sentence or clean.lower() != original_contract_sentence.lower():
+                lines.append(f'------------------------\nEvidence (MoM)\n"{clean}"')
             
-            if clean_evidence:
-                lines.append("------------------------")
-                lines.append("Evidence (MoM)")
-                lines.append(f'"{clean_evidence}"')
-
         return "\n".join(lines).strip()
 
