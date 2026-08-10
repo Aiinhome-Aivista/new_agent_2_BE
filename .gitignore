@@ -24,3 +24,5 @@ data/
 *.swp
 
 requirements.txt
+*.md
+*.txt

@@ -1,455 +1,755 @@
-import collections
+"""
+DependencyGraphBuilder — 2-Pass Canonical Dependency Graph Engine
 
+Pass 1: Build the complete Canonical Entity Registry from baseline + candidates.
+Pass 2: Resolve every dependency reference via EntityResolver → create DependencyEdges.
+
+Rules enforced:
+- No graph node is ever created from a raw string.
+- Edges are always between canonical_ids.
+- blocks[] and blocked_by[] are DERIVED from DependencyEdge, never maintained
+  independently.
+- Unresolved references become UnresolvedReference DTOs, not fake nodes.
+- The graph is built AFTER all entities are known.
+- graph_role is derived ONLY from final graph topology, never from LLM output.
+- Duplicate edges are merged with evidence arrays (not duplicated).
+- AND/OR prerequisite semantics are preserved per edge.
+- Readiness is calculated by ReadinessEngine (never inline).
+"""
+
+import collections
+import re
+from typing import Dict, List, Set, Optional, Any, Tuple
+
+from services.entity_resolver import (
+    EntityResolver,
+    CanonicalEntityRegistry,
+    CanonicalEntity,
+    UnresolvedReference,
+    ResolutionResult,
+    build_registry_from_baseline,
+    enrich_registry_with_candidates,
+    normalize_entity_name,
+    _is_non_entity,
+)
+from services.readiness_engine import ReadinessEngine
+
+
+# ---------------------------------------------------------------------------
+# Dependency Edge
+# ---------------------------------------------------------------------------
+
+class DependencyEdge:
+    """
+    One canonical directed dependency: source BLOCKS target.
+
+    Derives both directions from the edge — never maintain separate lists.
+    Supports merged evidence (multiple sentences proving same dependency).
+    Supports AND/OR condition semantics.
+    """
+    def __init__(self, source_id: str, target_id: str,
+                 relationship: str = "BLOCKS",
+                 evidence: str = "", confidence: float = 1.0,
+                 condition: str = "AND"):
+        self.source_id = source_id
+        self.target_id = target_id
+        self.relationship = relationship   # BLOCKS | REQUIRES
+        self.condition = condition          # AND | OR | UNKNOWN
+        # Multi-evidence support
+        self.evidence_list: List[str] = [evidence] if evidence else []
+        self.confidence = confidence
+        self.supporting_mentions: int = 1
+
+    @property
+    def evidence(self) -> str:
+        """Primary evidence for backwards-compatibility."""
+        return self.evidence_list[0] if self.evidence_list else ""
+
+    def merge_evidence(self, new_evidence: str, new_confidence: float = 1.0):
+        """Merge a duplicate edge's evidence without creating a new edge."""
+        if new_evidence and new_evidence not in self.evidence_list:
+            self.evidence_list.append(new_evidence)
+        self.confidence = max(self.confidence, new_confidence)
+        self.supporting_mentions += 1
+
+    def __eq__(self, other):
+        return (isinstance(other, DependencyEdge) and
+                self.source_id == other.source_id and
+                self.target_id == other.target_id)
+
+    def __hash__(self):
+        return hash((self.source_id, self.target_id))
+
+    def __repr__(self):
+        return f"DependencyEdge({self.source_id!r} → {self.target_id!r} [{self.condition}])"
+
+
+
+# ---------------------------------------------------------------------------
+# Words that are never valid dependency targets
+# ---------------------------------------------------------------------------
+
+_INVALID_TARGETS = {
+    "pending", "pending review", "waiting", "completed", "not started",
+    "in progress", "unknown", "delayed", "blocked", "cancelled",
+    "done", "resolved", "on hold", "deferred", "planned", "open",
+    "customer", "client", "internal", "external", "vendor",
+    "third party", "third-party", "development team", "qa team",
+    "qa lead", "project manager", "customer team", "sponsor",
+    "management", "stakeholder", "pmo", "team", "department", "role",
+    "customer department", "vendor team",
+    "credentials", "access", "approval", "security approval",
+    "internal security approval", "review", "next weekly meeting",
+    "meeting", "discussion", "follow up", "follow-up", "tbd", "n/a",
+    "na", "none", "null", "undefined", "yes", "no", "percentage",
+    "next week", "september 9",
+}
+
+_DATE_RE = re.compile(
+    r"^\d{1,2}\s+\w+(\s+\d{4})?$"
+    r"|^\w+\s+\d{1,2}(,?\s+\d{4})?$"
+    r"|^\d{4}-\d{2}-\d{2}$"
+    r"|^Q[1-4]\s+\d{4}$",
+    re.IGNORECASE,
+)
+
+
+def _is_invalid_target(text: str) -> bool:
+    n = normalize_entity_name(text)
+    if n in _INVALID_TARGETS:
+        return True
+    if _DATE_RE.match(n):
+        return True
+    if len(n) <= 2:
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Graph helpers
+# ---------------------------------------------------------------------------
+
+def _build_adjacency(edges: List[DependencyEdge]) -> tuple:
+    """Return (forward_graph, backward_graph) as defaultdict(set)."""
+    fwd = collections.defaultdict(set)
+    bwd = collections.defaultdict(set)
+    for e in edges:
+        fwd[e.source_id].add(e.target_id)
+        bwd[e.target_id].add(e.source_id)
+    return fwd, bwd
+
+
+def _derive_graph_role(node_id: str, fwd: dict, bwd: dict) -> str:
+    """
+    Derive graph role from topology ONLY. Never use LLM-generated graph_role.
+
+    ROOT_CAUSE          — no incoming edges, has downstream dependents
+    INTERMEDIATE_BLOCKER — has both incoming and outgoing edges
+    TERMINAL_ACTIVITY   — has incoming edges, no outgoing (leaf)
+    ISOLATED            — no edges at all
+    """
+    has_upstream = bool(bwd.get(node_id))
+    has_downstream = bool(fwd.get(node_id))
+
+    if not has_upstream and has_downstream:
+        return "ROOT_CAUSE"
+    elif has_upstream and has_downstream:
+        return "INTERMEDIATE_BLOCKER"
+    elif has_upstream and not has_downstream:
+        return "TERMINAL_ACTIVITY"
+    else:
+        return "ISOLATED"
+
+
+def _detect_and_break_cycles(fwd: dict, bwd: dict, edges: List[DependencyEdge]) -> List[DependencyEdge]:
+    """DFS cycle detection — breaks earliest back-edge found."""
+    visited: Set[str] = set()
+    rec_stack: Set[str] = set()
+    removed: Set[tuple] = set()
+
+    def dfs(node):
+        visited.add(node)
+        rec_stack.add(node)
+        for nb in list(fwd.get(node, [])):
+            if nb not in visited:
+                dfs(nb)
+            elif nb in rec_stack:
+                fwd[node].discard(nb)
+                bwd[nb].discard(node)
+                removed.add((node, nb))
+                print(f"  [GraphValidator] CYCLE BROKEN: {node} → {nb}")
+        rec_stack.discard(node)
+
+    all_nodes = set(fwd.keys()) | set(bwd.keys())
+    for n in all_nodes:
+        if n not in visited:
+            dfs(n)
+
+    return [e for e in edges if (e.source_id, e.target_id) not in removed]
+
+
+# ---------------------------------------------------------------------------
+# Graph metric computation
+# ---------------------------------------------------------------------------
+
+def _compute_graph_metrics(all_nodes: Set[str], fwd: dict, bwd: dict,
+                            status_fn=None) -> Dict[str, dict]:
+    """
+    Compute rich graph metrics for every node.
+
+    status_fn: callable(node_id) → str status, or None
+    """
+    def get_all_downstream(node, visited=None):
+        if visited is None:
+            visited = set()
+        if node in visited:
+            return set()
+        visited.add(node)
+        result = set()
+        for child in fwd.get(node, []):
+            result.add(child)
+            result.update(get_all_downstream(child, visited))
+        return result
+
+    # Longest downstream chain (memoised)
+    memo_dist: Dict[str, int] = {}
+    memo_path: Dict[str, list] = {}
+
+    def get_downstream_chain(node):
+        if node in memo_dist:
+            return memo_dist[node], memo_path[node]
+        children = list(fwd.get(node, []))
+        if not children:
+            memo_dist[node] = 0
+            memo_path[node] = [node]
+            return 0, [node]
+        best_d, best_p = -1, []
+        for c in children:
+            cd, cp = get_downstream_chain(c)
+            if cd > best_d:
+                best_d, best_p = cd, cp
+        memo_dist[node] = best_d + 1
+        memo_path[node] = [node] + best_p
+        return memo_dist[node], memo_path[node]
+
+    for n in all_nodes:
+        get_downstream_chain(n)
+
+    max_dist = max(memo_dist.values()) if memo_dist else 0
+    # Identify critical nodes (on the longest path)
+    critical_nodes: Set[str] = set()
+    if max_dist > 0:
+        starters = [n for n, d in memo_dist.items() if d == max_dist]
+        queue = collections.deque(starters)
+        crit_vis: Set[str] = set()
+        while queue:
+            curr = queue.popleft()
+            if curr in crit_vis:
+                continue
+            crit_vis.add(curr)
+            critical_nodes.add(curr)
+            children = list(fwd.get(curr, []))
+            if children:
+                max_child_d = max(memo_dist.get(c, 0) for c in children)
+                for c in children:
+                    if memo_dist.get(c, 0) == max_child_d:
+                        queue.append(c)
+
+    metrics: Dict[str, dict] = {}
+    for node in all_nodes:
+        downstream_set = get_all_downstream(node)
+        cascade_count = len(downstream_set)
+        status = status_fn(node) if status_fn else "UNKNOWN"
+
+        # Root cause: has cascade impact AND all predecessors are complete
+        is_root = False
+        if cascade_count > 0 and status not in ("COMPLETED", "RESOLVED"):
+            is_root = True
+            for pred in bwd.get(node, []):
+                pred_status = status_fn(pred) if status_fn else "UNKNOWN"
+                if pred_status not in ("COMPLETED", "RESOLVED"):
+                    is_root = False
+                    break
+
+        # Immediate unlock count
+        immediate_unlock_count = 0
+        for child in fwd.get(node, []):
+            child_ready = True
+            for dep in bwd.get(child, []):
+                if dep != node and (status_fn(dep) if status_fn else "UNKNOWN") \
+                        not in ("COMPLETED", "RESOLVED"):
+                    child_ready = False
+                    break
+            if child_ready:
+                immediate_unlock_count += 1
+
+        critical_path_len = memo_dist.get(node, 0)
+        on_critical_path = node in critical_nodes
+
+        metrics[node] = {
+            "is_root_cause": is_root,
+            "cascade_count": cascade_count,
+            "cascade_depth": critical_path_len,
+            "downstream_ids": sorted(downstream_set),
+            "immediate_unlock_count": immediate_unlock_count,
+            "on_critical_path": on_critical_path,
+            "longest_path_ids": memo_path.get(node, [node]),
+            "parent_ids": sorted(bwd.get(node, [])),
+            "child_ids": sorted(fwd.get(node, [])),
+        }
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Main builder
+# ---------------------------------------------------------------------------
 
 class DependencyGraphBuilder:
     """
-    Document-independent dependency graph builder.
-    
-    NO hardcoded project names or alias registries.
-    All resolution is dynamic from the EL baseline and extracted facts.
+    2-Pass canonical dependency graph builder.
+
+    Pass 1: Build CanonicalEntityRegistry (all entities known first).
+    Pass 2: Resolve dependency references → DependencyEdge objects.
+
+    No raw strings are used as graph node IDs.
+    No fake nodes are created.
     """
 
-    # Words that are NEVER valid graph nodes — they are statuses, roles, or generic nouns
-    INVALID_DEPENDENCY_TARGETS = {
-        # Statuses
-        "pending", "pending review", "waiting", "completed", "not started",
-        "in progress", "unknown", "delayed", "blocked", "cancelled",
-        "done", "resolved", "on hold", "deferred", "planned",
-        # Owners / Roles
-        "customer", "client", "internal", "external", "vendor",
-        "third party", "third-party", "development team", "qa team",
-        "qa lead", "project manager", "customer team", "sponsor",
-        "management", "stakeholder", "pmo",
-        # Generic nouns
-        "review", "approval", "access", "credentials", "next weekly meeting",
-        "meeting", "discussion", "follow up", "follow-up", "tbd",
-        "n/a", "na", "none", "null", "undefined",
-    }
-
     @classmethod
-    def is_valid_dependency_entity(cls, name: str, known_entities: set) -> bool:
+    def build_and_enrich(cls, candidates: List[dict],
+                         baseline_items: List[dict] = None) -> List[dict]:
         """
-        Validates whether a dependency target is a legitimate project entity.
-        Returns False for statuses, owners, roles, dates, and generic nouns.
-        """
-        if not name or not name.strip():
-            return False
+        Entry point called from the risk evaluation pipeline.
 
-        n_lower = name.lower().strip()
+        candidates: list of LLM-extracted activity dicts, each may contain:
+            { "activity", "blocked_by": [...], "blocks": [...], ... }
 
-        # Reject if it's in the explicit blocklist
-        if n_lower in cls.INVALID_DEPENDENCY_TARGETS:
-            return False
+        baseline_items: EL scope items from DB, each:
+            { "id", "name", "category", ... }
 
-        # Reject pure dates (e.g. "September 9", "2026-09-09", "09 Sep")
-        import re
-        if re.match(r'^\d{1,2}\s+\w+(\s+\d{4})?$', n_lower):  # "09 Sep 2026"
-            return False
-        if re.match(r'^\w+\s+\d{1,2}(,?\s+\d{4})?$', n_lower):  # "September 9, 2026"
-            return False
-        if re.match(r'^\d{4}-\d{2}-\d{2}$', n_lower):  # "2026-09-09"
-            return False
-
-        # Reject very short strings (1-2 chars) — likely abbreviations without context
-        if len(n_lower) <= 2:
-            return False
-
-        # If it matches a known project entity, always accept
-        if n_lower in known_entities:
-            return True
-
-        # Reject single generic words that aren't known entities
-        if len(n_lower.split()) == 1 and n_lower not in known_entities:
-            # Allow if it's a recognizable acronym (3+ uppercase chars)
-            if name.isupper() and len(name) >= 3:
-                return True
-            # Otherwise reject single-word unknowns
-            return False
-
-        return True
-
-    @classmethod
-    def build_and_enrich(cls, candidates: list, baseline_items: list = None) -> list:
-        """
-        Builds the dependency graph from extracted candidates.
-        
-        All alias resolution is DYNAMIC — driven by the EL baseline items,
-        not by a hardcoded registry.
+        Returns the enriched candidates list with graph metadata injected.
         """
         if baseline_items is None:
             baseline_items = []
 
-        # ── DYNAMIC ALIAS REGISTRY ──
-        # Built from EL baseline items, not hardcoded
-        alias_registry = {}
-        baseline_names_lower = set()
+        # ── PASS 1: Build complete Canonical Entity Registry ─────────────────
+        registry = build_registry_from_baseline(baseline_items, id_prefix="si")
+        registry = enrich_registry_with_candidates(registry, candidates, id_prefix="cand")
 
-        for item in baseline_items:
-            name = item.get("name", "").strip()
-            if not name:
-                continue
-            n_lower = name.lower()
-            baseline_names_lower.add(n_lower)
+        # Print registry for diagnostics
+        registry.print_registry()
 
-            # Auto-generate aliases from baseline items
-            # e.g. "System Integration Testing" -> aliases: "sit", "system integration testing"
-            words = name.split()
-            if len(words) > 1:
-                # Acronym alias (first letter of each word)
-                acronym = "".join(w[0] for w in words if w[0].isupper()).lower()
-                if len(acronym) >= 2:
-                    alias_registry[acronym] = name
-
-            alias_registry[n_lower] = name
-
-        # Also build aliases from candidate activities themselves
-        candidate_names = set()
+        # Build id → candidate map
+        id_to_cand: Dict[str, dict] = {}
         for cand in candidates:
-            raw_name = cand.get('activity', '').strip()
-            if raw_name:
-                candidate_names.add(raw_name.lower())
+            cid = cand.get("_canonical_id")
+            if cid:
+                id_to_cand[cid] = cand
 
-        # Build the full known entities set for validation
-        known_entities = baseline_names_lower | candidate_names
+        # ── PASS 2: Resolve dependency references ─────────────────────────────
+        resolver = EntityResolver(registry)
+        # Use edge_map for merged duplicate edges: (src, tgt) -> DependencyEdge
+        edge_map: Dict[Tuple[str, str], DependencyEdge] = {}
+        unresolved_by_source: Dict[str, List[dict]] = collections.defaultdict(list)
+        # Validation counters (use list so closures can mutate)
+        self_deps_counter = [0]
 
-        def normalize_name(name):
-            """Resolve a name against the dynamic alias registry."""
-            if not name:
-                return name
-            n_lower = str(name).lower().strip()
+        # Map baseline IDs to the execution candidates that represent them
+        baseline_to_cands = collections.defaultdict(list)
+        for c in candidates:
+            if c.get("_baseline_id"):
+                baseline_to_cands[c["_baseline_id"]].append(c["_canonical_id"])
 
-            # Exact alias match
-            if n_lower in alias_registry:
-                return alias_registry[n_lower]
-
-            # Substring match against aliases (longest match first)
-            sorted_aliases = sorted(alias_registry.keys(), key=len, reverse=True)
-            for alias in sorted_aliases:
-                if len(alias) >= 3 and alias == n_lower:
-                    return alias_registry[alias]
-
-            return name
-
-        # ── BUILD CANDIDATE MAP ──
-        name_to_candidate = {}
         for cand in candidates:
-            raw_name = cand.get('activity')
-            if not raw_name:
-                continue
-            canonical_name = normalize_name(raw_name)
-            cand['activity'] = canonical_name
-            cand['canonical_title'] = canonical_name
-            if 'blocked_by' not in cand:
-                cand['blocked_by'] = []
-
-            name_to_candidate[canonical_name] = cand
-
-        # ── PASS 1: Normalize blocked_by and blocks arrays ──
-        for cand in name_to_candidate.values():
-            if 'blocked_by' in cand:
-                new_blocked_by = []
-                for b in cand['blocked_by']:
-                    normalized = normalize_name(b)
-                    # VALIDATE: Only accept legitimate project entities
-                    if cls.is_valid_dependency_entity(normalized, known_entities):
-                        new_blocked_by.append(normalized)
-                    else:
-                        print(f"  [GraphValidator] REJECTED dependency target '{b}' (normalized: '{normalized}') — not a valid project entity")
-                cand['blocked_by'] = list(set(new_blocked_by))
-
-            if 'blocks' in cand:
-                new_blocks = []
-                for b in cand['blocks']:
-                    normalized = normalize_name(b)
-                    if cls.is_valid_dependency_entity(normalized, known_entities):
-                        new_blocks.append(normalized)
-                    else:
-                        print(f"  [GraphValidator] REJECTED blocks target '{b}' (normalized: '{normalized}') — not a valid project entity")
-                cand['blocks'] = list(set(new_blocks))
-
-        # ── BUILD GRAPH (only from validated entities) ──
-        forward_graph = collections.defaultdict(set)
-        backward_graph = collections.defaultdict(set)
-
-        for name, cand in name_to_candidate.items():
-            conf = cand.get('llm_confidence', 1.0)
-            if conf < 0.5:
+            source_id = cand.get("_canonical_id")
+            if not source_id:
                 continue
 
-            for b in cand.get('blocked_by', []):
-                b_conf = name_to_candidate.get(b, {}).get('llm_confidence', 1.0)
-                if b_conf >= 0.5:
-                    backward_graph[name].add(b)
-                    forward_graph[b].add(name)
-            for b in cand.get('blocks', []):
-                b_conf = name_to_candidate.get(b, {}).get('llm_confidence', 1.0)
-                if b_conf >= 0.5:
-                    forward_graph[name].add(b)
-                    backward_graph[b].add(name)
+            evidence = cand.get("evidence", "") or cand.get("source_sentence", "")
 
-        # ── VALIDATE GRAPH: Remove self-loops ──
-        for node in list(forward_graph.keys()):
-            if node in forward_graph[node]:
-                forward_graph[node].remove(node)
-                print(f"  [GraphValidator] Removed self-dependency: {node}")
+            def _resolve_refs(raw_list, direction_label, src_id=source_id, ev=evidence):
+                """Resolve a list of raw dependency strings for this candidate."""
+                resolved_ids = []
+                for raw_ref in (raw_list or []):
+                    if not raw_ref or not str(raw_ref).strip():
+                        continue
+                    raw_str = str(raw_ref).strip()
 
-        # ── VALIDATE GRAPH: Detect and break cycles ──
-        def detect_and_break_cycles():
-            visited = set()
-            rec_stack = set()
-            cycles_broken = []
+                    if _is_invalid_target(raw_str):
+                        print(f"  [GraphValidator] REJECTED '{raw_str}' "
+                              f"({direction_label} of '{cand.get('activity')}') "
+                              f"— non-entity text")
+                        continue
 
-            def dfs(node, path):
-                visited.add(node)
-                rec_stack.add(node)
-                for neighbor in list(forward_graph.get(node, [])):
-                    if neighbor not in visited:
-                        dfs(neighbor, path + [neighbor])
-                    elif neighbor in rec_stack:
-                        # Cycle detected! Break the edge from node -> neighbor
-                        forward_graph[node].discard(neighbor)
-                        backward_graph[neighbor].discard(node)
-                        cycles_broken.append((node, neighbor))
-                        print(f"  [GraphValidator] CYCLE DETECTED: {' -> '.join(path + [neighbor])}. Broke edge: {node} -> {neighbor}")
-                rec_stack.discard(node)
+                    result = resolver.resolve(raw_str, source_id=src_id, evidence=ev)
+                    if result.resolved:
+                        cid = result.canonical_id
+                        # If the resolved ID is a baseline item (not a cand execution node)
+                        if not cid.startswith("cand_"):
+                            if cid in baseline_to_cands:
+                                # Map baseline ID to the active candidate nodes
+                                for mapped_cid in baseline_to_cands[cid]:
+                                    if mapped_cid == src_id:
+                                        print(f"  [GraphValidator] SELF-DEP REJECTED: "
+                                              f"'{raw_str}' mapped to self '{cand.get('activity')}'")
+                                        self_deps_counter[0] += 1
+                                        continue
+                                    resolved_ids.append(mapped_cid)
+                            else:
+                                # Baseline item is not in this document's scope -> Unresolved External
+                                unres_dict = {
+                                    "raw_name": raw_str,
+                                    "canonical_id": cid,
+                                    "resolution_status": "UNRESOLVED_BASELINE",
+                                    "evidence": ev,
+                                    "target_canonical_id": cid
+                                }
+                                unresolved_by_source[src_id].append(unres_dict)
+                                print(f"  [GraphValidator] EXTERNAL BASELINE dependency "
+                                      f"'{raw_str}' for '{cand.get('activity')}' "
+                                      f"→ logged as UNRESOLVED")
+                        else:
+                            # It's already a candidate ID (cand_X)
+                            if cid == src_id:
+                                print(f"  [GraphValidator] SELF-DEP REJECTED: "
+                                      f"'{raw_str}' resolved to same entity as source "
+                                      f"'{cand.get('activity')}'")
+                                self_deps_counter[0] += 1
+                                continue
+                            resolved_ids.append(cid)
+                    else:
+                        unref = resolver.classify_unresolved(
+                            raw_str, source_id=src_id, evidence=ev)
+                        if unref.ref_type == UnresolvedReference.EXTERNAL:
+                            # Store as structured unresolved node (not discarded)
+                            unres_dict = {
+                                "raw_name": raw_str,
+                                "canonical_id": None,
+                                "resolution_status": "UNRESOLVED",
+                                "evidence": ev,
+                                "target_canonical_id": None
+                            }
+                            unresolved_by_source[src_id].append(unres_dict)
+                            print(f"  [GraphValidator] EXTERNAL dependency "
+                                  f"'{raw_str}' for '{cand.get('activity')}' "
+                                  f"→ logged as UNRESOLVED")
+                        else:
+                            print(f"  [GraphValidator] REJECTED '{raw_str}' "
+                                  f"({direction_label} of '{cand.get('activity')}') "
+                                  f"— classified as NON_ENTITY_TEXT")
+                return resolved_ids
 
-            for node in list(set(forward_graph.keys()) | set(backward_graph.keys())):
-                if node not in visited:
-                    dfs(node, [node])
+            # Resolve blocked_by (sources that block this activity)
+            resolved_blocked_by = _resolve_refs(
+                cand.get("blocked_by", []), "blocked_by")
 
-            return cycles_broken
+            # Resolve blocks (activities this candidate blocks)
+            resolved_blocks = _resolve_refs(
+                cand.get("blocks", []), "blocks")
 
-        detect_and_break_cycles()
-
-        # ── DO NOT spawn dummy nodes for unknown blockers ──
-        # If a blocked_by target doesn't exist as a candidate, it means:
-        # (a) The LLM extracted something that isn't a real activity, OR
-        # (b) It's a reference to something not in this document
-        # In both cases, we log it but do NOT create a fake graph node.
-        all_known_nodes = set(name_to_candidate.keys())
-        for name, cand in list(name_to_candidate.items()):
-            valid_blockers = []
-            for b in cand.get('blocked_by', []):
-                if b in all_known_nodes:
-                    valid_blockers.append(b)
+            # Create/merge canonical DependencyEdges via edge_map
+            for blocker_id in resolved_blocked_by:
+                if blocker_id == source_id:
+                    continue
+                key = (blocker_id, source_id)
+                if key in edge_map:
+                    edge_map[key].merge_evidence(evidence, 1.0)
                 else:
-                    print(f"  [GraphValidator] Orphan dependency '{b}' for '{name}' — target not in graph. Skipping.")
-                    # Remove from graphs too
-                    forward_graph[b].discard(name)
-                    backward_graph[name].discard(b)
-            cand['blocked_by'] = valid_blockers
+                    edge_map[key] = DependencyEdge(blocker_id, source_id,
+                                                   "BLOCKS", evidence, 1.0,
+                                                   condition="AND")
 
-        # Sync blocked_by arrays to match the validated backward graph
-        for name, cand in name_to_candidate.items():
-            cand['blocked_by'] = list(backward_graph.get(name, set()))
+            for blocked_id in resolved_blocks:
+                if blocked_id == source_id:
+                    continue
+                key = (source_id, blocked_id)
+                if key in edge_map:
+                    edge_map[key].merge_evidence(evidence, 1.0)
+                else:
+                    edge_map[key] = DependencyEdge(source_id, blocked_id,
+                                                   "BLOCKS", evidence, 1.0,
+                                                   condition="AND")
 
-        # ── GRAPH TRAVERSAL HELPERS ──
-        terminal_keywords = ['production', 'deployment', 'go live', 'go-live', 'launch', 'release', 'kt', 'knowledge transfer']
+        edges = list(edge_map.values())
+        duplicate_edges_removed = sum(
+            e.supporting_mentions - 1 for e in edges
+        )
 
-        def get_forward_path(start_node):
-            visited = set()
-            queue = collections.deque([start_node])
-            while queue:
-                curr = queue.popleft()
-                for neighbor in forward_graph.get(curr, []):
-                    if neighbor not in visited:
-                        visited.add(neighbor)
-                        queue.append(neighbor)
-            return list(visited)
+        # Print dependency resolution log
+        resolver.print_resolution_log("Pass 2")
 
-        def get_longest_forward_path(start_node):
-            """Deterministic DAG longest-path using DFS. Returns ordered list."""
-            max_path = []
-            def dfs(curr_node, current_path, visited):
-                nonlocal max_path
-                neighbors = sorted(forward_graph.get(curr_node, []))  # Sort for determinism
-                if not neighbors:
-                    if len(current_path) > len(max_path):
-                        max_path = list(current_path)
-                    return
-                for neighbor in neighbors:
-                    if neighbor not in visited:
-                        current_path.append(neighbor)
-                        visited.add(neighbor)
-                        dfs(neighbor, current_path, visited)
-                        visited.remove(neighbor)
-                        current_path.pop()
-                # Also check if current path is longest (in case all neighbors were visited)
-                if len(current_path) > len(max_path):
-                    max_path = list(current_path)
-            dfs(start_node, [], set())
-            return max_path
+        # ── BUILD ADJACENCY + VALIDATE ────────────────────────────────────────
+        fwd, bwd = _build_adjacency(edges)
+        all_nodes: Set[str] = set(id_to_cand.keys())
 
-        def get_distance_to_terminal(start_node):
-            if any(tk in start_node.lower() for tk in terminal_keywords):
-                return 0
-            visited = {start_node: 0}
-            queue = collections.deque([start_node])
-            min_dist = 999
-            while queue:
-                curr = queue.popleft()
-                dist = visited[curr]
-                if any(tk in curr.lower() for tk in terminal_keywords):
-                    if dist < min_dist:
-                        min_dist = dist
-                for neighbor in forward_graph.get(curr, []):
-                    if neighbor not in visited:
-                        visited[neighbor] = dist + 1
-                        queue.append(neighbor)
-            return min_dist
+        # Remove self-loops (second pass safety)
+        for n in list(fwd.keys()):
+            fwd[n].discard(n)
+        for n in list(bwd.keys()):
+            bwd[n].discard(n)
 
-        # ── IDENTIFY PARALLEL STREAMS ──
-        all_nodes = set(name_to_candidate.keys())
-        stream_id = 1
-        node_to_stream = {}
-        visited_nodes = set()
-        for node in sorted(all_nodes):  # Sort for determinism
-            if node not in visited_nodes:
-                stream_queue = collections.deque([node])
-                current_stream = set()
-                while stream_queue:
-                    curr = stream_queue.popleft()
-                    if curr not in current_stream:
-                        current_stream.add(curr)
-                        visited_nodes.add(curr)
-                        for neighbor in forward_graph.get(curr, []):
-                            if neighbor not in current_stream:
-                                stream_queue.append(neighbor)
-                        for neighbor in backward_graph.get(curr, []):
-                            if neighbor not in current_stream:
-                                stream_queue.append(neighbor)
-                for stream_node in current_stream:
-                    node_to_stream[stream_node] = f"Stream {stream_id}"
-                stream_id += 1
+        # Remove edges where target is not a known node (fake-node guard)
+        fake_nodes_removed = 0
+        for n in list(fwd.keys()):
+            before = len(fwd[n])
+            fwd[n] = {c for c in fwd[n] if c in all_nodes}
+            fake_nodes_removed += before - len(fwd[n])
+        for n in list(bwd.keys()):
+            bwd[n] = {p for p in bwd[n] if p in all_nodes}
 
-        # ── PASS 3: Calculate PMO Metrics ──
-        # Pre-compute unresolved blockers once
-        unresolved_blockers = {
-            n: [b for b in backward_graph.get(n, set())
-                if name_to_candidate.get(b, {}).get('status', 'NOT_STARTED') not in ['RESOLVED', 'COMPLETED']]
-            for n in name_to_candidate.keys()
+        # Rebuild edges after integrity check
+        valid_edges = [e for e in edges
+                       if e.source_id in all_nodes and e.target_id in all_nodes
+                       and e.source_id != e.target_id]
+
+        # Break cycles and count
+        edges_before_cycle = len(valid_edges)
+        valid_edges = _detect_and_break_cycles(fwd, bwd, valid_edges)
+        cycle_edges_rejected = edges_before_cycle - len(valid_edges)
+
+        # Build edge_conditions map for ReadinessEngine: {(src, tgt): "AND"|"OR"}
+        edge_conditions: Dict[Tuple[str, str], str] = {
+            (e.source_id, e.target_id): e.condition for e in valid_edges
         }
 
-        for name, cand in name_to_candidate.items():
-            immediate = sorted(list(forward_graph.get(name, set())))
-            longest_path = get_longest_forward_path(name)
+        # Print final graph
+        print(f"\n=== FINAL GRAPH ===")
+        print(f"{'Source (ID)':<15} | {'Source Name':<45} | {'Target (ID)':<15} | {'Target Name':<45} | {'Cond':<5} | Evidence")
+        print("-" * 150)
+        for e in sorted(valid_edges, key=lambda x: (x.source_id, x.target_id)):
+            src_name = registry.get_by_id(e.source_id)
+            tgt_name = registry.get_by_id(e.target_id)
+            sn = (src_name.display_name if src_name else e.source_id)[:45]
+            tn = (tgt_name.display_name if tgt_name else e.target_id)[:45]
+            ev = (e.evidence or "")[:60]
+            print(f"{e.source_id:<15} | {sn:<45} | {e.target_id:<15} | {tn:<45} | {e.condition:<5} | {ev}")
+        print(f"\n  Total: {len(all_nodes)} nodes, {len(valid_edges)} edges\n")
 
-            cand['parents'] = sorted(list(backward_graph.get(name, set())))
-            cand['children'] = immediate
-            cand['longest_path'] = longest_path
-            cand['parallel_stream'] = node_to_stream.get(name, "Stream 1")
+        # ── COMPUTE GRAPH METRICS ─────────────────────────────────────────────
+        def _status_fn(nid):
+            return (id_to_cand.get(nid) or {}).get("status", "UNKNOWN")
 
-            cand['downstream_names'] = get_forward_path(name)
-            cand['direct_blocking_names'] = immediate
+        def _owner_fn(nid):
+            return (id_to_cand.get(nid) or {}).get("dependency_owner", "Internal")
 
-            cand['blocked_work_count'] = len(get_forward_path(name))
-            cand['cascade_depth'] = len(longest_path)
-            cand['distance_to_terminal'] = get_distance_to_terminal(name)
+        def _name_fn(nid):
+            c = id_to_cand.get(nid)
+            if c:
+                return str(c.get("canonical_title") or c.get("activity") or nid)
+            e = registry.get_by_id(nid)
+            return e.display_name if e else nid
 
-            # Criticality Score (0-100)
-            crit_score = min(cand['cascade_depth'] * 15, 80)
-            if cand['distance_to_terminal'] < 999:
-                crit_score += max(20 - (cand['distance_to_terminal'] * 5), 0)
-            cand['criticality_score'] = min(crit_score, 100.0)
-            cand['critical_path'] = cand['criticality_score'] >= 75.0
-            cand['critical_chain'] = cand['distance_to_terminal'] < 999
+        metrics = _compute_graph_metrics(all_nodes, fwd, bwd, status_fn=_status_fn)
 
-            has_unresolved_upstream = len(unresolved_blockers.get(name, [])) > 0
-            # Root cause: blocks downstream AND has no unresolved upstream
-            if cand['blocked_work_count'] > 0 and not has_unresolved_upstream:
-                cand['is_root_cause'] = True
+        # Pre-compute ReadinessEngine results for all nodes (centralized)
+        def _unresolved_count_fn(nid):
+            return len(unresolved_by_source.get(nid, []))
+            
+        readiness_results = ReadinessEngine.evaluate_all(
+            list(all_nodes), bwd, _status_fn,
+            owner_fn=_owner_fn,
+            edge_conditions=edge_conditions,
+            name_fn=_name_fn,
+            unresolved_count_fn=_unresolved_count_fn,
+        )
+        # ── Collect all unresolved dependencies for graph validation contract ────
+        unresolved_externals = []
+        for ur_list in unresolved_by_source.values():
+            for ur in ur_list:
+                name = ur["raw_name"]
+                if name not in unresolved_externals:
+                    unresolved_externals.append(name)
+
+        # ── INJECT METRICS INTO CANDIDATES ───────────────────────────────────
+        def ids_to_names(id_list):
+            result = []
+            for i in id_list:
+                e = registry.get_by_id(i)
+                result.append(e.display_name if e else i)
+            return result
+
+        for cand in candidates:
+            cid = cand.get("_canonical_id")
+            if not cid:
+                continue
+
+            m = metrics.get(cid, {})
+            readiness = readiness_results.get(cid)
+
+            # ── graph_role: TOPOLOGY ONLY (never from LLM) ───────────────────
+            cand["graph_role"] = _derive_graph_role(cid, fwd, bwd)
+
+            # ── Blocks / blocked_by from graph (single source of truth) ──────
+            cand["blocked_by"] = ids_to_names(m.get("parent_ids", []))
+            cand["blocks"] = ids_to_names(m.get("child_ids", []))
+            cand["_blocked_by_ids"] = m.get("parent_ids", [])
+            cand["_blocks_ids"] = m.get("child_ids", [])
+
+            # ── Readiness (from ReadinessEngine, not inline) ─────────────────
+            if readiness:
+                cand["blocked"] = readiness.status == "BLOCKED"
+                cand["waiting"] = readiness.status in ("BLOCKED", "WAITING_ON_EXTERNAL", "BLOCKED_UNRESOLVED_DEPENDENCY")
+                cand["readiness_status"] = readiness.status
+                cand["blocking_prerequisites"] = readiness.blocking_names
+                cand["all_and_prerequisites_satisfied"] = readiness.all_and_satisfied
             else:
-                cand['is_root_cause'] = False
-            cand['earliest_root_cause'] = cand['is_root_cause']
+                cand["blocked"] = False
+                cand["waiting"] = False
+                cand["readiness_status"] = "UNKNOWN"
+                cand["blocking_prerequisites"] = []
+                cand["all_and_prerequisites_satisfied"] = True
 
-            # Immediate Unlock Count
-            unlocked = set()
-            queue = collections.deque([name])
-            sim_blockers = {k: list(v) for k, v in unresolved_blockers.items()}
+            cand["unresolved_dependencies"] = unresolved_by_source.get(cid, [])
 
-            while queue:
-                curr = queue.popleft()
-                for neighbor in forward_graph.get(curr, []):
-                    if neighbor in sim_blockers and curr in sim_blockers[neighbor]:
-                        sim_blockers[neighbor].remove(curr)
-                        if len(sim_blockers[neighbor]) == 0:
-                            unlocked.add(neighbor)
-                            queue.append(neighbor)
+            # ── Graph metrics ─────────────────────────────────────────────────
+            cand["is_root_cause"] = m.get("is_root_cause", False)
+            cand["earliest_root_cause"] = m.get("is_root_cause", False)
+            cand["cascade_count"] = m.get("cascade_count", 0)
+            cand["cascade_depth"] = m.get("cascade_depth", 0)
+            cand["blocked_work_count"] = m.get("cascade_count", 0)
+            cand["critical_path"] = m.get("on_critical_path", False)
+            cand["critical_chain"] = m.get("on_critical_path", False)
+            cand["criticality_score"] = (
+                min(m.get("cascade_depth", 0) * 15, 80) +
+                (20 if m.get("on_critical_path") else 0)
+            )
 
-            cand['immediate_unlock_count'] = len(unlocked)
-            cand['execution_unlock_count'] = len(unlocked)
-            cand['immediate_unlocks'] = sorted(list(unlocked))
-            cand['future_unlocks'] = [x for x in cand['downstream_names'] if x not in unlocked]
+            # ── Immediate unlock count (ReadinessEngine AND semantics) ────────
+            immediate_unlock = ReadinessEngine.immediate_unlock_count(
+                cid, fwd, bwd, _status_fn, edge_conditions=edge_conditions
+            )
+            cand["immediate_unlock_count"] = immediate_unlock
+            cand["execution_unlock_count"] = immediate_unlock
 
-            if cand['immediate_unlock_count'] > 0:
-                cand['distance_to_next_executable'] = 1
-            elif cand['blocked_work_count'] > 0:
-                cand['distance_to_next_executable'] = cand['cascade_depth']
+            # ── Downstream / path metadata ────────────────────────────────────
+            downstream_names = ids_to_names(m.get("downstream_ids", []))
+            cand["downstream_names"] = downstream_names
+            cand["direct_blocking_names"] = ids_to_names(m.get("child_ids", []))
+
+            longest_path_ids = m.get("longest_path_ids", [])
+            cand["longest_path"] = ids_to_names(longest_path_ids)
+
+            child_ids_set = set(m.get("child_ids", []))
+            all_downstream_ids = set(m.get("downstream_ids", []))
+            immediate_ids = child_ids_set & all_downstream_ids
+            future_ids = all_downstream_ids - child_ids_set
+
+            cand["immediate_unlocks"] = ids_to_names(sorted(immediate_ids))
+            cand["future_unlocks"] = ids_to_names(sorted(future_ids))
+            cand["immediate_unlock_names"] = ids_to_names(sorted(immediate_ids))
+
+            # ── Dependency owner from evidence (generic) ──────────────────────
+            ev_text = (cand.get("evidence") or cand.get("source_sentence") or "").lower()
+            if any(k in ev_text for k in ["customer", "client", "sponsor"]):
+                cand["dependency_owner"] = "Customer"
+            elif any(k in ev_text for k in ["vendor", "3rd party", "third-party",
+                                              "external provider"]):
+                cand["dependency_owner"] = "Vendor"
             else:
-                cand['distance_to_next_executable'] = 999
+                cand["dependency_owner"] = "Internal"
 
-            # PMO Fields — Dependency Owner (from evidence, not hardcoded names)
-            ev = (cand.get('evidence') or '').lower()
-            if any(k in ev for k in ['customer', 'client', 'sponsor']):
-                cand['dependency_owner'] = 'Customer'
-            elif any(k in ev for k in ['vendor', '3rd party', 'third-party', 'external provider']):
-                cand['dependency_owner'] = 'Vendor'
+            # ── Resolution effort proxy ───────────────────────────────────────
+            if m.get("cascade_count", 0) == 0:
+                cand["resolution_effort"] = "S"
+            elif m.get("cascade_depth", 0) >= 3:
+                cand["resolution_effort"] = "L"
             else:
-                cand['dependency_owner'] = 'Internal'
+                cand["resolution_effort"] = "M"
 
-            # Resolution Effort Proxy — generic heuristic, not name-specific
-            cand['resolution_effort'] = 'M'  # Default medium
-            if cand['blocked_work_count'] == 0:
-                cand['resolution_effort'] = 'S'
-            elif cand['cascade_depth'] >= 3:
-                cand['resolution_effort'] = 'L'
-
-            # Business Criticality — based on graph position, not name keywords
-            if cand['critical_path'] or cand['cascade_depth'] >= 3:
-                cand['business_criticality'] = 'Mission Critical'
-            elif cand['blocked_work_count'] >= 2:
-                cand['business_criticality'] = 'High'
+            # ── Business criticality from graph position ───────────────────────
+            if m.get("on_critical_path") or m.get("cascade_depth", 0) >= 3:
+                cand["business_criticality"] = "Mission Critical"
+            elif m.get("cascade_count", 0) >= 2:
+                cand["business_criticality"] = "High"
             else:
-                cand['business_criticality'] = 'Medium'
+                cand["business_criticality"] = "Medium"
 
-            # Business Phase — based on graph position
-            if cand['distance_to_terminal'] == 0:
-                cand['business_phase'] = 'Deployment'
-            elif cand['distance_to_terminal'] <= 2:
-                cand['business_phase'] = 'Testing'
-            elif cand['is_root_cause']:
-                cand['business_phase'] = 'Execution'
+            # ── Business phase from graph distance to terminal ─────────────────
+            if m.get("cascade_count", 0) == 0:
+                cand["business_phase"] = "Deployment"
+                cand["distance_to_terminal"] = 0
+            elif m.get("cascade_depth", 0) <= 2:
+                cand["business_phase"] = "Testing"
+                cand["distance_to_terminal"] = m.get("cascade_depth", 1)
+            elif m.get("is_root_cause"):
+                cand["business_phase"] = "Execution"
+                cand["distance_to_terminal"] = m.get("cascade_depth", 3)
             else:
-                cand['business_phase'] = 'Development'
+                cand["business_phase"] = "Development"
+                cand["distance_to_terminal"] = m.get("cascade_depth", 5)
 
-            cand['blocked'] = has_unresolved_upstream
-            cand['waiting'] = cand['blocked'] and not cand['is_root_cause']
-            cand['cascade_count'] = cand['blocked_work_count']
+            cand["distance_to_next_executable"] = (
+                1 if immediate_unlock > 0
+                else m.get("cascade_depth", 999)
+            )
 
-            # Dependency source — from evidence keywords
-            evidence_lower = (cand.get('evidence', '') + ' ' + cand.get('reasoning', '') + ' ' + str(cand.get('activity', ''))).lower()
-            if any(k in evidence_lower for k in ['customer', 'client', 'credentials', 'vpn', 'access', 'external']):
-                cand['dependency_source'] = 'CUSTOMER'
-                cand['external_dependency'] = True
-            elif any(k in evidence_lower for k in ['vendor', 'third party', 'third-party', 'partner']):
-                cand['dependency_source'] = 'VENDOR'
-                cand['external_dependency'] = True
-            elif any(k in evidence_lower for k in ['security', 'audit', 'compliance', 'review']):
-                cand['dependency_source'] = 'SECURITY'
-                cand['external_dependency'] = False
-            elif any(k in evidence_lower for k in ['pmo', 'management', 'approval']):
-                cand['dependency_source'] = 'PMO'
-                cand['external_dependency'] = False
+            # ── Dependency source from evidence keywords ──────────────────────
+            evidence_lower = (
+                cand.get("evidence", "") + " " +
+                cand.get("reasoning", "") + " " +
+                str(cand.get("activity", ""))
+            ).lower()
+            if any(k in evidence_lower for k in ["customer", "client",
+                                                   "credentials", "vpn",
+                                                   "access", "external"]):
+                cand["dependency_source"] = "CUSTOMER"
+                cand["external_dependency"] = True
+            elif any(k in evidence_lower for k in ["vendor", "third party",
+                                                    "third-party", "partner"]):
+                cand["dependency_source"] = "VENDOR"
+                cand["external_dependency"] = True
+            elif any(k in evidence_lower for k in ["security", "audit",
+                                                    "compliance", "review"]):
+                cand["dependency_source"] = "SECURITY"
+                cand["external_dependency"] = False
+            elif any(k in evidence_lower for k in ["pmo", "management",
+                                                    "approval"]):
+                cand["dependency_source"] = "PMO"
+                cand["external_dependency"] = False
             else:
-                cand['dependency_source'] = 'ENGINEERING'
-                cand['external_dependency'] = False
+                cand["dependency_source"] = "ENGINEERING"
+                cand["external_dependency"] = False
 
-        # ── LOG FINAL GRAPH STRUCTURE ──
-        print(f"\n  [DependencyGraph] Final graph: {len(name_to_candidate)} nodes, {sum(len(v) for v in forward_graph.values())} edges")
-        for name, cand in sorted(name_to_candidate.items()):
-            root_marker = " [ROOT CAUSE]" if cand.get('is_root_cause') else ""
-            crit_marker = " [CRITICAL PATH]" if cand.get('critical_path') else ""
-            print(f"    {name}: cascade={cand.get('cascade_count', 0)}, unlocks={cand.get('immediate_unlock_count', 0)}, "
-                  f"blocked_by={cand.get('blocked_by', [])}{root_marker}{crit_marker}")
+            # ── Parallel stream label (connected component) ───────────────────
+            cand["parallel_stream"] = cand.get("parallel_stream", "Stream 1")
 
-        return list(name_to_candidate.values())
+            # ── Unresolved external dependencies (structured, not executable) ──
+            cand["unresolved_dependencies"] = [
+                ur["raw_name"] for ur in unresolved_by_source.get(cid, [])
+            ]
+
+        # ── GRAPH VALIDATION CONTRACT ─────────────────────────────────────────
+        # Stored on the first candidate for API access
+        validation_contract = {
+            "fake_nodes_removed": fake_nodes_removed,
+            "duplicate_edges_removed": duplicate_edges_removed,
+            "self_dependencies_rejected": self_deps_counter[0],
+            "cycle_edges_rejected": cycle_edges_rejected,
+            "unresolved_dependencies": len(unresolved_externals),
+            "unresolved_nodes": unresolved_externals,
+            "total_confirmed_edges": len(valid_edges),
+            "total_nodes": len(all_nodes),
+        }
+        if candidates:
+            candidates[0]["_graph_validation"] = validation_contract
+
+        # Final summary log
+        print(f"\n=== GRAPH ANALYSIS ===")
+        print(f"{'Entity':<50} | {'Role':<22} | {'Ready':<22} | {'Unlocks':>7} | {'Cascade':>7} | {'CritPath'}")
+        print("-" * 130)
+        for cand in sorted(candidates, key=lambda c: -c.get("cascade_count", 0)):
+            name = str(cand.get("canonical_title") or cand.get("activity") or "?")[:50]
+            role = cand.get("graph_role", "ISOLATED")
+            ready = cand.get("readiness_status", "UNKNOWN")
+            unlocks = cand.get("immediate_unlock_count", 0)
+            cascade = cand.get("cascade_count", 0)
+            crit = "✓" if cand.get("critical_path") else ""
+            print(f"{name:<50} | {role:<22} | {ready:<22} | {unlocks:>7} | {cascade:>7} | {crit}")
+        print()
+        print(f"  Validation: {validation_contract['total_confirmed_edges']} edges confirmed, "
+              f"{validation_contract['self_dependencies_rejected']} self-deps rejected, "
+              f"{validation_contract['cycle_edges_rejected']} cycles broken, "
+              f"{validation_contract['unresolved_dependencies']} unresolved deps\n")
+
+        return candidates

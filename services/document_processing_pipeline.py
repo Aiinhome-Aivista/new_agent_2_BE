@@ -71,5 +71,8 @@ class DocumentProcessingPipeline:
             import traceback
             traceback.print_exc()
             print(f"Enterprise risk engine failed: {e}")
+            with open("error_log.txt", "a") as f:
+                f.write(f"Enterprise risk engine failed: {e}\n")
+                f.write(traceback.format_exc() + "\n")
             
         _emit("Pipeline Complete", 100)

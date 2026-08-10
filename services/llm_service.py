@@ -54,7 +54,7 @@ class LLMService:
             response = requests.post(
                 settings.LLM_API_URL, 
                 json=payload, 
-                timeout=settings.LLM_TIMEOUT
+                timeout=(10, settings.LLM_TIMEOUT)
             )
             response.raise_for_status()
             data = response.json()

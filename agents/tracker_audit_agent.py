@@ -25,7 +25,11 @@ class TrackerAuditAgent:
                              requires_escalation: bool, title: str = None, reference_id: int = None,
                              priority_order: int = None, status: str = 'NOT_STARTED',
                              resolve_only: bool = False, risk_source: str = 'OBSERVED',
-                             recommended_action: str = None, execution_priority_score: int = None) -> int:
+                             recommended_action: str = None, execution_priority_score: int = None,
+                             # New decoupled fields
+                             execution_status: str = None, risk_status: str = None,
+                             graph_role: str = None, canonical_id: str = None,
+                             risk_severity_score: int = None) -> int:
         """
         Acts as the Tracker & Audit Agent. Deterministically persists state with evidence lineage
         into the `tracker_items` table and logs the action in the `audit_logs` table.
@@ -91,15 +95,21 @@ class TrackerAuditAgent:
                 else:
                     final_reasoning = existing_reasoning
 
+            final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
+            if final_exec_status in ('UNKNOWN', ''):
+                final_exec_status = 'NOT_STARTED'
+            final_risk_status = risk_status or 'OPEN'
+            final_risk_sev = risk_severity_score if risk_severity_score is not None else risk_score
+
             db_cursor.execute("""
                 UPDATE tracker_items
-                SET risk_score = %s, execution_priority_score = %s, risk_level = %s, confidence = %s, reasoning = %s,
-                    source_document_id = %s, status = %s, risk_source = %s,
+                SET risk_score = %s, execution_priority_score = %s, risk_severity_score = %s, risk_level = %s, confidence = %s, reasoning = %s,
+                    source_document_id = %s, status = %s, execution_status = %s, risk_status = %s, graph_role = %s, canonical_id = %s, risk_source = %s,
                     priority_order = %s, previous_highest_score = %s, recommended_action = %s
                 WHERE id = %s
             """, (
-                final_risk_score, final_exec_score, final_risk_level, confidence, final_reasoning,
-                document_id, status, risk_source,
+                final_risk_score, final_exec_score, final_risk_sev, final_risk_level, confidence, final_reasoning,
+                document_id, status, final_exec_status, final_risk_status, graph_role or 'DOWNSTREAM_ACTIVITY', canonical_id or '', risk_source,
                 final_priority, new_peak, recommended_action, existing_id
             ))
             tracker_id = existing_id
@@ -122,12 +132,22 @@ class TrackerAuditAgent:
 
             has_priority = priority_order is not None
             final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
+            final_risk_sev = risk_severity_score if risk_severity_score is not None else risk_score
+
+            # Resolve execution_status default
+            final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
+            if final_exec_status in ('UNKNOWN', ''):
+                final_exec_status = 'NOT_STARTED'
+            final_risk_status = risk_status or 'OPEN'
+
             tracker_sql = """
                 INSERT INTO tracker_items
                 (project_id, source_document_id, item_type, reference_id, title, is_out_of_scope,
-                 risk_score, execution_priority_score, previous_highest_score, risk_level, risk_category, risk_origin,
-                 confidence, reasoning, requires_escalation, risk_source{priority_col}, status, recommended_action)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{priority_placeholder}, %s, %s)
+                 risk_score, execution_priority_score, risk_severity_score, previous_highest_score,
+                 risk_level, risk_category, risk_origin,
+                 confidence, reasoning, requires_escalation, risk_source{priority_col},
+                 status, execution_status, risk_status, graph_role, canonical_id, recommended_action)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s{priority_placeholder}, %s, %s, %s, %s, %s, %s)
             """.format(
                 priority_col=", priority_order" if has_priority else "",
                 priority_placeholder=", %s" if has_priority else ""
@@ -135,9 +155,15 @@ class TrackerAuditAgent:
             extra_vals = (priority_order,) if has_priority else ()
             db_cursor.execute(tracker_sql, (
                 project_id, document_id, item_type, reference_id, title, int(is_out_of_scope),
-                risk_score, final_exec_score, new_peak, risk_level, risk_category, risk_origin_value,
+                risk_score, final_exec_score, final_risk_sev, new_peak,
+                risk_level, risk_category, risk_origin_value,
                 confidence, reasoning, int(requires_escalation), risk_source
-            ) + extra_vals + (status, recommended_action))
+            ) + extra_vals + (
+                status, final_exec_status, final_risk_status,
+                graph_role or 'DOWNSTREAM_ACTIVITY',
+                canonical_id or '',
+                recommended_action
+            ))
             tracker_id = db_cursor.lastrowid
             action_type = 'CREATED'
 

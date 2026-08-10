@@ -226,13 +226,19 @@ class RiskEvaluationAgent:
                 name, None, scope_items, all_baseline_items
             )
 
-            # Dedup key is the canonical title — so "SAP Integration Request Assessment"
-            # and "Evaluate SAP Integration Request" both resolve to "SAP Integration" → merged
+            # Dedup key is the canonical title
             dedup_key = _normalize(canonical_title)
             if dedup_key in seen_canonical:
                 print(f"  [Dedup] Merged '{name}' → already seen as '{canonical_title}'")
                 continue
             seen_canonical.add(dedup_key)
+
+            # ── Preserve execution_status separately from risk_status ──
+            # LLM may extract WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, etc.
+            # These must survive as execution_status and must NOT be flattened to UNKNOWN.
+            raw_exec_status = str(item.get("status") or item.get("execution_status") or "").strip().upper()
+            if not raw_exec_status or raw_exec_status in ("UNKNOWN", ""):
+                raw_exec_status = "NOT_STARTED"
 
             cleaned_activities.append({
                 "activity": name,
@@ -241,7 +247,13 @@ class RiskEvaluationAgent:
                 "is_in_scope": is_in_scope,
                 "source_sentence": item.get("source_sentence", name),
                 "extraction_confidence": item.get("confidence", 100),
-                "blocks": item.get("blocks", [])
+                # Raw dependency refs — passed to DependencyGraphBuilder for
+                # canonical resolution via EntityResolver (NOT compared as strings)
+                "blocked_by": item.get("blocked_by", []),
+                "blocks": item.get("blocks", []),
+                # Preserved execution status — kept independent of risk_status
+                "execution_status": raw_exec_status,
+                "status": raw_exec_status,
             })
 
         # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
@@ -275,7 +287,10 @@ class RiskEvaluationAgent:
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
                     "confidence": confidence,
-                    "extraction_confidence": extraction_confidence
+                    "extraction_confidence": extraction_confidence,
+                    "blocked_by": act_item.get("blocked_by", []),
+                    "blocks": act_item.get("blocks", []),
+                    "execution_status": act_item.get("execution_status", "NOT_STARTED")
                 })
             else:
                 # Ambiguous — needs deeper analysis
@@ -286,7 +301,10 @@ class RiskEvaluationAgent:
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
                     "confidence": confidence,
-                    "extraction_confidence": extraction_confidence
+                    "extraction_confidence": extraction_confidence,
+                    "blocked_by": act_item.get("blocked_by", []),
+                    "blocks": act_item.get("blocks", []),
+                    "execution_status": act_item.get("execution_status", "NOT_STARTED")
                 })
 
         # ===========================================================
@@ -311,7 +329,10 @@ class RiskEvaluationAgent:
                 "source_sentence": item.get("source_sentence", activity_name),
                 "context": context,
                 "matched_si": matched_si,
-                "extraction_confidence": item.get("extraction_confidence", 100)
+                "extraction_confidence": item.get("extraction_confidence", 100),
+                "blocked_by": item.get("blocked_by", []),
+                "blocks": item.get("blocks", []),
+                "execution_status": item.get("execution_status", "NOT_STARTED")
             })
 
         # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
@@ -553,8 +574,24 @@ class RiskEvaluationAgent:
         for i, result in enumerate(llm_risk_results):
             activity_name = result.get("activity", "Unknown")
             canonical_title = result["_canonical_title"]
-            status = result.get("status", "UNKNOWN").upper()
-            blocked_by = result.get("blocked_by", [])
+
+            # Use execution_status preserved from LLM extraction (never UNKNOWN)
+            # risk_status is managed separately by the risk lifecycle engine.
+            execution_status = (
+                result.get("execution_status") or
+                result.get("status") or
+                "NOT_STARTED"
+            ).upper().strip()
+            if not execution_status or execution_status == "UNKNOWN":
+                execution_status = "NOT_STARTED"
+            status = execution_status  # status used downstream for graph/scoring
+
+            # Pull canonical-resolved blocked_by from DependencyGraphBuilder enrichment
+            # (if graph builder ran on this batch; else fall back to raw LLM output)
+            context_i = activities_with_contexts[i] if i < len(activities_with_contexts) else {}
+            blocked_by = result.get("_resolved_blocked_by",
+                         context_i.get("_resolved_blocked_by",
+                         result.get("blocked_by", [])))
             evidence = result.get("evidence_text", "")
             
             # Resolve scope matching using deterministic logic, not just LLM output
@@ -731,9 +768,21 @@ class RiskEvaluationAgent:
                 llm_confidence = 100
 
             should_create_risk = False
-            if status not in ["COMPLETED", "RESOLVED", "WAITING"]:
-                if llm_confidence >= 80:
+            # Statuses that block risk creation:
+            #   COMPLETED, RESOLVED — item is done
+            #   WAITING is NOT excluded; WAITING_ON_CUSTOMER, DELAYED, BLOCKED,
+            #   NOT_STARTED are all valid risk conditions.
+            non_risk_statuses = {"COMPLETED", "RESOLVED"}
+            if status.upper() not in non_risk_statuses:
+                # Threshold: 60 (not 80). LLM typically returns 0.7–0.95 confidence.
+                # An extraction_confidence of 1.0 (100%) is the default when no
+                # confidence was returned — should always create a risk.
+                if llm_confidence >= 60:
                     should_create_risk = True
+                else:
+                    print(f"  [Gate] '{canonical_title}' skipped — low extraction confidence: {llm_confidence}%")
+            else:
+                print(f"  [Gate] '{canonical_title}' skipped — status is '{status}' (completed/resolved)")
 
             all_activities.append({
                 "activity": canonical_title,
@@ -931,18 +980,39 @@ class RiskEvaluationAgent:
                 if item.get("matched_baseline_item") and item.get("entity_type") == "SCOPE_REQUEST":
                     item["entity_type"] = "MILESTONE"
 
+                # ── Decoupled status fields ──
+                # execution_status: preserves the operational fact from the document
+                # Override with graph readiness if blocked by unresolved/external deps
+                raw_exec_status = item.get("execution_status", item.get("status", "NOT_STARTED"))
+                readiness = item.get("readiness_status", "")
+                
+                if readiness in ("BLOCKED_UNRESOLVED_DEPENDENCY", "WAITING_ON_EXTERNAL"):
+                    final_exec_status = readiness
+                else:
+                    final_exec_status = raw_exec_status
+
                 tracker_items.append({
                     "deliverable": item["canonical_title"],
                     "entity_type": item["entity_type"],
                     "expected_date": str(item["p_date_str"]) if item["p_date_str"] else "Unknown",
-                    "current_status": item["status"],
+                    "execution_status": final_exec_status,
+                    "current_status": final_exec_status,
+                    "risk_status": "OPEN",
                     "progress": item["progress"],
                     "delay_days": item["days_overdue"],
                     "blockers": item["blocked_by"],
+                    "blocked_by_ids": item.get("_blocked_by_ids", []),
+                    "blocks_ids": item.get("_blocks_ids", []),
                     "confidence": item["llm_confidence"],
+                    # ── Decoupled score fields ──
+                    # execution_priority_score: graph-derived (root cause, unlock count, cascade)
+                    # risk_score / risk_severity_score: risk severity (separate)
                     "execution_priority_score": exec_prio,
+                    "risk_severity_score": risk_sev,
                     "dependency_status": item["risk_cat"],
                     "category": item["risk_cat"],
+                    "graph_role": item.get("graph_role", "DOWNSTREAM_ACTIVITY"),
+                    "canonical_id": item.get("_canonical_id", ""),
                     "risk_source": "DERIVED" if item["risk_cat"] in ["EXECUTION_BLOCKER", "ROOT_CAUSE", "TECHNICAL_DEPENDENCY"] else "OBSERVED",
                     "is_root_cause": item["is_root_cause"],
                     "m_id": item.get("m_id"),
@@ -966,12 +1036,19 @@ class RiskEvaluationAgent:
                     "mom_evidence": item["evidence"],
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
                     "narratives": item.get("narratives", {}),
-                    "recommended_action": item.get("recommended_action") or cls._pm_decision(execution_priority, item.get("dependency_owner", "Internal"), item["is_root_cause"], item.get("longest_path", [])),
+                    "recommended_action": item.get("recommended_action") or cls._pm_decision(
+                        execution_priority,
+                        item.get("dependency_owner", "Internal"),
+                        item["is_root_cause"],
+                        item.get("longest_path", [])
+                    ),
                     "business_phase": item.get("business_phase"),
                     "queue_order": queue_order,
                     "longest_path": item.get("longest_path", []),
                     "dependency_owner": item.get("dependency_owner"),
-                    "parallel_stream": item.get("parallel_stream")
+                    "parallel_stream": item.get("parallel_stream"),
+                    "unresolved_external_dependencies":
+                        item.get("unresolved_external_dependencies", []),
                 })
 
         # PM Decision Engine Helper
@@ -1267,7 +1344,16 @@ class RiskEvaluationAgent:
                 status=target_status,
                 risk_source=deliv.get('risk_source', 'OBSERVED'),
                 recommended_action=deliv.get('recommended_action'),
-                execution_priority_score=deliv.get('execution_priority', deliv.get('execution_priority_score', deliv.get('action_priority_score', 0)))
+                execution_priority_score=deliv.get('execution_priority',
+                    deliv.get('execution_priority_score',
+                    deliv.get('action_priority_score', 0))),
+                # New decoupled fields
+                execution_status=deliv.get('execution_status', deliv.get('current_status')),
+                risk_status=deliv.get('risk_status', 'OPEN'),
+                graph_role=deliv.get('graph_role', 'DOWNSTREAM_ACTIVITY'),
+                canonical_id=deliv.get('canonical_id', ''),
+                risk_severity_score=deliv.get('risk_severity_score',
+                    deliv.get('risk_score', item_risk_score)),
             )
 
             # Use alert threshold from DB config (not hardcoded 70)

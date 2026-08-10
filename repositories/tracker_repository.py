@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 import mysql.connector
 from typing import List, Dict, Any, Optional
 import json
@@ -10,36 +11,26 @@ class TrackerRepository:
             conn = get_db_connection()
             if conn:
                 cursor = conn.cursor()
-                try:
-                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN resolved_by BIGINT NULL;")
-                    conn.commit()
-                except Exception:
-                    pass
-                try:
-                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN resolved_at TIMESTAMP NULL;")
-                    conn.commit()
-                except Exception:
-                    pass
-                try:
-                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN title VARCHAR(255) NULL AFTER reference_id;")
-                    conn.commit()
-                except Exception:
-                    pass
-                try:
-                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN priority_order INT NULL;")
-                    conn.commit()
-                except Exception:
-                    pass  # already exists
-                try:
-                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN recommended_action TEXT NULL;")
-                    conn.commit()
-                except Exception:
-                    pass  # already exists
-                try:
-                    cursor.execute("ALTER TABLE tracker_items ADD COLUMN execution_priority_score INT NULL;")
-                    conn.commit()
-                except Exception:
-                    pass  # already exists
+                new_columns = [
+                    "ALTER TABLE tracker_items ADD COLUMN resolved_by BIGINT NULL",
+                    "ALTER TABLE tracker_items ADD COLUMN resolved_at TIMESTAMP NULL",
+                    "ALTER TABLE tracker_items ADD COLUMN title VARCHAR(255) NULL AFTER reference_id",
+                    "ALTER TABLE tracker_items ADD COLUMN priority_order INT NULL",
+                    "ALTER TABLE tracker_items ADD COLUMN recommended_action TEXT NULL",
+                    "ALTER TABLE tracker_items ADD COLUMN execution_priority_score INT NULL",
+                    # New decoupled status and graph metadata columns
+                    "ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(60) NULL COMMENT 'Operational status from document: WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, IN_PROGRESS'",
+                    "ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(30) NULL DEFAULT 'OPEN' COMMENT 'Risk lifecycle: OPEN, RESOLVED, NO_ACTIVE_RISK'",
+                    "ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(40) NULL COMMENT 'Graph-derived role: ROOT_CAUSE, EXECUTION_BLOCKER, DOWNSTREAM_ACTIVITY, etc.'",
+                    "ALTER TABLE tracker_items ADD COLUMN canonical_id VARCHAR(40) NULL COMMENT 'Canonical entity ID from EntityResolver registry'",
+                    "ALTER TABLE tracker_items ADD COLUMN risk_severity_score INT NULL COMMENT 'Risk severity score, independent of execution_priority_score'",
+                ]
+                for sql in new_columns:
+                    try:
+                        cursor.execute(sql)
+                        conn.commit()
+                    except Exception:
+                        pass  # Column already exists
                 cursor.close()
                 conn.close()
         except Exception as e:
@@ -109,6 +100,7 @@ class TrackerRepository:
             WHERE ti.project_id = %s
             ORDER BY
                 CASE WHEN ti.priority_order IS NOT NULL THEN ti.priority_order ELSE 9999 END ASC,
+                COALESCE(ti.execution_priority_score, 0) DESC,
                 ti.risk_score DESC
         """, (project_id,))
         items = cursor.fetchall()

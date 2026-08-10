@@ -52,6 +52,13 @@ def startup_event():
         start_scheduler()
     except Exception as e:
         print(f"Failed to start followup scheduler: {e}")
+        
+    try:
+        from init_db import run_tracker_migrations
+        run_tracker_migrations()
+        print("Successfully ran tracker migrations on startup.")
+    except Exception as e:
+        print(f"Failed to run tracker migrations: {e}")
 
 @app.get("/")
 def root():

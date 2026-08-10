@@ -27,8 +27,15 @@ class ActivityExtractorAgent:
         from core.prompts import get_activity_extractor_prompt
         prompt = get_activity_extractor_prompt(document_text, active_tracker_block)
         result = LLMService.generate_json(prompt)
+        extractions = result.get("extractions", [])
+        # The extraction prompt uses `statement` as the primary key;
+        # normalise to `activity` so the downstream pipeline always finds one key.
+        for item in extractions:
+            if not item.get("activity") and item.get("statement"):
+                item["activity"] = item["statement"]
         return {
-            "extractions": result.get("extractions", []),
+            "activities": extractions,        # primary key read by risk_evaluation_agent
+            "extractions": extractions,       # legacy fallback key
             "resolved_items": result.get("resolved_items", [])
         }
 
@@ -74,9 +81,16 @@ Baseline Context:
         result = LLMService.generate_json(prompt)
         if isinstance(result, list):
             return result
-        for key in ["activities", "results", "evaluations"]:
-            if key in result:
-                return result[key]
+        # Robust fallback: if the LLM wrapped the array in an object (e.g. {"evaluated_activities": [...]})
+        if isinstance(result, dict):
+            # First check common keys
+            for key in ["activities", "results", "evaluations", "evaluated_activities"]:
+                if key in result and isinstance(result[key], list):
+                    return result[key]
+            # If not found, just return the first list we find in the dict values
+            for val in result.values():
+                if isinstance(val, list):
+                    return val
         return []
 
 

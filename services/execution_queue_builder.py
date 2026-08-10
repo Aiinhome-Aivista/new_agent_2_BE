@@ -1,79 +1,151 @@
+"""
+ExecutionQueueBuilder — Graph-First Execution Priority Engine
+
+Answers: "What should the PM resolve first to unblock the maximum amount
+of project execution?"
+
+Does NOT use:
+  - Topological list position as a score
+  - risk_severity_score as an input
+  - Hardcoded names or document-specific heuristics
+
+Priority is derived from:
+  is_root_cause         × 100 base
+  immediate_unlock_count × critical_path_multiplier × due_date_weight
+  cascade_count          (breadth)
+  cascade_depth          (depth)
+  customer_dependency    bonus
+  deadline_urgency       weight
+
+All scores are normalised to 0–100.
+"""
+
 import collections
 from datetime import datetime, timezone
-from agents.execution_pipeline import ProjectStateSnapshot
+from typing import Dict, List, Tuple, Any, Optional
+
+from services.readiness_engine import ReadinessEngine
+
+
+# ---------------------------------------------------------------------------
+# Graph validation helper
+# ---------------------------------------------------------------------------
 
 class GraphValidationEngine:
-    @classmethod
-    def validate_and_clean(cls, backward_graph: dict, forward_graph: dict, all_nodes: set):
-        # 1. Self-Dependency Removal
-        for n in list(forward_graph.keys()):
-            if n in forward_graph[n]:
-                forward_graph[n].remove(n)
-        for n in list(backward_graph.keys()):
-            if n in backward_graph[n]:
-                backward_graph[n].remove(n)
+    """Validate and clean adjacency dicts before metric computation."""
 
-        # 2. Reference Integrity (Remove edges to non-existent nodes)
+    @staticmethod
+    def validate_and_clean(backward_graph: dict, forward_graph: dict,
+                           all_nodes: set) -> Tuple[dict, dict]:
+        # 1. Self-loops
+        for n in list(forward_graph.keys()):
+            forward_graph[n] = [c for c in forward_graph.get(n, []) if c != n]
+        for n in list(backward_graph.keys()):
+            backward_graph[n] = [p for p in backward_graph.get(n, []) if p != n]
+
+        # 2. Reference integrity — remove edges to unknown nodes
         for n in list(forward_graph.keys()):
             forward_graph[n] = [c for c in forward_graph[n] if c in all_nodes]
         for n in list(backward_graph.keys()):
             backward_graph[n] = [p for p in backward_graph[n] if p in all_nodes]
 
-        # 3. Cycle Detection (DFS)
-        visited = set()
-        rec_stack = set()
-        def is_cyclic(node):
+        # 3. Cycle detection / breaking (DFS)
+        visited: set = set()
+        rec_stack: set = set()
+
+        def _dfs(node):
             visited.add(node)
             rec_stack.add(node)
-            for neighbor in forward_graph.get(node, []):
-                if neighbor not in visited:
-                    if is_cyclic(neighbor):
-                        return True
-                elif neighbor in rec_stack:
-                    return True
-            rec_stack.remove(node)
-            return False
+            for nb in list(forward_graph.get(node, [])):
+                if nb not in visited:
+                    _dfs(nb)
+                elif nb in rec_stack:
+                    forward_graph[node] = [x for x in forward_graph[node] if x != nb]
+                    if nb in backward_graph:
+                        backward_graph[nb] = [x for x in backward_graph[nb] if x != node]
+                    print(f"  [GraphValidation] Cycle broken: {node} → {nb}")
+            rec_stack.discard(node)
 
-        for node in all_nodes:
-            if node not in visited:
-                if is_cyclic(node):
-                    # If cycle detected, break it conservatively by clearing backward edges of the offending node
-                    print(f"  [GraphValidation] Warning: Cycle detected at node {node}. Breaking cycle.")
-                    forward_graph[node] = []
-                    
+        for n in list(all_nodes):
+            if n not in visited:
+                _dfs(n)
+
         return backward_graph, forward_graph
 
 
+# ---------------------------------------------------------------------------
+# Execution Queue Builder
+# ---------------------------------------------------------------------------
+
 class ExecutionQueueBuilder:
+    """
+    Builds the PM Execution Queue using graph-derived metrics.
+
+    The queue is sorted by execution_priority_score (highest first).
+    execution_priority_score ≠ risk_severity_score — they are computed
+    independently and persisted as separate fields.
+    """
+
+    # Weights (tunable without code change)
+    ROOT_CAUSE_BASE = 100
+    DOWNSTREAM_BASE = 10
+    CASCADE_WEIGHT = 8         # per downstream node
+    UNLOCK_WEIGHT = 25         # per immediately unblocked node
+    CRITICAL_PATH_MULT = 1.4
+    CUSTOMER_DEP_BONUS = 15
+
+    # Due-date urgency multipliers
+    DUE_OVERDUE = 3.0
+    DUE_7_DAYS = 2.0
+    DUE_14_DAYS = 1.5
+    DUE_30_DAYS = 1.2
+    DUE_LATER = 1.0
+
     @classmethod
-    def build_queue(cls, snapshot: ProjectStateSnapshot, backward_graph: dict, forward_graph: dict) -> tuple:
+    def build_queue(cls, snapshot, backward_graph: dict,
+                    forward_graph: dict) -> Tuple[list, Dict[str, dict]]:
         """
-        Builds the Execution Queue using Topological Traversal and the Execution Index Formula.
-        Returns a tuple: (queue, node_metrics)
+        Parameters
+        ----------
+        snapshot       : ProjectStateSnapshot — provides status and planned_date.
+        backward_graph : dict  node → list of predecessor node IDs
+        forward_graph  : dict  node → list of successor node IDs
+
+        Returns
+        -------
+        queue       : list of node IDs in execution priority order
+        node_metrics: dict  node_id → rich metrics dict
         """
-        all_nodes = set(backward_graph.keys()).union(set(forward_graph.keys())).union(set(snapshot.milestone_statuses.keys()))
-        
-        # Phase 1: Validation
-        backward_graph, forward_graph = GraphValidationEngine.validate_and_clean(backward_graph, forward_graph, all_nodes)
-        
-        node_metrics = {}
-        
-        # Helper: Get all downstream nodes
+        all_nodes: set = (
+            set(backward_graph.keys()) |
+            set(forward_graph.keys()) |
+            set(snapshot.milestone_statuses.keys())
+        )
+
+        # Validate
+        backward_graph, forward_graph = GraphValidationEngine.validate_and_clean(
+            backward_graph, forward_graph, all_nodes
+        )
+
+        node_metrics: Dict[str, dict] = {}
+
+        # ── Helpers ────────────────────────────────────────────────────────────
+
         def get_all_downstream(node, visited=None):
             if visited is None:
                 visited = set()
             if node in visited:
                 return set()
             visited.add(node)
-            downstream = set()
+            result = set()
             for child in forward_graph.get(node, []):
-                downstream.add(child)
-                downstream.update(get_all_downstream(child, visited))
-            return downstream
+                result.add(child)
+                result.update(get_all_downstream(child, visited))
+            return result
 
-        # Helper: Get downstream chain length and longest path
-        memo_dist = {}
-        memo_path = {}
+        memo_dist: Dict[str, int] = {}
+        memo_path: Dict[str, list] = {}
+
         def get_downstream_chain(node):
             if node in memo_dist:
                 return memo_dist[node], memo_path[node]
@@ -82,161 +154,216 @@ class ExecutionQueueBuilder:
                 memo_dist[node] = 0
                 memo_path[node] = [node]
                 return 0, [node]
-            
-            max_dist = -1
-            best_path = []
+            best_d, best_p = -1, []
             for c in children:
-                c_dist, c_path = get_downstream_chain(c)
-                if c_dist > max_dist:
-                    max_dist = c_dist
-                    best_path = c_path
-                    
-            memo_dist[node] = max_dist + 1
-            memo_path[node] = [node] + best_path
+                cd, cp = get_downstream_chain(c)
+                if cd > best_d:
+                    best_d, best_p = cd, cp
+            memo_dist[node] = best_d + 1
+            memo_path[node] = [node] + best_p
             return memo_dist[node], memo_path[node]
 
-        for node in all_nodes:
-            get_downstream_chain(node)
+        for n in all_nodes:
+            get_downstream_chain(n)
 
-        # Critical path heuristics (nodes on the absolute longest path)
-        max_graph_dist = max(memo_dist.values()) if memo_dist else 0
-        critical_nodes = set()
-        if max_graph_dist > 0:
-            current_nodes = [n for n, d in memo_dist.items() if d == max_graph_dist]
-            while current_nodes:
-                next_nodes = []
-                for n in current_nodes:
-                    critical_nodes.add(n)
-                    children = forward_graph.get(n, [])
-                    if children:
-                        max_c_dist = max(memo_dist.get(c, 0) for c in children)
-                        for c in children:
-                            if memo_dist.get(c, 0) == max_c_dist:
-                                next_nodes.append(c)
-                current_nodes = next_nodes
+        max_dist = max(memo_dist.values()) if memo_dist else 0
 
-        # Helper: Find earliest effective due date
-        memo_date = {}
+        # Critical path nodes
+        critical_nodes: set = set()
+        if max_dist > 0:
+            starters = [n for n, d in memo_dist.items() if d == max_dist]
+            q = collections.deque(starters)
+            crit_vis: set = set()
+            while q:
+                curr = q.popleft()
+                if curr in crit_vis:
+                    continue
+                crit_vis.add(curr)
+                critical_nodes.add(curr)
+                children = forward_graph.get(curr, [])
+                if children:
+                    mc = max(memo_dist.get(c, 0) for c in children)
+                    for c in children:
+                        if memo_dist.get(c, 0) == mc:
+                            q.append(c)
+
+        # Effective due date (earliest of node date + all downstream dates)
+        memo_date: Dict[str, Any] = {}
+
         def get_effective_date(node):
             if node in memo_date:
                 return memo_date[node]
-            
             node_date = snapshot.get_date(node)
-            children = forward_graph.get(node, [])
-            
-            valid_dates = []
-            if node_date: valid_dates.append(node_date)
-            
-            for c in children:
-                c_date = get_effective_date(c)
-                if c_date: valid_dates.append(c_date)
-                
-            eff_date = min(valid_dates) if valid_dates else None
-            memo_date[node] = eff_date
-            return eff_date
+            valid = [node_date] if node_date else []
+            for c in forward_graph.get(node, []):
+                cd = get_effective_date(c)
+                if cd:
+                    valid.append(cd)
+            result = min(valid) if valid else None
+            memo_date[node] = result
+            return result
 
-        for node in all_nodes:
-            get_effective_date(node)
+        for n in all_nodes:
+            get_effective_date(n)
 
-        # Phase 2: Compute Rich Graph Metrics
+        # ── Per-node metric computation ────────────────────────────────────────
         today = datetime.now(timezone.utc).date()
-        
+
         for node in all_nodes:
+            status = snapshot.get_status(node)
             downstream_set = get_all_downstream(node)
             cascade_count = len(downstream_set)
-            status = snapshot.get_status(node)
-            
-            # Root cause heuristic: Is it the EARLIEST actionable blocker?
+            critical_path_len = memo_dist.get(node, 0)
+
+            # Root cause: has cascade impact AND all predecessors are done
             is_root = False
-            if status not in ["COMPLETED", "RESOLVED"]:
+            if cascade_count > 0 and status not in ("COMPLETED", "RESOLVED"):
                 is_root = True
-                for dep in backward_graph.get(node, []):
-                    dep_status = snapshot.get_status(dep)
-                    if dep_status not in ["COMPLETED", "RESOLVED"]:
+                for pred in backward_graph.get(node, []):
+                    if snapshot.get_status(pred) not in ("COMPLETED", "RESOLVED"):
                         is_root = False
                         break
-            
-            is_leaf = len(forward_graph.get(node, [])) == 0
-            
-            # Immediate Unlock Count
-            immediate_unlocks = 0
-            for child in forward_graph.get(node, []):
-                child_ready = True
-                for dep in backward_graph.get(child, []):
-                    if dep != node and snapshot.get_status(dep) not in ["COMPLETED", "RESOLVED"]:
-                        child_ready = False
-                        break
-                if child_ready:
-                    immediate_unlocks += 1
-                    
-            # Due Date Urgency calculation
-            due_date = memo_date.get(node)
+
+            # Immediate unlock count using ReadinessEngine (AND semantics)
+            immediate_unlocks = ReadinessEngine.immediate_unlock_count(
+                node,
+                forward_graph,
+                backward_graph,
+                snapshot.get_status,
+            )
+
+            # Due-date urgency weight
+            eff_date = memo_date.get(node)
             days_remaining = 999
-            if due_date:
-                # Assuming due_date is datetime.date or datetime
+            if eff_date:
                 try:
-                    due_date_obj = due_date.date() if isinstance(due_date, datetime) else due_date
-                    days_remaining = (due_date_obj - today).days
-                except:
+                    d_obj = eff_date.date() if isinstance(eff_date, datetime) else eff_date
+                    days_remaining = (d_obj - today).days
+                except Exception:
                     pass
-                    
-            due_date_weight = 1.0
+
             if days_remaining <= 0:
-                due_date_weight = 3.0
+                due_wt = cls.DUE_OVERDUE
             elif days_remaining <= 7:
-                due_date_weight = 2.0
+                due_wt = cls.DUE_7_DAYS
             elif days_remaining <= 14:
-                due_date_weight = 1.5
+                due_wt = cls.DUE_14_DAYS
             elif days_remaining <= 30:
-                due_date_weight = 1.2
-            
-            critical_path_len = memo_dist.get(node, 0)
-            
-            # Execution Index Formula
-            root_cause_score = 100 if is_root else 10
-            exec_index = root_cause_score + (critical_path_len * immediate_unlocks * due_date_weight)
-            if node in critical_nodes:
-                exec_index *= 1.5
-                
-            node_metrics[node] = {
-                "parents": backward_graph.get(node, []),
-                "children": forward_graph.get(node, []),
-                "is_root": is_root,
-                "is_leaf": is_leaf,
-                "critical_path": node in critical_nodes,
-                "critical_path_length": critical_path_len,
-                "immediate_unlocks": immediate_unlocks,
-                "cascade_nodes": cascade_count,
-                "execution_level": 0, # Will be filled by topological sort
-                "longest_path": memo_path.get(node, []),
-                "execution_index": exec_index,
-                "days_remaining": days_remaining
+                due_wt = cls.DUE_30_DAYS
+            else:
+                due_wt = cls.DUE_LATER
+
+            on_critical_path = node in critical_nodes
+
+            # Topology-derived graph_role (never from LLM or heuristics)
+            has_upstream = bool(backward_graph.get(node))
+            has_downstream = bool(forward_graph.get(node))
+            if not has_upstream and has_downstream:
+                topo_role = "ROOT_CAUSE"
+            elif has_upstream and has_downstream:
+                topo_role = "INTERMEDIATE_BLOCKER"
+            elif has_upstream and not has_downstream:
+                topo_role = "TERMINAL_ACTIVITY"
+            else:
+                topo_role = "ISOLATED"
+
+            # Priority reason (human-readable, from graph metrics)
+            reason_parts = []
+            if is_root:
+                reason_parts.append("Root prerequisite with no pending upstream")
+            if cascade_count > 0:
+                reason_parts.append(f"Blocks {cascade_count} downstream activities")
+            if immediate_unlocks > 0:
+                reason_parts.append(f"Resolving unlocks {immediate_unlocks} activities immediately")
+            if on_critical_path:
+                reason_parts.append("On critical delivery path")
+            if days_remaining <= 0:
+                reason_parts.append("OVERDUE")
+            elif days_remaining <= 7:
+                reason_parts.append(f"Due in {days_remaining} days")
+            priority_reason = "; ".join(reason_parts) if reason_parts else "No immediate unblock impact"
+
+            # Unblock impact summary
+            downstream_ids = sorted(downstream_set)
+            unblock_impact = {
+                "immediate_unlocks": list(forward_graph.get(node, [])),
+                "transitive_unlocks": downstream_ids,
+                "critical_path_impact": on_critical_path,
+                "total_unblocked": cascade_count,
             }
 
-        # Phase 3: Build Queue
-        # We sort eligible nodes strictly by Execution Index (highest first)
-        eligible_nodes = [n for n in all_nodes if snapshot.get_status(n) not in ["COMPLETED", "RESOLVED"]]
-        eligible_nodes.sort(key=lambda n: (-node_metrics[n]["execution_index"], n))
-        
-        queue = []
-        visited = set()
-        
-        # Traverse strictly by descending execution index
-        for node in eligible_nodes:
-            if node not in visited:
-                visited.add(node)
-                queue.append(node)
-                
-        # Fill execution levels based on BFS depth from roots
+            # ── Execution Priority Score ─────────────────────────────────────
+            # root cause bonus + unlock impact + cascade breadth
+            base = cls.ROOT_CAUSE_BASE if is_root else cls.DOWNSTREAM_BASE
+            unlock_impact_score = immediate_unlocks * cls.UNLOCK_WEIGHT
+            cascade_impact = cascade_count * cls.CASCADE_WEIGHT
+            raw_score = (base + unlock_impact_score + cascade_impact) * due_wt
+
+            if on_critical_path:
+                raw_score *= cls.CRITICAL_PATH_MULT
+
+            # Store raw for normalisation pass
+            node_metrics[node] = {
+                "_raw_score": raw_score,
+                "is_root": is_root,
+                "cascade_count": cascade_count,
+                "cascade_depth": critical_path_len,
+                "immediate_unlocks": immediate_unlocks,
+                "critical_path": on_critical_path,
+                "critical_path_length": critical_path_len,
+                "longest_path": memo_path.get(node, [node]),
+                "parents": list(backward_graph.get(node, [])),
+                "children": list(forward_graph.get(node, [])),
+                "cascade_nodes": cascade_count,
+                "execution_level": 0,
+                "days_remaining": days_remaining,
+                "graph_role": topo_role,
+                "priority_reason": priority_reason,
+                "unblock_impact": unblock_impact,
+                "root_cause_dependency": node if is_root else None,
+            }
+
+        # ── Normalise execution_index to 0–100 ────────────────────────────────
+        raw_scores = [m["_raw_score"] for m in node_metrics.values()]
+        max_raw = max(raw_scores) if raw_scores else 1.0
+        # Enforce a minimum baseline to avoid artificially inflating ISOLATED nodes (score 10) to 100
+        max_raw = max(max_raw, cls.ROOT_CAUSE_BASE)
+
+        for node, m in node_metrics.items():
+            m["execution_index"] = round(
+                min((m["_raw_score"] / max_raw) * 100, 100), 1)
+
+        # ── Build queue (eligible = not completed/resolved) ────────────────────
+        eligible = [n for n in all_nodes
+                    if snapshot.get_status(n) not in ("COMPLETED", "RESOLVED")]
+        eligible.sort(key=lambda n: (-node_metrics[n]["execution_index"], n))
+
+        queue = list(eligible)  # deterministic order
+
+        # Topological levels (for display / BFS)
         roots = [n for n in all_nodes if not backward_graph.get(n)]
-        q = collections.deque([(r, 1) for r in roots])
-        level_visited = set()
-        while q:
-            curr, lvl = q.popleft()
-            if curr not in level_visited:
-                level_visited.add(curr)
+        bfs_q = collections.deque([(r, 1) for r in roots])
+        bfs_vis: set = set()
+        while bfs_q:
+            curr, lvl = bfs_q.popleft()
+            if curr not in bfs_vis:
+                bfs_vis.add(curr)
                 node_metrics[curr]["execution_level"] = lvl
                 for c in forward_graph.get(curr, []):
-                    q.append((c, lvl + 1))
-                    
+                    bfs_q.append((c, lvl + 1))
+
+        # ── Print execution priority table ─────────────────────────────────────
+        print("\n=== EXECUTION PRIORITY ===")
+        print(f"{'Rank':<5} | {'Node ID':<15} | {'Role':<22} | {'Exec Priority':>13} | "
+              f"{'Unlocks':>7} | {'Cascade':>7} | {'CritPath'}")
+        print("-" * 100)
+        for rank, node in enumerate(queue, 1):
+            m = node_metrics[node]
+            print(f"{rank:<5} | {node:<15} | {m['graph_role']:<22} | "
+                  f"{m['execution_index']:>13.1f} | "
+                  f"{m['immediate_unlocks']:>7} | "
+                  f"{m['cascade_count']:>7} | "
+                  f"{'✓' if m['critical_path'] else ''}")
+        print()
+
         return queue, node_metrics

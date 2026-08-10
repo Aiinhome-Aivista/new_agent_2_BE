@@ -244,8 +244,9 @@ RULES:
 2. STATUS EXTRACTION:
    - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, WAITING_ON_CUSTOMER, or UNKNOWN.
 
-3. BLOCKED BY & BLOCKS (STRICT ENTITY ONLY):
-   - `blocked_by` and `blocks` MUST contain valid project deliverables or activities ONLY (e.g. ["Production CRM API Credentials"]).
+3. BLOCKED BY & PREREQUISITES (STRICT EVIDENCE-BACKED ENTITY ONLY):
+   - `blocked_by` MUST contain explicit prerequisite activities, deliverables, or resource dependencies mentioned in the text (e.g. ["Production CRM API Credentials"], ["Production VPN Access"], ["Backend APIs"], ["Security Review"], ["QA Validation"]).
+   - ONLY include items explicitly established in evidence as prerequisites or blockers. NEVER invent, infer, or guess dependencies across unrelated workstreams (e.g. do NOT put "CRM Integration" under "Analytics Dashboard" unless the sentence explicitly says so).
    - NEVER include statuses ("Pending review", "Waiting", "Completed"), owners ("Customer", "Vendor", "Internal"), roles ("QA Lead"), dates, or evidence phrases.
    - If not blocked, return an empty array [].
 

@@ -57,6 +57,16 @@ def run_tracker_migrations():
             print("Migration: Adding 'previous_highest_score' column...")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN previous_highest_score INT NULL DEFAULT 0")
             conn.commit()
+
+        cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'execution_status'")
+        if not cursor.fetchone():
+            print("Migration: Adding decoupled status columns...")
+            cursor.execute("ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(50) NULL DEFAULT 'NOT_STARTED'")
+            cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(50) NULL DEFAULT 'OPEN'")
+            cursor.execute("ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(100) NULL DEFAULT 'DOWNSTREAM_ACTIVITY'")
+            cursor.execute("ALTER TABLE tracker_items ADD COLUMN canonical_id VARCHAR(255) NULL DEFAULT ''")
+            cursor.execute("ALTER TABLE tracker_items ADD COLUMN recommended_action TEXT NULL")
+            conn.commit()
             
         print("Migration: Updating item_type ENUM...")
         cursor.execute("ALTER TABLE tracker_items MODIFY COLUMN item_type enum('ACTIVITY','NEW_REQUEST','CHANGE_REQUEST','BLOCKER','ACTION_ITEM','DECISION','RISK_MENTIONED','DEPENDENCY') NOT NULL")
