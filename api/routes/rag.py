@@ -12,51 +12,6 @@ import json
 
 router = APIRouter()
 
-# Schema Setup logic
-def create_rag_tables():
-    conn = get_db_connection()
-    if not conn:
-        print("RAG Table Setup: Failed to connect to database")
-        return
-    cursor = conn.cursor()
-    try:
-        # Create sessions table
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rag_chat_sessions (
-            id BIGINT PRIMARY KEY AUTO_INCREMENT,
-            project_id BIGINT NOT NULL,
-            session_name VARCHAR(255) NOT NULL,
-            created_by BIGINT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            CONSTRAINT fk_rag_session_project FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
-            CONSTRAINT fk_rag_session_user FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        """)
-        
-        # Create messages table
-        cursor.execute("""
-        CREATE TABLE IF NOT EXISTS rag_chat_messages (
-            id BIGINT PRIMARY KEY AUTO_INCREMENT,
-            session_id BIGINT NOT NULL,
-            role ENUM('USER', 'ASSISTANT') NOT NULL,
-            content TEXT NOT NULL,
-            citations_json JSON NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            CONSTRAINT fk_rag_message_session FOREIGN KEY (session_id) REFERENCES rag_chat_sessions(id) ON DELETE CASCADE
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        """)
-        conn.commit()
-        print("RAG tables successfully checked/created.")
-    except Exception as e:
-        print(f"RAG Tables Setup Error: {e}")
-        conn.rollback()
-    finally:
-        cursor.close()
-        conn.close()
-
-# Auto setup tables on import
-create_rag_tables()
 
 # Request/Response schemas
 class SessionCreate(BaseModel):
