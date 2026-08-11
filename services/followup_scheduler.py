@@ -308,12 +308,36 @@ def run_followup_checks(target_date: Optional[str] = None) -> Dict[str, Any]:
             pass
         return {"success": False, "error": str(e)}
 
+def run_drive_sync_job() -> None:
+    """
+    Wrapper called by APScheduler for the Google Drive sync.
+    Errors are caught so a Drive failure never crashes the scheduler thread.
+    """
+    try:
+        from services.drive_inbox_service import run_drive_sync
+        result = run_drive_sync()
+        logger.info(
+            "Drive sync completed: %d new file(s) staged, %d error(s).",
+            result.get("new_files_staged", 0),
+            len(result.get("errors", [])),
+        )
+    except Exception as exc:
+        logger.error("Drive sync job crashed: %s", exc)
+
+
 def start_scheduler():
     """
     Starts the APScheduler background thread.
-    Schedules run_followup_checks to execute every day at 9:00 AM.
+    Job 1: Daily follow-up reminders at 9:00 AM.
+    Job 2: Google Drive sync — interval controlled by settings:
+           DRIVE_SYNC_INTERVAL_HOURS (default 24)
+           DRIVE_SYNC_INTERVAL_MINUTES (default 0)
+    If both are 0, defaults to every 24 hours.
     """
+    from core.config import settings
+
     if not scheduler.running:
+        # ── Job 1: follow-up reminders ────────────────────────────────────
         scheduler.add_job(
             run_followup_checks,
             trigger='cron',
@@ -322,5 +346,28 @@ def start_scheduler():
             id='daily_followup_checks',
             replace_existing=True
         )
+
+        # ── Job 2: Drive sync — interval-based ───────────────────────────
+        sync_hours = settings.DRIVE_SYNC_INTERVAL_HOURS
+        sync_minutes = settings.DRIVE_SYNC_INTERVAL_MINUTES
+        total_minutes = sync_hours * 60 + sync_minutes
+        if total_minutes <= 0:
+            total_minutes = 24 * 60  # fallback to 24 hours
+
+        scheduler.add_job(
+            run_drive_sync_job,
+            trigger='interval',
+            minutes=total_minutes,
+            id='drive_sync',
+            replace_existing=True,
+        )
+
         scheduler.start()
-        logger.info("APScheduler initialized and daily follow-up checks scheduled for 9:00 AM.")
+        logger.info(
+            "APScheduler started. Follow-up: 09:00 daily. "
+            "Drive sync: every %d minute(s) (%dh %dm).",
+            total_minutes,
+            total_minutes // 60,
+            total_minutes % 60,
+        )
+

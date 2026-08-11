@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
-from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers
+from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers, drive
  
 app = FastAPI(
     title=settings.APP_NAME,
@@ -45,6 +45,7 @@ app.include_router(tracker.router, prefix=f"{settings.API_PREFIX}/projects/{{pro
 app.include_router(rag.router, prefix=f"{settings.API_PREFIX}/projects/{{project_id}}/rag", tags=["rag"])
 app.include_router(dashboard.router, prefix=f"{settings.API_PREFIX}/dashboard", tags=["dashboard"])
 app.include_router(project_registers.router, prefix=f"{settings.API_PREFIX}")
+app.include_router(drive.router, prefix=f"{settings.API_PREFIX}/drive", tags=["drive"])
 @app.on_event("startup")
 def startup_event():
     try:
@@ -59,6 +60,13 @@ def startup_event():
         print("Successfully ran tracker migrations on startup.")
     except Exception as e:
         print(f"Failed to run tracker migrations: {e}")
+
+    try:
+        from services.drive_inbox_service import ensure_drive_tables
+        ensure_drive_tables()
+        print("Drive tables ensured on startup.")
+    except Exception as e:
+        print(f"Failed to ensure drive tables: {e}")
 
 @app.get("/")
 def root():

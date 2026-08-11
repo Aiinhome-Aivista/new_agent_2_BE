@@ -55,6 +55,15 @@ class Settings(BaseSettings):
     SMTP_PASSWORD: str = ""
     SMTP_USE_TLS: bool = True
 
+    # ── Google Drive Integration ──────────────────────────────────────────────
+    # Scheduler interval: runs every N hours (default 24 = once daily)
+    # Set DRIVE_SYNC_INTERVAL_HOURS=0 and DRIVE_SYNC_INTERVAL_MINUTES=30 for every 30 min.
+    DRIVE_SYNC_INTERVAL_HOURS: int = 24
+    DRIVE_SYNC_INTERVAL_MINUTES: int = 0
+    # Fernet key used to encrypt/decrypt stored credentials JSON.
+    # Generate once with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    DRIVE_CREDENTIAL_ENCRYPTION_KEY: str = ""
+
     class Config:
         env_file = ".env"
         extra = "ignore"
