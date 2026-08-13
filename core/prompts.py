@@ -893,18 +893,26 @@ Rules:
 2. NEVER group distinct testing or deployment phases (e.g. SIT, UAT, Production) into a single item. They MUST be separate items.
 3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one item, and do not group distinct features like "audit logs" and "SSO" into one "Security" item).
 4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST be extracted as its own distinct item.
-5. "name" MUST be a short label (<= 60 characters).
+5. "name" MUST be a short label (<= 60 characters). Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the name.
 6. "description" MUST be the faithful sentence or clause the item was taken from.
 7. "source_section" MUST be exactly one of: "Scope of Work", "Deliverables", "Responsibilities", "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies", "Milestones", "General".
 8. If the excerpt contains no scope-related content, return an empty array [].
 9. Do NOT invent items that are not present in the excerpt.
+10. "is_pure_milestone" MUST be true if the item is purely a project phase, timeline event, or deadline (e.g., 'Kickoff', 'UAT', 'Go-Live'). Otherwise false.
 
 Output STRICTLY as a JSON ARRAY and nothing else (no markdown, no prose):
 [
   {{
-    "name": "Web Portal Design",
-    "description": "The vendor will design and develop the web-based retail portal.",
-    "source_section": "Scope of Work"
+    "name": "Example Feature/Deliverable Name",
+    "description": "The vendor shall provide the specified technical component.",
+    "source_section": "Scope of Work",
+    "is_pure_milestone": false
+  }},
+  {{
+    "name": "Example Project Phase",
+    "description": "Phase 1 - Initial Kickoff (DD MMM YYYY)",
+    "source_section": "Milestones",
+    "is_pure_milestone": true
   }}
 ]
 
@@ -927,16 +935,24 @@ Task:
 2. Do NOT merge genuinely distinct items (for example, keep SIT, UAT, and Production Deployment as separate items).
 3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one 'Out of Scope Exclusions' item, and do not group distinct features like "audit logs" and "user management" into one "Security" item). Every distinct line item from the contract must remain a distinct item.
 4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST remain a distinct item.
-5. When merging, keep the most specific non-"General" "source_section".
-6. Do NOT classify items as in-scope or out-of-scope.
-7. Do NOT invent items that are not present in the input.
+5. Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the "name".
+6. When merging, keep the most specific non-"General" "source_section".
+7. Do NOT classify items as in-scope or out-of-scope.
+8. Keep the "is_pure_milestone" flag as true if the item is purely a project phase or timeline event.
 
 Output STRICTLY as a JSON ARRAY of the consolidated items and nothing else (no markdown, no prose):
 [
   {{
-    "name": "Web Portal Design",
-    "description": "The vendor will design and develop the web-based retail portal.",
-    "source_section": "Scope of Work"
+    "name": "Example Feature/Deliverable Name",
+    "description": "The vendor shall provide the specified technical component.",
+    "source_section": "Scope of Work",
+    "is_pure_milestone": false
+  }},
+  {{
+    "name": "Example Project Phase",
+    "description": "Phase 1 - Initial Kickoff (DD MMM YYYY)",
+    "source_section": "Milestones",
+    "is_pure_milestone": true
   }}
 ]
 """

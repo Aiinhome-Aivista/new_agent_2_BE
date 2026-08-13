@@ -332,6 +332,7 @@ class DeepScanExtractor:
                         "section": section,
                         "chunk_index": window["chunk_index"],
                         "page_number": window["page_number"],
+                        "is_pure_milestone": it.get("is_pure_milestone", False),
                     }
                 )
         return mapped
@@ -355,6 +356,7 @@ class DeepScanExtractor:
                     "name": it["name"],
                     "description": it["description"],
                     "source_section": it["section"],
+                    "is_pure_milestone": it.get("is_pure_milestone", False),
                 }
                 for it in items
             ]
@@ -401,6 +403,7 @@ class DeepScanExtractor:
                     "section": it.get("source_section")
                     if it.get("source_section") in cls.VALID_SECTIONS
                     else "General",
+                    "is_pure_milestone": it.get("is_pure_milestone", False),
                 }
             )
         return cleaned
@@ -431,6 +434,7 @@ class DeepScanExtractor:
                         "name": it["name"],
                         "description": it["description"],
                         "section": it["section"],
+                        "is_pure_milestone": it.get("is_pure_milestone", False),
                     }
                 )
         return result
@@ -469,6 +473,7 @@ class DeepScanExtractor:
                     "chunk_index": src.get("chunk_index"),
                     "raw_text": item.get("description", name),
                     "document_id": document_id,
+                    "is_pure_milestone": item.get("is_pure_milestone", False) or src.get("is_pure_milestone", False),
                 }
             )
         return candidates
