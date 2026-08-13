@@ -1,5 +1,5 @@
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Body
 from pydantic import BaseModel
 from typing import List, Optional
 import os
@@ -20,6 +20,7 @@ from services.normalization_service import NormalizationService
 from services.milestone_dependency_extractor import MilestoneDependencyExtractor
 from services.milestone_dependency_service import MilestoneDependencyService
 from services.recurring_deliverable_service import RecurringDeliverableService
+from services.rag_service import RAGService
 
 # pyrefly: ignore [missing-import]
 import mysql.connector
@@ -30,7 +31,44 @@ import threading
 
 router = APIRouter()
 
-def run_baseline_pipeline(project_id: int, document_id: int):
+# Supported extraction modes for the baseline pipeline.
+QUICK_EXTRACT = "QUICK"
+DEEP_SCAN = "DEEP_SCAN"
+
+
+def _supersede_previous_vector_versions(db_conn, project_id: int, current_document_id: int):
+    """
+    Automatic VectorDB version control.
+
+    When a new EL/IFA document is processed for extraction, purge the Vector DB
+    chunks (Chroma + BM25) of any previous, superseded EL/IFA documents for this
+    project, so RAG does not return conflicting answers from stale versions.
+    The old documents remain in the relational DB for history — only their
+    vector chunks are removed.
+    """
+    try:
+        prior_docs = BaselineRepository.get_other_elifa_documents(
+            db_conn, project_id, current_document_id
+        )
+        for prior in prior_docs:
+            try:
+                RAGService.delete_document(project_id, prior["id"])
+                print(
+                    f"[VectorVersioning] Purged vector chunks for superseded "
+                    f"{prior.get('document_type')} document id={prior['id']} "
+                    f"('{prior.get('document_name')}')"
+                )
+            except Exception as del_err:
+                print(
+                    f"[VectorVersioning] Failed to purge vector chunks for "
+                    f"document id={prior['id']}: {del_err}"
+                )
+    except Exception as e:
+        # Non-fatal: extraction should still proceed even if cleanup fails.
+        print(f"[VectorVersioning] Non-fatal error during vector version cleanup: {e}")
+
+
+def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_EXTRACT):
     # Establish a fresh connection for the thread
     thread_conn = get_db_connection()
     if not thread_conn:
@@ -64,7 +102,13 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         doc = BaselineRepository.get_document(thread_conn, document_id, project_id)
         if not doc:
             raise RuntimeError("Document not found")
-            
+
+        # Automatic VectorDB version control: remove vector chunks of any
+        # previous, superseded EL/IFA documents for this project. This keeps RAG
+        # answers consistent for BOTH modes, and additionally ensures the Deep
+        # Scan heatmap only sees the current document's chunks.
+        _supersede_previous_vector_versions(thread_conn, project_id, document_id)
+
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         chunks = DocumentService.parse_document(doc["storage_key"], ext)
         
@@ -73,8 +117,23 @@ def run_baseline_pipeline(project_id: int, document_id: int):
         chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
         
         # Pipeline Step 2: Extract Candidates
+        # Branch on the selected extraction mode. Both branches MUST return
+        # candidates in the same dictionary shape so the rest of the pipeline
+        # (classification -> dedup -> milestones -> saving) is mode-agnostic.
         emit("Extracting Scope Candidates", 30)
-        raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
+        if mode == DEEP_SCAN:
+            print("[Baseline] Using DEEP_SCAN (Map-Reduce + Heatmap) extraction mode.")
+            from services.deep_scan_extractor import DeepScanExtractor
+            raw_candidates = DeepScanExtractor.extract_candidates(
+                project_id=project_id,
+                document_id=document_id,
+                document_type=doc.get("document_type", "EL"),
+                parsed_chunks=chunks,
+                sectioned_chunks=chunks_with_sections,
+            )
+        else:
+            print("[Baseline] Using QUICK extraction mode.")
+            raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
         
         # Pipeline Step 3: Classification
         emit("Classifying Scope Items", 50)
@@ -409,9 +468,25 @@ def run_baseline_pipeline(project_id: int, document_id: int):
     finally:
         thread_conn.close()
 
+class ExtractRequest(BaseModel):
+    # "QUICK" (default, existing deterministic hybrid) or "DEEP_SCAN" (Map-Reduce).
+    mode: Optional[str] = QUICK_EXTRACT
+
+
 @router.post("/extract")
-def extract_baseline(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+def extract_baseline(
+    project_id: int,
+    document_id: int,
+    payload: Optional[ExtractRequest] = Body(default=None),
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
     verify_project_access(project_id, current_user, db)
+
+    # Resolve and validate the extraction mode (backward compatible: no body -> QUICK).
+    mode = (payload.mode if payload and payload.mode else QUICK_EXTRACT).upper()
+    if mode not in (QUICK_EXTRACT, DEEP_SCAN):
+        mode = QUICK_EXTRACT
     
     doc = BaselineRepository.get_document(db, document_id, project_id)
     if not doc:
@@ -442,12 +517,13 @@ def extract_baseline(project_id: int, document_id: int, current_user: dict = Dep
 
     thread = threading.Thread(
         target=run_baseline_pipeline,
-        args=(project_id, document_id),
+        args=(project_id, document_id, mode),
         daemon=True
     )
     thread.start()
-    
-    return {"success": True, "message": "Baseline extraction started", "data": {"baseline_id": None}}
+
+    mode_label = "Deep Scan" if mode == DEEP_SCAN else "Quick Extract"
+    return {"success": True, "message": f"Baseline extraction started ({mode_label})", "data": {"baseline_id": None, "mode": mode}}
 
 @router.get("/")
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):

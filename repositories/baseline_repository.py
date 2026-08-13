@@ -12,6 +12,24 @@ class BaselineRepository:
         return doc
 
     @staticmethod
+    def get_other_elifa_documents(db: mysql.connector.connection.MySQLConnection, project_id: int, exclude_document_id: int) -> List[Dict[str, Any]]:
+        """
+        Returns all EL/IFA documents for the project EXCEPT the given one.
+        Used to purge the Vector DB chunks of previous, superseded EL/IFA
+        versions so RAG does not return conflicting answers from old versions.
+        The relational records are intentionally left intact for history.
+        """
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, document_name, document_type FROM documents "
+            "WHERE project_id = %s AND document_type IN ('EL', 'IFA') AND id != %s",
+            (project_id, exclude_document_id)
+        )
+        rows = cursor.fetchall()
+        cursor.close()
+        return rows
+
+    @staticmethod
     def get_draft_baseline(db: mysql.connector.connection.MySQLConnection, project_id: int) -> Optional[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'DRAFT' ORDER BY id DESC LIMIT 1", (project_id,))

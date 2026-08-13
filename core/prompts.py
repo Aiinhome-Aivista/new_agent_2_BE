@@ -874,3 +874,69 @@ Rules for output:
 - Output ONLY the JSON array. No markdown blocks, no explanations outside JSON.
 """
 
+# ==========================================
+# DEEP SCAN (MAP-REDUCE) EXTRACTION PROMPTS
+# ==========================================
+# Used by services/deep_scan_extractor.py for the "Deep Scan" extraction mode.
+# The Map phase extracts every distinct scope-related item from a page/chunk
+# window WITHOUT classifying it (a later stage classifies IN/OUT of scope).
+# The Reduce phase merges and deduplicates the mapped items into a clean list.
+def get_deep_scan_map_prompt(chunk_text: str) -> str:
+    return f"""
+You are an expert contract analyst performing the MAP phase of a Map-Reduce scope extraction.
+Read the following excerpt from an Engagement Letter (EL) or Inter-Firm Approval (IFA) document and extract EVERY distinct scope-related item you can find: services or deliverables the vendor will provide, items that are explicitly excluded, client responsibilities, assumptions, dependencies, and milestones.
+
+Do NOT decide whether an item is in-scope or out-of-scope — a later stage does that. Your job is only to faithfully capture each distinct item.
+
+Rules:
+1. Extract each distinct obligation, deliverable, exclusion, assumption, dependency, or milestone as its OWN item. NEVER merge multiple distinct items into one.
+2. NEVER group distinct testing or deployment phases (e.g. SIT, UAT, Production) into a single item. They MUST be separate items.
+3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one item, and do not group distinct features like "audit logs" and "SSO" into one "Security" item).
+4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST be extracted as its own distinct item.
+5. "name" MUST be a short label (<= 60 characters).
+6. "description" MUST be the faithful sentence or clause the item was taken from.
+7. "source_section" MUST be exactly one of: "Scope of Work", "Deliverables", "Responsibilities", "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies", "Milestones", "General".
+8. If the excerpt contains no scope-related content, return an empty array [].
+9. Do NOT invent items that are not present in the excerpt.
+
+Output STRICTLY as a JSON ARRAY and nothing else (no markdown, no prose):
+[
+  {{
+    "name": "Web Portal Design",
+    "description": "The vendor will design and develop the web-based retail portal.",
+    "source_section": "Scope of Work"
+  }}
+]
+
+Document Excerpt:
+{chunk_text}
+"""
+
+
+def get_deep_scan_reduce_prompt(items_for_prompt: list) -> str:
+    import json
+    return f"""
+You are an expert contract analyst performing the REDUCE phase of a Map-Reduce scope extraction.
+Below is a JSON array of candidate scope items that were extracted from different (and sometimes overlapping) excerpts of the SAME contract. Because the excerpts overlap, the array contains duplicates and near-duplicates.
+
+Candidate items:
+{json.dumps(items_for_prompt, indent=2)}
+
+Task:
+1. Merge duplicates and near-duplicates that refer to the SAME underlying item into a single entry. Keep the clearest "name" and the most complete "description".
+2. Do NOT merge genuinely distinct items (for example, keep SIT, UAT, and Production Deployment as separate items).
+3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one 'Out of Scope Exclusions' item, and do not group distinct features like "audit logs" and "user management" into one "Security" item). Every distinct line item from the contract must remain a distinct item.
+4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST remain a distinct item.
+5. When merging, keep the most specific non-"General" "source_section".
+6. Do NOT classify items as in-scope or out-of-scope.
+7. Do NOT invent items that are not present in the input.
+
+Output STRICTLY as a JSON ARRAY of the consolidated items and nothing else (no markdown, no prose):
+[
+  {{
+    "name": "Web Portal Design",
+    "description": "The vendor will design and develop the web-based retail portal.",
+    "source_section": "Scope of Work"
+  }}
+]
+"""
