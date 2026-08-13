@@ -576,6 +576,7 @@ Rules for EACH item:
 2. If no deadline/milestone is mentioned, set has_schedule to false.
 3. If deadline is mentioned, return the EXACT original text (e.g., "15 Apr", "End of June").
 4. If a milestone name is mentioned (e.g. "UAT", "Go Live"), extract it. If the item itself is the milestone, use the item name.
+5. Extract the status if explicitly mentioned (e.g. "Completed", "In Progress", "Planned"). If not mentioned, default to "Planned".
 
 Output strictly as a JSON ARRAY of objects, matching the input "id".
 Schema Example:
@@ -584,7 +585,8 @@ Schema Example:
     "id": "0",
     "has_schedule": true,
     "milestone": "UAT",
-    "deadline_text": "15 Apr"
+    "deadline_text": "15 Apr",
+    "milestone_status": "Planned"
   }}
 ]
 """
@@ -899,6 +901,7 @@ Rules:
 8. If the excerpt contains no scope-related content, return an empty array [].
 9. Do NOT invent items that are not present in the excerpt.
 10. "is_pure_milestone" MUST be true if the item is purely a project phase, timeline event, or deadline (e.g., 'Kickoff', 'UAT', 'Go-Live'). Otherwise false.
+11. If ANY item (milestone, deliverable, or responsibility) has an explicitly stated date, deadline, or schedule in the text, you MUST include that date in its "description".
 
 Output STRICTLY as a JSON ARRAY and nothing else (no markdown, no prose):
 [
@@ -939,6 +942,7 @@ Task:
 6. When merging, keep the most specific non-"General" "source_section".
 7. Do NOT classify items as in-scope or out-of-scope.
 8. Keep the "is_pure_milestone" flag as true if the item is purely a project phase or timeline event.
+9. If ANY item has a date, deadline, or schedule in its description, you MUST retain it in the merged "description".
 
 Output STRICTLY as a JSON ARRAY of the consolidated items and nothing else (no markdown, no prose):
 [

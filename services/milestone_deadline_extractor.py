@@ -4,8 +4,9 @@ from services.llm_service import LLMService
 
 class MilestoneDeadlineExtractor:
     
+    # Use a more robust date regex that restricts months to actual month prefixes and optionally allows 'of ' before the date.
     DATE_PATTERNS = [
-        r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date|acceptance\s+date|\bby\b|\bon\b)\s+([0-9]{1,2}\s+[A-Za-z]+\s+[0-9]{4}|[0-9]{1,2}\s+[A-Za-z]+|[A-Za-z]+\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of [A-Za-z]+)"
+        r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date(?:\s+of)?|acceptance\s+date|\bby\b|\bon\b)\s+([0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4}|[0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of \s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)"
     ]
 
     MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer"]
@@ -70,7 +71,13 @@ class MilestoneDeadlineExtractor:
                 
             # If we suspect there is scheduling info but regex failed, use LLM.
             keywords = ["completed by", "before", "after", "scheduled for", "due on", "delivery date", "target date", "completion date", "acceptance date"]
-            needs_llm = any(kw in combined_text.lower() for kw in keywords) or any(mk.lower() in combined_text.lower() for mk in cls.MILESTONE_KEYWORDS)
+            needs_llm = (
+                candidate.get("is_pure_milestone", False) or 
+                candidate.get("category") == "MILESTONE" or
+                any(kw in combined_text.lower() for kw in keywords) or 
+                any(mk.lower() in combined_text.lower() for mk in cls.MILESTONE_KEYWORDS) or
+                cls._normalize_date(combined_text) is not None
+            )
             
             if needs_llm:
                 llm_batch.append({
@@ -109,6 +116,7 @@ class MilestoneDeadlineExtractor:
                         candidate_ref["deadline_text"] = res.get("deadline_text")
                         candidate_ref["deadline"] = cls._normalize_date(candidate_ref["deadline_text"])
                         candidate_ref["milestone"] = res.get("milestone")
+                        candidate_ref["milestone_status"] = res.get("milestone_status", "Planned")
                         candidate_ref["extraction_method"] = "LLM"
                         candidate_ref["extraction_confidence"] = 0.85
                     else:
