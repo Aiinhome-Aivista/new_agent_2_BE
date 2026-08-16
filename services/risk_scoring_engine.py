@@ -129,6 +129,10 @@ class RiskScoringEngine:
         risk_severity = (schedule_impact * 0.40) + (business_impact_score * 0.40) + (owner_impact * 0.20)
         risk_severity = max(min(round(risk_severity), 100), 0)
 
+        # Enforce high risk severity for Scope Creep (unbilled work/revenue leakage)
+        if is_scope_creep:
+            risk_severity = max(risk_severity, 85)
+
         # Remove duplicate execution reasons
         unique_reasons = []
         for r in execution_reasons:

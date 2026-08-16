@@ -690,6 +690,17 @@ class RiskEvaluationAgent:
                 risk_cat = "EXECUTION_BLOCKER"
                 
             is_scope_creep = False
+            # Scope Creep Scenario 1: Completely missing from baseline (Rogue work)
+            if not matched_si and not is_confirmed_in_scope:
+                if entity_type in ["SCOPE_REQUEST", "MILESTONE"]:
+                    is_scope_creep = True
+                    risk_cat = "SCOPE_CREEP"
+            # Scope Creep Scenario 2: Matches an item explicitly listed as OUT_OF_SCOPE in the contract
+            elif matched_si and not is_confirmed_in_scope:
+                if matched_si.get("type", "").upper() == "OUT_OF_SCOPE" or matched_si.get("category", "").upper() == "OUT_OF_SCOPE":
+                    is_scope_creep = True
+                    risk_cat = "SCOPE_CREEP"
+
             downstream_names = []
 
             days_overdue = 0
