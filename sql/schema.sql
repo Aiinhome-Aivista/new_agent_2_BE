@@ -614,12 +614,6 @@ CREATE TABLE `alert_rule_config` (
   PRIMARY KEY (`severity`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
-CREATE TABLE `business_rule_config` (
-  `rule_code` varchar(60) NOT NULL,
-  `rule_description` text NOT NULL,
-  `enabled` tinyint(1) NOT NULL DEFAULT '1',
-  PRIMARY KEY (`rule_code`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 CREATE TABLE `category_assignment_rules` (
   `id` int NOT NULL AUTO_INCREMENT,
