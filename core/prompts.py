@@ -193,7 +193,8 @@ CRITICAL RULES:
 6. Identify if this item is explicitly blocking or delaying any other deliverables/activities.
    CRITICAL FOR DEPENDENCIES:
    - `blocks` and `blocked_by` MUST contain project deliverables/activities ONLY (e.g. ["CRM Integration"], ["Production VPN Access"]).
-   - NEVER put statuses ("Pending review", "Waiting", "Completed", "Blocked"), owners ("Customer", "Internal"), roles, or dates into `blocks` or `blocked_by`.
+   - NEVER put statuses ("Pending review", "Waiting", "Completed", "Blocked"), owners ("Customer", "Internal", "Development Team"), roles ("QA Lead", "Project Manager", "Architect"), or dates ("09 Sep 2026", "Next week") into `blocks` or `blocked_by`.
+   - Valid values are ONLY names of project deliverables, features, integrations, or milestones mentioned in the document.
 7. Preserve the exact original sentence as `source_sentence`.
 8. Ignore greetings, attendance lists, signatures, and agenda headings.
 9. Extract any items that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-1) and the exact evidence sentence.
@@ -259,6 +260,14 @@ RULES:
 6. ENTITY TYPE:
    - Identify what kind of entity this is: MILESTONE, DEPENDENCY, SCOPE_REQUEST, ACTION_ITEM, or RISK.
 
+   CRITICAL RULE — entity_type consistency:
+   - If you set matched_baseline_item to any non-null value, you are saying this activity EXISTS in the contract. Therefore:
+     - entity_type MUST be MILESTONE, DEPENDENCY, or ACTION_ITEM
+     - entity_type MUST NOT be SCOPE_REQUEST
+     - entity_type MUST NOT be RISK
+   - SCOPE_REQUEST is ONLY valid when matched_baseline_item is null or empty, meaning the activity has NO match in the contract baseline whatsoever.
+   - If an item is in the contract AND the customer is asking for it to be expanded or modified, classify it as MILESTONE with status IN_PROGRESS or BLOCKED, not as SCOPE_REQUEST.
+
 7. EVIDENCE TEXT:
    - You MUST provide `evidence_text` for every extracted fact. Every downstream calculation must be traceable back to the original MoM sentence.
 
@@ -267,7 +276,7 @@ RULES:
    - `executive_summary`: 1-2 sentence PM executive summary of the item and its impact.
    - `gap_analysis`: Expected (from baseline) vs Actual (from MoM) gap analysis. (e.g. "Expected completion by X, but still pending.")
    - `why_important`: Non-technical explanation of importance and what will slip if not resolved.
-   - `business_impact.immediate`: What is blocked right now?
+   - `business_impact.immediate`: What is blocked right now? IMPORTANT: If the milestone progress block above shows OVERDUE milestones that depend on this item, the immediate impact is happening NOW (not in the future). Reference the overdue milestone by name and how many days it is overdue.
    - `business_impact.future`: What will slip in the future?
    - `ai_interpretation`: Coherent story interpreting the evidence.
 

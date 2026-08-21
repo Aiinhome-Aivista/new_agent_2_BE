@@ -197,6 +197,17 @@ class RiskEvaluationAgent:
             
         resolved_items = extraction_result.get("resolved_items", [])
 
+        # --- NEW LOGGING FOR STEP 2A ---
+        print("\n" + "="*70)
+        print("🟢 STEP 2A OUTPUT (Fact Extraction)")
+        print("="*70)
+        import json
+        try:
+            print(json.dumps({"raw_activities": raw_activities, "resolved_items": resolved_items}, indent=2))
+        except Exception:
+            pass
+        print("="*70 + "\n")
+
         # ── Post-extraction: resolve canonical title immediately, then deduplicate ──
         # Root cause fix: deduplication must happen on the CANONICAL title, not the raw
         # normalized activity string. Otherwise "Evaluate SAP Integration Request" and
@@ -254,6 +265,8 @@ class RiskEvaluationAgent:
                 # Preserved execution status — kept independent of risk_status
                 "execution_status": raw_exec_status,
                 "status": raw_exec_status,
+                # Carry due_date from LLM extraction (Problem 3 fix)
+                "due_date": item.get("due_date"),
             })
 
         # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
@@ -290,7 +303,8 @@ class RiskEvaluationAgent:
                     "extraction_confidence": extraction_confidence,
                     "blocked_by": act_item.get("blocked_by", []),
                     "blocks": act_item.get("blocks", []),
-                    "execution_status": act_item.get("execution_status", "NOT_STARTED")
+                    "execution_status": act_item.get("execution_status", "NOT_STARTED"),
+                    "due_date": act_item.get("due_date"),
                 })
             else:
                 # Ambiguous — needs deeper analysis
@@ -304,7 +318,8 @@ class RiskEvaluationAgent:
                     "extraction_confidence": extraction_confidence,
                     "blocked_by": act_item.get("blocked_by", []),
                     "blocks": act_item.get("blocks", []),
-                    "execution_status": act_item.get("execution_status", "NOT_STARTED")
+                    "execution_status": act_item.get("execution_status", "NOT_STARTED"),
+                    "due_date": act_item.get("due_date"),
                 })
 
         # ===========================================================
@@ -332,19 +347,26 @@ class RiskEvaluationAgent:
                 "extraction_confidence": item.get("extraction_confidence", 100),
                 "blocked_by": item.get("blocked_by", []),
                 "blocks": item.get("blocks", []),
-                "execution_status": item.get("execution_status", "NOT_STARTED")
+                "execution_status": item.get("execution_status", "NOT_STARTED"),
+                "due_date": item.get("due_date"),
             })
+
+        # --- NEW LOGGING FOR STEP 2B ---
+        print("\n" + "="*70)
+        print("🔵 STEP 2B OUTPUT (Context Builder)")
+        print("="*70)
+        import json
+        try:
+            print(json.dumps(activities_with_contexts, indent=2))
+        except Exception:
+            pass
+        print("="*70 + "\n")
 
         # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
         _emit("Running In-Scope Evaluation Agent", 55)
         llm_risk_results = []
         if activities_with_contexts:
             print(f"  [LLM] Batch-evaluating {len(activities_with_contexts)} ambiguous activities...")
-            import json
-            try:
-                print(f"[DEBUG] activities_with_contexts = {json.dumps(activities_with_contexts, indent=2)}")
-            except:
-                print(f"[DEBUG] activities_with_contexts = {activities_with_contexts}")
             
             # Retrieve milestone progress block to inject into the LLM prompt
             milestone_progress_block = ProjectKnowledgeService.calculate_milestone_progress(db_cursor, project_id)
@@ -357,13 +379,16 @@ class RiskEvaluationAgent:
             
             llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, combined_context)
             
-            print(f"=== [DEBUG] llm_risk_results ===")
+            # --- NEW LOGGING FOR STEP 2C ---
+            print("\n" + "="*70)
+            print("🟡 STEP 2C OUTPUT (LLM Draft)")
+            print("="*70)
             import json
             try:
                 print(json.dumps(llm_risk_results, indent=2))
             except:
                 print(llm_risk_results)
-            print(f"==================================")
+            print("="*70 + "\n")
 
 
         # ===========================================================
@@ -483,6 +508,15 @@ class RiskEvaluationAgent:
         forward_graph, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
         
+        print("\n" + "="*70)
+        print("🔗 SUB-PROCESS: Dependency Static Graph Analysis")
+        print("="*70)
+        try:
+            print(json.dumps(dep_analysis_results, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
+        
         # 4a. Deterministic Graph Completion for Prerequisites
         # If an extracted activity is semantically matched to a milestone, but isn't that exact milestone,
         # we treat it as a prerequisite blocking that milestone.
@@ -514,6 +548,15 @@ class RiskEvaluationAgent:
         # 4b. Graph-First PMO Execution Queue Ordering
         from services.execution_queue_builder import ExecutionQueueBuilder
         execution_queue_order, node_metrics = ExecutionQueueBuilder.build_queue(state_snapshot, backward_graph, forward_graph)
+
+        print("\n" + "="*70)
+        print("📈 SUB-PROCESS: PMO Execution Queue Builder")
+        print("="*70)
+        try:
+            print(json.dumps(node_metrics, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
         
         # Add ExecutionQueueBuilder metrics into dep_analysis_results so they reach the scoring engine
         for m_id, metrics in node_metrics.items():
@@ -533,6 +576,15 @@ class RiskEvaluationAgent:
         
         # 5. Derived Execution State
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
+
+        print("\n" + "="*70)
+        print("🚦 SUB-PROCESS: Derived Execution State")
+        print("="*70)
+        try:
+            print(json.dumps(derived_states, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
         
         # ── RISK RECONCILIATION ENGINE ───────────────────────────────────────
         # Deterministically resolve existing OPEN risks if their originating condition has cleared.
@@ -548,6 +600,16 @@ class RiskEvaluationAgent:
         }
         
         risks_to_resolve = RiskReconciliationEngine.reconcile_open_risks(open_tracker_items, current_state)
+
+        print("\n" + "="*70)
+        print("🧹 SUB-PROCESS: Risk Reconciliation Engine (Auto-Resolve)")
+        print("="*70)
+        try:
+            resolve_logs = [{"title": r[0].get("title"), "reason": r[1], "type": r[2]} for r in risks_to_resolve]
+            print(json.dumps(resolve_logs, indent=2))
+        except:
+            print(f"Found {len(risks_to_resolve)} risks to resolve.")
+        print("="*70 + "\n")
         
         for risk, reason, res_type in risks_to_resolve:
             TrackerAuditAgent.persist_tracker_item(
@@ -603,17 +665,22 @@ class RiskEvaluationAgent:
             
             m_id = get_milestone_id(canonical_title)
             
-            # Deterministic Source of Truth for Entity Type
+            # Deterministic Source of Truth for Entity Type (Problem 5 Fix)
+            matched_baseline_item = result.get("matched_baseline_item", "") or ""
+            has_baseline_evidence = (
+                m_id is not None or
+                is_confirmed_in_scope or
+                bool(str(matched_baseline_item).strip())
+            )
+            
             if matched_si and matched_si.get("category"):
                 db_category = str(matched_si.get("category")).upper()
-                if db_category == "FUNCTIONAL":
-                    if matched_si.get("milestone"):
-                        entity_type = "MILESTONE"
-                    else:
-                        entity_type = "ACTION_ITEM"
-                else:
+                if db_category in ["MILESTONE", "DELIVERABLE", "FUNCTIONAL"]:
+                    entity_type = "MILESTONE"
+                elif db_category in ["DEPENDENCY", "ACTION_ITEM", "RISK"]:
                     entity_type = db_category
-            elif (is_confirmed_in_scope or m_id is not None) and entity_type in ["SCOPE_REQUEST", "RISK"]:
+            
+            if has_baseline_evidence and entity_type not in ["DEPENDENCY", "ACTION_ITEM"]:
                 entity_type = "MILESTONE"
                 
             dependency_source = None
@@ -830,7 +897,9 @@ class RiskEvaluationAgent:
                 "is_execution_blocker": is_execution_blocker,
                 "earliest_executable_work": immediate_unlocks,
                 "longest_path": longest_path,
-                "m_id": m_id_for_metrics
+                "m_id": m_id_for_metrics,
+                # Problem 3 fix: carry due_date from LLM extraction
+                "due_date": context_i.get("due_date") or result.get("due_date"),
             })
 
         # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
@@ -889,7 +958,7 @@ class RiskEvaluationAgent:
                 critical_chain=item.get("critical_chain", False),
                 dependency_source=item.get("dependency_source", "ENGINEERING"),
                 days_overdue=item.get("days_overdue", 0),
-                days_until_due=item.get("days_until_due", 999),
+                days_until_due=item.get("days_until_due", 9999),
                 is_scope_creep=item.get("is_scope_creep", False),
                 confidence=item.get("llm_confidence", 1.0),
                 business_impact=item.get("business_impact", "MEDIUM"),
@@ -909,7 +978,13 @@ class RiskEvaluationAgent:
                 business_criticality=item.get("business_criticality", "Medium"),
                 business_phase=item.get("business_phase", "Execution"),
                 criticality_score=item.get("criticality_score", 0.0),
-                parallel_stream=item.get("parallel_stream", "Stream 1")
+                parallel_stream=item.get("parallel_stream", "Stream 1"),
+                # NEW: graph_role-based band scoring (Problems 1, 2)
+                graph_role=item.get("graph_role", "ISOLATED"),
+                # NEW: due_date fallback for days_until_due (Problem 3)
+                due_date=item.get("due_date"),
+                # NEW: explicit cascade_count for band determination
+                cascade_count=item.get("cascade_count", 0),
             )
             
             exec_prio = score_result["execution_priority"]
@@ -1113,6 +1188,43 @@ class RiskEvaluationAgent:
 
         out_of_scope_activities = dedup_items(out_of_scope_activities, "activity")
         tracker_items = dedup_items(tracker_items, "deliverable")
+
+        # ── POST-SCORING VALIDATION: Parent > Child constraint ────────────
+        # For every item A that blocks item B, A.execution_priority_score MUST > B.execution_priority_score.
+        # If violated, force A up to B + 1 (never crash).
+        print("\n  [PostScoring] Validating parent > child constraint...")
+        # Build a name→item lookup
+        item_by_name = {}
+        for ti in tracker_items:
+            item_by_name[_normalize(ti.get("deliverable", ""))] = ti
+        for oos in out_of_scope_activities:
+            item_by_name[_normalize(oos.get("activity", ""))] = oos
+        
+        corrections_made = 0
+        for ti in tracker_items:
+            parent_name = _normalize(ti.get("deliverable", ""))
+            parent_score = ti.get("execution_priority_score", 0)
+            # Check all items this parent blocks
+            for blocked_name in ti.get("direct_blocking_names", []):
+                blocked_norm = _normalize(blocked_name)
+                child = item_by_name.get(blocked_norm)
+                if child:
+                    child_score = child.get("execution_priority_score", 0)
+                    if parent_score <= child_score:
+                        old_score = parent_score
+                        new_score = min(child_score + 1, 100)
+                        ti["execution_priority_score"] = new_score
+                        ti["execution_priority"] = new_score
+                        parent_score = new_score  # Update for subsequent checks
+                        corrections_made += 1
+                        print(f"    [Correction] '{ti.get('deliverable')}' score: {old_score} → {new_score} "
+                              f"(must outscore child '{blocked_name}' at {child_score})")
+        
+        if corrections_made > 0:
+            print(f"  [PostScoring] Made {corrections_made} parent>child corrections.")
+        else:
+            print(f"  [PostScoring] All parent>child constraints satisfied.")
+
         # 4. Risk Ranking Engine
         timeline_deliverables = RiskRankingEngine.rank_risks(tracker_items, category_priorities)
         
@@ -1172,9 +1284,16 @@ class RiskEvaluationAgent:
             if 'reason' in item:
                 item['reason'] = formatted
 
-        # --- DEBUG: confirm category-first ordering ---
-        print("[RankEngine] Ranked order:",
-              [(r["deliverable"], r["category"], r["execution_priority_score"]) for r in timeline_deliverables])
+        # --- NEW LOGGING FOR STEP 2D ---
+        print("\n" + "="*70)
+        print("🟣 STEP 2D OUTPUT (Final Risk List with Math & Graph)")
+        print("="*70)
+        import json
+        try:
+            print(json.dumps(timeline_deliverables, indent=2))
+        except Exception:
+            pass
+        print("="*70 + "\n")
 
         in_scope_result = {"activities": in_scope_activities}
         out_of_scope_result = {"activities": out_of_scope_activities}
@@ -1190,6 +1309,15 @@ class RiskEvaluationAgent:
             timeline_deliverables=timeline_deliverables
         )
         final_assessment = LLMService.generate_json(aggregation_prompt)
+
+        print("\n" + "="*70)
+        print("📊 STEP 2G OUTPUT (Final Project Aggregation)")
+        print("="*70)
+        try:
+            print(json.dumps(final_assessment, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
 
         overall_risk = final_assessment.get("overallRisk", "LOW")
         risk_score = final_assessment.get("riskScore", 0)
@@ -1425,45 +1553,6 @@ class RiskEvaluationAgent:
                 )
                 
         # General Risks remain open unless mentioned (handled by not updating them)
-
-        import json
-        db_cursor.execute("""
-            INSERT INTO risk_evaluations 
-            (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            project_id, document_id, risk_score, overall_risk, summary,
-            json.dumps(recommendations), json.dumps(sub_agent_results)
-        ))
-        
-        risk_eval_id = db_cursor.lastrowid
-
-        # Determine baseline version for progress tracking
-        db_cursor.execute("SELECT version FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
-        bv_row = db_cursor.fetchone()
-        baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
-
-        # Deliverable Progress: now insert with the valid risk_eval_id
-        from repositories.baseline_repository import BaselineRepository
-        for pr in pending_progress_records:
-            try:
-                BaselineRepository.insert_deliverable_progress(
-                    db=db_cursor._connection,
-                    project_id=project_id,
-                    scope_item_id=pr.get("scope_item_id"),
-                    source_document_id=document_id,
-                    risk_evaluation_id=risk_eval_id,
-                    baseline_version=baseline_version,
-                    status_code=pr.get("progress_status", "UNKNOWN"),
-                    progress_percentage=pr.get("progress_percentage"),
-                    execution_summary=pr.get("execution_summary", ""),
-                    dependencies=pr.get("dependencies", []),
-                    resolved_items=extraction_result.get("resolved_items", []),
-                    confidence=pr.get("confidence", 1.0),
-                    evidence_text=pr.get("evidence_text", "")
-                )
-            except Exception as e:
-                print(f"Warning: Could not persist deliverable progress record: {e}")
 
         _emit("Completed", 100)
         return {

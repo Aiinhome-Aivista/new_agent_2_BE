@@ -1,6 +1,3 @@
-from tools.mcp_tools import MCPTools
-
-
 class ProjectKnowledgeService:
     """
     Centralized Project Knowledge Service.
@@ -80,7 +77,13 @@ class ProjectKnowledgeService:
 
         # Hybrid ChromaDB retrieval — narrow, activity-specific query only
         query = f"{activity_name} deadline milestone dependency customer responsibility exclusion"
-        evidence_chunks = MCPTools.search_baseline(project_id, query)
+        try:
+            from tools.mcp_tools import MCPTools
+            evidence_chunks = MCPTools.search_baseline(project_id, query) or []
+        except Exception as e:
+            print(f"  [Warning] Baseline evidence search failed: {e}")
+            evidence_chunks = []
+
         for chunk in evidence_chunks[:3]:  # Max 3 chunks per activity to keep context compact
             text = chunk.get("text", "").strip()
             if text:
@@ -95,8 +98,11 @@ class ProjectKnowledgeService:
     def calculate_milestone_progress(db_cursor, project_id: int) -> str:
         """
         Calculates deterministic progress based on weighted milestone mapping.
+        Also includes overdue and blocked milestones for LLM prompt awareness (Problem 7).
         """
         try:
+            from datetime import datetime, date
+            
             # Find the active baseline for the project
             db_cursor.execute("SELECT id FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY version DESC LIMIT 1", (project_id,))
             baseline = db_cursor.fetchone()
@@ -138,7 +144,64 @@ class ProjectKnowledgeService:
             completed = float(completed_weight or 0.0)
             percentage = int((completed / total) * 100)
 
-            return f"Milestone Progress: {percentage}% (Completed weight: {completed:.1f} / {total:.1f})"
+            lines = [f"Milestone Progress: {percentage}% (Completed weight: {completed:.1f} / {total:.1f})"]
+            
+            # ── Problem 7: Overdue & Blocked milestone context for LLM awareness ──
+            today = date.today()
+            
+            # Fetch overdue milestones (planned_date < today AND status != COMPLETED)
+            try:
+                db_cursor.execute("""
+                    SELECT name, planned_date, status 
+                    FROM project_milestones 
+                    WHERE project_id = %s AND status != 'COMPLETED' AND planned_date IS NOT NULL AND planned_date < CURDATE()
+                    ORDER BY planned_date ASC
+                """, (project_id,))
+                overdue_milestones = db_cursor.fetchall()
+                
+                if overdue_milestones:
+                    lines.append("\n=== OVERDUE MILESTONES (deadline has PASSED) ===")
+                    lines.append("IMPORTANT: Any dependency blocking these milestones has IMMEDIATE impact (not future).")
+                    for m in overdue_milestones:
+                        m_name = m['name'] if isinstance(m, dict) else m[0]
+                        m_date = m['planned_date'] if isinstance(m, dict) else m[1]
+                        m_status = m['status'] if isinstance(m, dict) else m[2]
+                        if m_date:
+                            if isinstance(m_date, str):
+                                try:
+                                    m_date = datetime.strptime(m_date, "%Y-%m-%d").date()
+                                except ValueError:
+                                    pass
+                            if isinstance(m_date, date):
+                                days_overdue = (today - m_date).days
+                                lines.append(f"- {m_name}: {days_overdue} days overdue (planned: {m_date}, status: {m_status})")
+                            else:
+                                lines.append(f"- {m_name}: OVERDUE (planned: {m_date}, status: {m_status})")
+            except Exception as e:
+                print(f"  [Warning] Could not fetch overdue milestones: {e}")
+            
+            # Fetch blocked milestones
+            try:
+                db_cursor.execute("""
+                    SELECT name, planned_date, status 
+                    FROM project_milestones 
+                    WHERE project_id = %s AND status = 'BLOCKED'
+                    ORDER BY planned_date ASC
+                """, (project_id,))
+                blocked_milestones = db_cursor.fetchall()
+                
+                if blocked_milestones:
+                    lines.append("\n=== BLOCKED MILESTONES ===")
+                    for m in blocked_milestones:
+                        m_name = m['name'] if isinstance(m, dict) else m[0]
+                        m_date = m['planned_date'] if isinstance(m, dict) else m[1]
+                        lines.append(f"- {m_name} (planned: {m_date}, status: BLOCKED)")
+            except Exception as e:
+                print(f"  [Warning] Could not fetch blocked milestones: {e}")
+            
+            lines.append(f"\nDocument analysis date: {today.isoformat()}")
+            
+            return "\n".join(lines)
         except Exception as e:
             return f"Milestone Progress: Error calculating progress ({str(e)})"
 

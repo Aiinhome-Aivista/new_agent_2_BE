@@ -5,7 +5,26 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
 from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers, drive
- 
+import sys
+import os
+
+class TeeLogger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout
+        self.log = open(filename, "w", encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+# Redirect all print statements to both the terminal AND a log file
+sys.stdout = TeeLogger(os.path.join(os.path.dirname(__file__), "pipeline_trace.log"))
+
 app = FastAPI(
     title=settings.APP_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
