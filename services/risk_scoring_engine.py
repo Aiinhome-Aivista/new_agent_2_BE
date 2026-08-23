@@ -286,6 +286,9 @@ class RiskScoringEngine:
                 effective_days_until_due = parsed_days
                 score_breakdown["Due Date Source"] = f"LLM extracted: {due_date} → {parsed_days} days"
         
+        # FIX 2: Expose parsed_days_until_due in score_breakdown so caller can sync days_until_due
+        score_breakdown["parsed_days_until_due"] = effective_days_until_due if effective_days_until_due < 9999 else None
+        
         days_to_use = days_to_next_milestone if days_to_next_milestone is not None else effective_days_until_due
         
         schedule_impact = 0

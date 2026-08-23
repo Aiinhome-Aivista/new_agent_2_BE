@@ -1,3 +1,4 @@
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from typing import List, Optional
@@ -6,6 +7,7 @@ from api.dependencies.auth import get_current_user, verify_project_access
 from services.rag_service import RAGService
 from services.llm_service import LLMService
 from services.project_knowledge_service import ProjectKnowledgeService
+# pyrefly: ignore [missing-import]
 from fastapi.responses import FileResponse
 import mysql.connector
 import json
@@ -231,31 +233,84 @@ def send_chat_message(
         cursor.execute("UPDATE rag_chat_sessions SET session_name = %s WHERE id = %s", (short_title, session_id))
         db.commit()
 
-    # 1. Fetch structured scope baseline items from MySQL
+    # 1. Fetch structured scope baseline items from MySQL (Latest Approved Baseline)
     cursor.execute("""
-        SELECT si.*, d.document_name 
-        FROM scope_items si
-        LEFT JOIN documents d ON si.source_document_id = d.id
-        WHERE si.project_id = %s
+        SELECT id, version, status 
+        FROM scope_baselines 
+        WHERE project_id = %s AND status = 'APPROVED' 
+        ORDER BY version DESC, id DESC 
+        LIMIT 1
     """, (project_id,))
-    scope_items = cursor.fetchall()
+    active_baseline = cursor.fetchone()
+    
+    if not active_baseline:
+        # Fallback to latest draft or any baseline if none is approved yet
+        cursor.execute("""
+            SELECT id, version, status 
+            FROM scope_baselines 
+            WHERE project_id = %s 
+            ORDER BY version DESC, id DESC 
+            LIMIT 1
+        """, (project_id,))
+        active_baseline = cursor.fetchone()
+        
+    scope_items = []
+    baseline_info_str = "No baseline registered."
+    
+    if active_baseline:
+        baseline_id = active_baseline['id'] if isinstance(active_baseline, dict) else active_baseline[0]
+        baseline_ver = active_baseline['version'] if isinstance(active_baseline, dict) else active_baseline[1]
+        baseline_stat = active_baseline['status'] if isinstance(active_baseline, dict) else active_baseline[2]
+        
+        cursor.execute("""
+            SELECT si.*, d.document_name 
+            FROM scope_items si
+            LEFT JOIN documents d ON si.source_document_id = d.id
+            WHERE si.project_id = %s AND si.baseline_id = %s
+            ORDER BY si.scope_type ASC, si.id ASC
+        """, (project_id, baseline_id))
+        scope_items = cursor.fetchall() or []
+        baseline_info_str = f"ACTIVE BASELINE: Version {baseline_ver} (Status: {baseline_stat})"
     
     mysql_context = []
     if scope_items:
-        for item in scope_items:
-            doc_source = item.get("document_name") or "Manually Added"
-            status_tag = f" ({item['status_change_tag']})" if item.get("status_change_tag") else ""
-            mysql_context.append(
-                f"- Name: {item['name']}\n"
-                f"  Type: {item['scope_type']}\n"
-                f"  Status: {item['completion_status']}{status_tag}\n"
-                f"  Description: {item.get('description') or 'N/A'}\n"
-                f"  Source Document: {doc_source}\n"
-                f"  Evidence: {item.get('evidence_text') or 'N/A'}"
-            )
+        in_scope_items = [i for i in scope_items if i.get('scope_type') == 'IN_SCOPE']
+        out_of_scope_items = [i for i in scope_items if i.get('scope_type') == 'OUT_OF_SCOPE']
+        
+        mysql_context.append(f"=== {baseline_info_str} ===")
+        mysql_context.append(f"• Total Baseline Scope Items: {len(scope_items)} ({len(in_scope_items)} In-Scope Deliverables, {len(out_of_scope_items)} Out-of-Scope Exclusions)\n")
+        
+        mysql_context.append("--- IN-SCOPE DELIVERABLES & FEATURES ---")
+        if in_scope_items:
+            for item in in_scope_items:
+                doc_source = item.get("document_name") or "Contract Baseline"
+                status_tag = f" ({item['status_change_tag']})" if item.get("status_change_tag") else ""
+                deadline_str = f" | Deadline: {item.get('deadline_text') or item.get('deadline') or 'N/A'}"
+                milestone_str = f" | Milestone: {item.get('milestone')}" if item.get('milestone') else ""
+                cat_str = f" | Category: {item.get('category')}" if item.get('category') else ""
+                
+                mysql_context.append(
+                    f"• {item['name']} [IN_SCOPE]{cat_str}{milestone_str}{deadline_str}\n"
+                    f"  Status: {item.get('completion_status', 'ACTIVE')}{status_tag} | Source: {doc_source}\n"
+                    f"  Description: {item.get('description') or 'N/A'}"
+                )
+        else:
+            mysql_context.append("None")
+            
+        mysql_context.append("\n--- OUT-OF-SCOPE / EXCLUDED ITEMS ---")
+        if out_of_scope_items:
+            for item in out_of_scope_items:
+                doc_source = item.get("document_name") or "Contract Baseline"
+                mysql_context.append(
+                    f"• {item['name']} [OUT_OF_SCOPE / EXCLUDED]\n"
+                    f"  Source: {doc_source} | Description: {item.get('description') or 'N/A'}"
+                )
+        else:
+            mysql_context.append("None")
+            
         mysql_context_str = "\n".join(mysql_context)
     else:
-        mysql_context_str = "No structured scope items found in the MySQL database."
+        mysql_context_str = f"=== {baseline_info_str} ===\nNo structured scope items found in the database."
         
     # 2. Retrieve document vector chunks from ChromaDB (RAG)
     try:
@@ -283,14 +338,34 @@ def send_chat_message(
     
     # 2.5 Retrieve PM Execution Engine context
     pm_context_str = ProjectKnowledgeService.get_pm_execution_context(cursor, project_id)
+    # 2.6 Fetch recent conversation history for multi-turn conversational context
+    cursor.execute("""
+        SELECT role, content 
+        FROM rag_chat_messages 
+        WHERE session_id = %s 
+        ORDER BY id DESC LIMIT 6
+    """, (session_id,))
+    recent_history_rows = cursor.fetchall() or []
+    recent_history_rows.reverse()
     
-    # 3. Construct prompt
-    prompt = f"""You are the Project AI Assistant. Your job is to answer the user's question accurately and professionally, based on the provided project contexts.
-You have access to three sources of information:
-1. STRUCTURED SCOPE ITEMS (From MySQL): Approved items currently in the scope baseline (In Scope or Out of Scope), including manual additions.
-2. SOURCE DOCUMENT EXCERPTS (From Vector DB / ChromaDB): Paragraphs retrieved from all project documents (EL, IFA, MOMs, Status Reports).
-3. PM EXECUTION ENGINE & DEPENDENCY GRAPH: The active project milestones, sequential dependencies, critical execution blockers, and external customer dependencies.
+    history_str = ""
+    if recent_history_rows:
+        h_lines = []
+        for h in recent_history_rows:
+            role_label = "User" if h.get("role") == "USER" else "Assistant"
+            h_lines.append(f"{role_label}: {h.get('content', '')}")
+        history_str = "\n".join(h_lines)
+    
+    # 3. Construct prompt with Enterprise Guardrails & Anti-Hallucination
+    history_block = f"\n=== RECENT CONVERSATION HISTORY ===\n{history_str}\n" if history_str else ""
+    
+    prompt = f"""You are the Project AI Assistant. Your sole purpose is to provide factual, accurate, and professional information regarding THIS specific project, its contractual documents, deliverables, milestones, dependency graph, and risk tracker.
 
+=== THREE AUTHORITATIVE INFORMATION SOURCES ===
+1. STRUCTURED SCOPE ITEMS (From MySQL): The active approved baseline deliverables and excluded items.
+2. SOURCE DOCUMENT EXCERPTS (From Vector DB / ChromaDB): Extracted paragraphs from uploaded project documents (EL, IFA, MOMs, Status Reports) with page numbers.
+3. LIVE PM EXECUTION ENGINE & RISK REGISTER (From MySQL): The real-time project metrics, milestone statuses, dependency chains, open risks, and resolved items.
+{history_block}
 === USER QUERY ===
 {query}
 
@@ -303,17 +378,33 @@ You have access to three sources of information:
 === CONTEXT SOURCE 3: PM EXECUTION ENGINE & DEPENDENCY GRAPH ===
 {pm_context_str}
 
-=== INSTRUCTIONS ===
-- Answer the user's query precisely using ONLY the provided contexts. If the context does not contain the answer, say "I cannot find the answer in the project documents."
-- For questions about dependencies, timelines, root causes, external blockers, or parallel execution, USE CONTEXT SOURCE 3.
-- Ground your answer in the provided facts. Do not assume or extrapolate.
-- CRITICAL: Do NOT use the hyphen/dash symbol (-) or asterisk (*) as bullet points, separators, or list markers.
-- CRITICAL: Do NOT output raw horizontal line dividers (like ---).
-- Structure your response cleanly, using double newlines for paragraph breaks and numbered points (e.g., 1., 2., 3.) with bold titles for any lists.
-- Example of correct points format:
-  1. **Point Title**: Details of the point.
-  2. **Point Title**: Details of the point.
-- Cite the source documents, page numbers, or baseline items you referenced in your response.
+=== MANDATORY GUARDRAILS & OPERATIONAL INSTRUCTIONS ===
+1. GUARDRAIL 1 — OFF-TOPIC & GENERAL KNOWLEDGE REFUSAL:
+   If the user asks an off-topic or general knowledge question not related to this project (such as world politics, celebrities, general trivia, 'Who is the Prime Minister of India?', general programming exercises, recipes, weather, etc.), you MUST politely refuse.
+   Exact refusal format:
+   "I do not have information on this topic. As the Project AI Assistant, I can only assist with questions regarding this project's scope, documents, deliverables, milestones, and risk tracker."
+
+2. GUARDRAIL 2 — ANTI-HALLUCINATION & FACTUAL GROUNDING:
+   You MUST base your response 100% on the provided contexts (Sources 1, 2, and 3). NEVER invent, assume, or extrapolate facts, dates, names, or statuses. If an item or detail is not present anywhere in the provided project contexts, state clearly:
+   "I cannot find information about this in the project documents or records."
+
+3. GUARDRAIL 3 — ACTIVE CLARIFICATION (When Ambiguous or 50-60% Confident):
+   If the user asks a question that is vague, ambiguous, or could refer to multiple project entities (e.g. asking about "Integration" when both "CRM Integration" and "SAP ERP Integration" exist in the project), DO NOT guess. Clearly list the possible matching deliverables/items from the project and ask the user to clarify which one they mean, or answer concisely for both possibilities.
+
+4. GUARDRAIL 4 — SOURCE ROUTING & LIVE DATABASE AS AUTHORITATIVE TRUTH:
+   - For questions about whether an item is in-scope or out-of-scope/excluded, USE CONTEXT SOURCE 1 (it contains the currently active approved baseline and its exact version).
+   - For questions about risk counts, active/open risks, blockers, resolved risks, overdue milestones, or dependencies, USE CONTEXT SOURCE 3 (it contains live MySQL metrics and counts).
+   - For historical quotes, meeting minutes evidence, or contractual clause excerpts, USE CONTEXT SOURCE 2 (Vector DB excerpts).
+   - If older document excerpts in Context Source 2 mention an earlier status that was subsequently resolved or updated in Context Source 3, state the current status from Context Source 3 as the authoritative live state.
+
+5. FORMATTING RULES:
+   - CRITICAL: Do NOT use the hyphen/dash symbol (-) or asterisk (*) as bullet points, separators, or list markers.
+   - CRITICAL: Do NOT output raw horizontal line dividers (like ---).
+   - Structure your response cleanly, using double newlines for paragraph breaks and numbered points (e.g., 1., 2., 3.) with bold titles for any lists.
+   - Example of correct points format:
+     1. **Point Title**: Details of the point.
+     2. **Point Title**: Details of the point.
+   - Cite the source documents, page numbers, or baseline items you referenced in your response..
 """
     
     # 4. Generate AI response

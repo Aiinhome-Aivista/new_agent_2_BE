@@ -125,7 +125,9 @@ def get_risk_aggregation_prompt(
     in_scope_count: int, 
     deterministic_count: int, 
     out_of_scope_activities: list, 
-    timeline_deliverables: list
+    timeline_deliverables: list,
+    milestone_progress_pct: int = 0,
+    resolved_in_this_run: int = 0
 ) -> str:
     import json
     return f"""You are the Risk Aggregation Agent.
@@ -134,6 +136,18 @@ Summarize the following risk evaluation results and compute an overall project r
 In-Scope Activities: {in_scope_count} (including {deterministic_count} confirmed by baseline matching)
 Out-of-Scope / Scope Creep Items: {len(out_of_scope_activities)}
 Delayed / Blocked Deliverables: {len(timeline_deliverables)}
+milestone_progress_pct: {milestone_progress_pct}
+resolved_in_this_run: {resolved_in_this_run}
+
+CRITICAL METRIC RULES (MUST FOLLOW EXACTLY):
+1. milestone_progress_pct: The actual percentage of project milestones that are COMPLETED, calculated from the project milestone database ({milestone_progress_pct}%). This is the authoritative source for project progress. Use this value directly for project_executive_summary.progress_percent.
+   - DO NOT calculate progress_percent from the risk items list.
+   - DO NOT estimate or guess the percentage.
+   - Use exactly the value provided: {milestone_progress_pct}.
+2. resolved_in_this_run: The number of risk items that were resolved or completed during processing of this document ({resolved_in_this_run}). This includes items explicitly marked as completed in the document AND items whose conditions were auto-cleared.
+   - Use this value directly for project_executive_summary.resolved_items.
+   - DO NOT count RESOLVED status tracker items from the list.
+   - DO NOT estimate. Use exactly the value provided: {resolved_in_this_run}.
 
 Scope Creep Items:
 {json.dumps(out_of_scope_activities, indent=2)}
@@ -150,11 +164,11 @@ Output MUST be a valid JSON object:
       "status": "⚠ At Risk",
       "tracked_items": 15,
       "critical_risks": 3,
-      "highest_priority": "Production CRM API Credentials",
-      "progress_percent": 27,
+      "highest_priority": "Top Priority Item Name",
+      "progress_percent": {milestone_progress_pct},
       "new_blockers": 2,
-      "resolved_items": 1,
-      "ai_summary": "The project is progressing as planned, however three customer dependencies are preventing execution of the critical path. Immediate customer action is required to avoid delaying CRM Integration, SIT and Production Deployment."
+      "resolved_items": {resolved_in_this_run},
+      "ai_summary": "The project executive summary describing current critical path blockers and progress."
    }},
    "highestActionPriority": {{
       "activity": "Name of the Delayed/Blocked item with the highest action_priority_score",
@@ -195,6 +209,14 @@ CRITICAL RULES:
    - `blocks` and `blocked_by` MUST contain project deliverables/activities ONLY (e.g. ["CRM Integration"], ["Production VPN Access"]).
    - NEVER put statuses ("Pending review", "Waiting", "Completed", "Blocked"), owners ("Customer", "Internal", "Development Team"), roles ("QA Lead", "Project Manager", "Architect"), or dates ("09 Sep 2026", "Next week") into `blocks` or `blocked_by`.
    - Valid values are ONLY names of project deliverables, features, integrations, or milestones mentioned in the document.
+   - DIRECTIONALITY RULE (CRITICAL):
+     `blocks` and `blocked_by` are strictly directional and asymmetric.
+     If Activity A blocks Activity B:
+       - A.blocks must contain B
+       - B.blocked_by must contain A
+     NEVER add the reverse direction (B.blocks must NOT contain A, and A.blocked_by must NOT contain B).
+     Stating 'A blocks B' is complete. Do not also state 'B is blocking A' — that would create a cycle.
+     Validation rule: If you are about to add item X to both activity.blocks AND activity.blocked_by for the same pair of activities, STOP — one of those is wrong. Remove the duplicate and keep only the direction the document states.
 7. Preserve the exact original sentence as `source_sentence`.
 8. Ignore greetings, attendance lists, signatures, and agenda headings.
 9. Extract any items that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-1) and the exact evidence sentence.
@@ -251,8 +273,27 @@ RULES:
    - NEVER include statuses ("Pending review", "Waiting", "Completed"), owners ("Customer", "Vendor", "Internal"), roles ("QA Lead"), dates, or evidence phrases.
    - If not blocked, return an empty array [].
 
-4. OWNER:
-   - Extract the entity owner: INTERNAL, CUSTOMER, VENDOR, or THIRD_PARTY.
+4. OWNER DEFINITION RULE (CRITICAL):
+   The `owner` field means: WHO IS RESPONSIBLE FOR EXECUTING OR DELIVERING this work item.
+   It does NOT mean: who is blocking it, who requested it, or who caused the delay.
+   
+   Apply these rules in order:
+   - Rule 1 — BASELINE DELIVERABLE:
+     If the activity matches a baseline scope item (contracted deliverable), the owner is ALWAYS the party contracted to deliver it. For vendor-delivered projects, contracted deliverables are owned by INTERNAL (the delivery team). Even if the deliverable is currently blocked by a customer dependency, the owner is still INTERNAL.
+     Example: 'Deliverable X' is blocked by missing customer credentials → owner = INTERNAL (delivery team builds it), NOT Customer (customer is just blocking it).
+   - Rule 2 — DEPENDENCY / EXTERNAL PREREQUISITE:
+     If the activity is something a CUSTOMER, VENDOR, or THIRD_PARTY must provide (credentials, access, approvals, sign-offs, licenses, hardware), the owner is that external party.
+     Example: 'Production API Credentials' → owner = CUSTOMER
+     Example: 'SSL Certificate from CA' → owner = THIRD_PARTY
+   - Rule 3 — ACTION ITEM assigned to a person or team:
+     The owner is whoever is assigned to complete the action. Read the evidence_text to determine assignment.
+     Example: 'Update Schedule | QA Lead' → owner = INTERNAL
+   - Rule 4 — SCOPE REQUEST / CHANGE REQUEST:
+     Owner is always CUSTOMER (they are requesting the change).
+   - Rule 5 — AMBIGUOUS:
+     Default to INTERNAL.
+
+   NEVER set owner = CUSTOMER for a contracted deliverable just because it is blocked by a customer dependency. The blocker owner and the deliverable owner are different concepts. The `blocked_by` array captures the blocker. The `owner` field captures the executor.
 
 5. PROGRESS:
    - Extract progress percentage if explicitly mentioned (e.g., 70 for 70%). Otherwise, null. NEVER invent percentages.

@@ -60,6 +60,27 @@ def normalize_entity_name(text: str) -> str:
     return text
 
 
+def _strip_parentheticals(name: str) -> Optional[str]:
+    """
+    Strips parenthetical suffixes from dependency names.
+    Handles common patterns like:
+      "User Acceptance Testing (UAT)" → "User Acceptance Testing"
+      "System Integration Testing (SIT)" → "System Integration Testing"
+      "API Gateway (v2)" → "API Gateway"
+
+    Generic: uses only regex, no hardcoded names.
+    Returns the stripped name for secondary resolution attempt.
+    """
+    if not name:
+        return None
+    # Remove trailing parenthetical expressions
+    stripped = re.sub(r'\s*\([^)]+\)\s*$', '', name).strip()
+    # Also handle multiple parens: "Name (abbr) (v2)" → "Name"
+    while re.search(r'\([^)]+\)$', stripped):
+        stripped = re.sub(r'\s*\([^)]+\)\s*$', '', stripped).strip()
+    return stripped if stripped != name else None
+
+
 def _token_overlap(a: str, b: str) -> float:
     """Jaccard similarity on word tokens."""
     ta = set(a.split())
@@ -327,6 +348,29 @@ class EntityResolver:
             self._log.append(r.to_log_dict())
             return r
 
+        # ── Step 3.1 (Tier 0.5): Strip parentheticals and retry exact matches ──
+        # PARENTHETICAL FIX: Strip trailing parentheticals and retry exact name / alias matches
+        stripped = _strip_parentheticals(raw)
+        if stripped:
+            norm_stripped = normalize_entity_name(stripped)
+            # Retry exact canonical name with stripped name
+            if norm_stripped in self._registry._by_norm_name:
+                e = self._registry._by_norm_name[norm_stripped]
+                print(f"  [GraphBuilder] Parenthetical strip resolved: "
+                      f"'{raw}' -> '{stripped}' ({e.canonical_id}, confidence: 0.95)")
+                r = ResolutionResult(True, e, raw, 0.95, "parenthetical_strip")
+                self._log.append(r.to_log_dict())
+                return r
+            # Retry exact alias with stripped name
+            if norm_stripped in self._registry._by_norm_alias:
+                candidates = self._registry._by_norm_alias[norm_stripped]
+                e = candidates[0]
+                print(f"  [GraphBuilder] Parenthetical strip alias resolved: "
+                      f"'{raw}' -> '{stripped}' ({e.canonical_id}, confidence: 0.93)")
+                r = ResolutionResult(True, e, raw, 0.93, "parenthetical_strip_alias")
+                self._log.append(r.to_log_dict())
+                return r
+
         # ── Step 3.5: Prefix / Head phrase match ────────────────────────────
         # Only resolves if the reference is a significant leading phrase of the
         # entity name (e.g. "CRM Integration" -> "CRM Integration for customer...")
@@ -447,7 +491,7 @@ class EntityResolver:
         print(f"{'Source (raw)':<45} | {'Resolved Name':<50} | {'ID':<12} | {'Conf':>5} | {'Match':<18} | Result")
         print("-" * 160)
         for entry in self._log:
-            status = "✓ RESOLVED" if entry["resolved"] else "✗ UNRESOLVED"
+            status = "RESOLVED" if entry["resolved"] else "UNRESOLVED"
             name = (entry.get("display_name") or "-")[:50]
             cid = (entry.get("canonical_id") or "-")[:12]
             raw = (entry.get("raw") or "-")[:45]

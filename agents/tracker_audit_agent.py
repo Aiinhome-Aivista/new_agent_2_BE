@@ -4,9 +4,17 @@ import json
 # This is set once on INSERT and never changed — preserving historical context.
 _ORIGIN_MAP = {
     'ROOT_CAUSE': 'Root Cause Blocker',
+    # FIX 5: Added missing categories from category_assignment_engine & pipeline
+    'ROOT_CAUSE_BLOCKER': 'Root Cause Blocker',
     'EXECUTION_BLOCKER': 'Execution Blocker',
+    'DIRECT_EXECUTION_BLOCKER': 'Direct Execution Blocker',
+    'TRANSITIVE_EXECUTION_BLOCKER': 'Transitive Execution Blocker',
+    'CRITICAL_PATH_RISK': 'Critical Path Risk',
     'CUSTOMER_DEPENDENCY': 'Customer Dependency',
     'TECHNICAL_DEPENDENCY': 'Technical Dependency',
+    'INTERNAL_DEPENDENCY': 'Internal Dependency',
+    'WAITING_DEPENDENCY': 'Waiting on Dependency',
+    'IN_PROGRESS_RISK': 'Execution Risk',
     'SCOPE_CREEP': 'Scope Creep',
     'DELAY': 'Delay Risk',
     'MISSING_DELIVERABLE': 'Missing Deliverable',
@@ -16,6 +24,23 @@ _ORIGIN_MAP = {
     'RESOLVED': 'Resolved Risk',
     'BLOCKED': 'Execution Blocker',
 }
+
+def _embed_owner_in_reasoning(reasoning: str, owner: str) -> str:
+    # FIX 1: Owner embedded in reasoning JSON
+    # because tracker_items has no top-level owner column.
+    # Frontend reads: JSON.parse(reasoning).owner
+    if not owner:
+        return reasoning
+    try:
+        import json
+        parsed = json.loads(reasoning) if reasoning else {}
+        if isinstance(parsed, dict):
+            parsed["owner"] = owner
+            return json.dumps(parsed)
+        else:
+            return json.dumps({"text": str(reasoning), "owner": owner})
+    except Exception:
+        return json.dumps({"text": str(reasoning or ""), "owner": owner})
 
 class TrackerAuditAgent:
     @classmethod
@@ -29,7 +54,8 @@ class TrackerAuditAgent:
                              # New decoupled fields
                              execution_status: str = None, risk_status: str = None,
                              graph_role: str = None, canonical_id: str = None,
-                             risk_severity_score: int = None) -> int:
+                             risk_severity_score: int = None,
+                             owner: str = None) -> int:
         """
         Acts as the Tracker & Audit Agent. Deterministically persists state with evidence lineage
         into the `tracker_items` table and logs the action in the `audit_logs` table.
@@ -95,6 +121,10 @@ class TrackerAuditAgent:
                 else:
                     final_reasoning = existing_reasoning
 
+            # FIX 1: Embed owner in final_reasoning JSON before UPDATE
+            if status != 'RESOLVED':
+                final_reasoning = _embed_owner_in_reasoning(final_reasoning, owner)
+
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
             if final_exec_status in ('UNKNOWN', ''):
                 final_exec_status = 'NOT_STARTED'
@@ -133,6 +163,9 @@ class TrackerAuditAgent:
             has_priority = priority_order is not None
             final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
             final_risk_sev = risk_severity_score if risk_severity_score is not None else risk_score
+
+            # FIX 1: Embed owner in reasoning JSON before INSERT
+            reasoning = _embed_owner_in_reasoning(reasoning, owner)
 
             # Resolve execution_status default
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
@@ -175,6 +208,7 @@ class TrackerAuditAgent:
             "peak_score": new_peak,
             "risk_level": risk_level,
             "risk_origin": risk_origin_value,
+            "owner": owner,
             "reasoning_snippet": (reasoning or "")[:200] + ("..." if len(reasoning or "") > 200 else "")
         }
 

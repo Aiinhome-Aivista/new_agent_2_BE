@@ -103,8 +103,23 @@ class TrackerRepository:
                 COALESCE(ti.execution_priority_score, 0) DESC,
                 ti.risk_score DESC
         """, (project_id,))
-        items = cursor.fetchall()
+        items = cursor.fetchall() or []
         cursor.close()
+        
+        # FIX 1: Populate owner and dependency_owner from embedded reasoning JSON if present
+        for it in items:
+            if it.get("reasoning"):
+                try:
+                    r_parsed = json.loads(it["reasoning"])
+                    if isinstance(r_parsed, dict) and r_parsed.get("owner"):
+                        it["owner"] = r_parsed["owner"]
+                        it["dependency_owner"] = r_parsed["owner"]
+                except Exception:
+                    pass
+            if not it.get("owner"):
+                it["owner"] = it.get("dependency_owner") or ("Customer" if "CUSTOMER" in str(it.get("risk_category", "")) else "Internal")
+                if not it.get("dependency_owner"):
+                    it["dependency_owner"] = it["owner"]
         
         TrackerRepository._fetch_and_attach_audit_trails(db, items, project_id)
         
@@ -118,6 +133,18 @@ class TrackerRepository:
         cursor.close()
         
         if item:
+            if item.get("reasoning"):
+                try:
+                    r_parsed = json.loads(item["reasoning"])
+                    if isinstance(r_parsed, dict) and r_parsed.get("owner"):
+                        item["owner"] = r_parsed["owner"]
+                        item["dependency_owner"] = r_parsed["owner"]
+                except Exception:
+                    pass
+            if not item.get("owner"):
+                item["owner"] = item.get("dependency_owner") or ("Customer" if "CUSTOMER" in str(item.get("risk_category", "")) else "Internal")
+                if not item.get("dependency_owner"):
+                    item["dependency_owner"] = item["owner"]
             TrackerRepository._fetch_and_attach_audit_trails(db, [item], project_id)
             
         return item
