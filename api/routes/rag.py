@@ -7,6 +7,8 @@ from api.dependencies.auth import get_current_user, verify_project_access
 from services.rag_service import RAGService
 from services.llm_service import LLMService
 from services.project_knowledge_service import ProjectKnowledgeService
+from services.graph_rag_service import GraphRAGService
+from services.rag_guardrail_service import RAGGuardrailService
 # pyrefly: ignore [missing-import]
 from fastapi.responses import FileResponse
 import mysql.connector
@@ -209,8 +211,69 @@ def send_chat_message(
         raise HTTPException(status_code=404, detail="Session not found")
         
     query = payload.query
-    
-    # 0. Check if this is the first message in the session to rename it dynamically (from 'New Chat')
+
+    # 0. Fetch project name and evaluate safety guardrails
+    cursor.execute("SELECT project_name FROM projects WHERE id = %s", (project_id,))
+    proj_row = cursor.fetchone()
+    project_name = proj_row["project_name"] if proj_row else "the project"
+
+    guard_result = RAGGuardrailService.classify_and_guard(query, project_name=project_name)
+    if not guard_result["is_in_domain"]:
+        safe_answer = guard_result.get("safe_response") or RAGGuardrailService.SAFE_REFUSAL_MESSAGE
+        cursor.execute("""
+            INSERT INTO rag_chat_messages (session_id, role, content)
+            VALUES (%s, 'USER', %s)
+        """, (session_id, query))
+        cursor.execute("""
+            INSERT INTO rag_chat_messages (session_id, role, content, citations_json)
+            VALUES (%s, 'ASSISTANT', %s, %s)
+        """, (session_id, safe_answer, "[]"))
+        db.commit()
+        assistant_msg_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM rag_chat_messages WHERE id = %s", (assistant_msg_id,))
+        assistant_msg = cursor.fetchone()
+        assistant_msg["citations"] = []
+        cursor.close()
+        return {"success": True, "data": assistant_msg}
+
+    if guard_result.get("needs_clarification") and guard_result.get("clarification_prompt"):
+        clarify_answer = guard_result["clarification_prompt"]
+        cursor.execute("""
+            INSERT INTO rag_chat_messages (session_id, role, content)
+            VALUES (%s, 'USER', %s)
+        """, (session_id, query))
+        cursor.execute("""
+            INSERT INTO rag_chat_messages (session_id, role, content, citations_json)
+            VALUES (%s, 'ASSISTANT', %s, %s)
+        """, (session_id, clarify_answer, "[]"))
+        db.commit()
+        assistant_msg_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM rag_chat_messages WHERE id = %s", (assistant_msg_id,))
+        assistant_msg = cursor.fetchone()
+        assistant_msg["citations"] = []
+        cursor.close()
+        return {"success": True, "data": assistant_msg}
+
+    if guard_result.get("safe_response"):
+        # Greeting response
+        greeting_answer = guard_result["safe_response"]
+        cursor.execute("""
+            INSERT INTO rag_chat_messages (session_id, role, content)
+            VALUES (%s, 'USER', %s)
+        """, (session_id, query))
+        cursor.execute("""
+            INSERT INTO rag_chat_messages (session_id, role, content, citations_json)
+            VALUES (%s, 'ASSISTANT', %s, %s)
+        """, (session_id, greeting_answer, "[]"))
+        db.commit()
+        assistant_msg_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM rag_chat_messages WHERE id = %s", (assistant_msg_id,))
+        assistant_msg = cursor.fetchone()
+        assistant_msg["citations"] = []
+        cursor.close()
+        return {"success": True, "data": assistant_msg}
+
+    # 0.5. Check if this is the first message in the session to rename it dynamically (from 'New Chat')
     cursor.execute("SELECT COUNT(*) as count FROM rag_chat_messages WHERE session_id = %s", (session_id,))
     msg_count_res = cursor.fetchone()
     is_first_msg = (msg_count_res["count"] == 0) if msg_count_res else True
@@ -271,6 +334,20 @@ def send_chat_message(
         """, (project_id, baseline_id))
         scope_items = cursor.fetchall() or []
         baseline_info_str = f"ACTIVE BASELINE: Version {baseline_ver} (Status: {baseline_stat})"
+    else:
+        # Direct fallback to all scope items for the project
+        cursor.execute("""
+            SELECT si.*, d.document_name 
+            FROM scope_items si
+            LEFT JOIN documents d ON si.source_document_id = d.id
+            WHERE si.project_id = %s
+            ORDER BY si.scope_type ASC, si.id ASC
+        """, (project_id,))
+        scope_items = cursor.fetchall() or []
+        if scope_items:
+            baseline_info_str = "ACTIVE BASELINE: Project Scope Items"
+        else:
+            baseline_info_str = "No baseline registered."
     
     mysql_context = []
     if scope_items:
@@ -285,8 +362,10 @@ def send_chat_message(
             for item in in_scope_items:
                 doc_source = item.get("document_name") or "Contract Baseline"
                 status_tag = f" ({item['status_change_tag']})" if item.get("status_change_tag") else ""
-                deadline_str = f" | Deadline: {item.get('deadline_text') or item.get('deadline') or 'N/A'}"
-                milestone_str = f" | Milestone: {item.get('milestone')}" if item.get('milestone') else ""
+                deadline_val = item.get('deadline_text') or item.get('deadline_original') or item.get('deadline_normalized') or item.get('deadline') or 'N/A'
+                deadline_str = f" | Deadline: {deadline_val}"
+                milestone_val = item.get('milestone') or item.get('milestone_normalized') or ""
+                milestone_str = f" | Milestone: {milestone_val}" if milestone_val else ""
                 cat_str = f" | Category: {item.get('category')}" if item.get('category') else ""
                 
                 mysql_context.append(
@@ -338,7 +417,11 @@ def send_chat_message(
     
     # 2.5 Retrieve PM Execution Engine context
     pm_context_str = ProjectKnowledgeService.get_pm_execution_context(cursor, project_id)
-    # 2.6 Fetch recent conversation history for multi-turn conversational context
+
+    # 2.6 Retrieve GraphRAG Topological Lineage & Simulation context
+    graph_rag_context_str = GraphRAGService.get_graph_rag_context(cursor, project_id, query)
+
+    # 2.7 Fetch recent conversation history for multi-turn conversational context
     cursor.execute("""
         SELECT role, content 
         FROM rag_chat_messages 
@@ -361,10 +444,11 @@ def send_chat_message(
     
     prompt = f"""You are the Project AI Assistant. Your sole purpose is to provide factual, accurate, and professional information regarding THIS specific project, its contractual documents, deliverables, milestones, dependency graph, and risk tracker.
 
-=== THREE AUTHORITATIVE INFORMATION SOURCES ===
+=== FOUR AUTHORITATIVE INFORMATION SOURCES ===
 1. STRUCTURED SCOPE ITEMS (From MySQL): The active approved baseline deliverables and excluded items.
 2. SOURCE DOCUMENT EXCERPTS (From Vector DB / ChromaDB): Extracted paragraphs from uploaded project documents (EL, IFA, MOMs, Status Reports) with page numbers.
 3. LIVE PM EXECUTION ENGINE & RISK REGISTER (From MySQL): The real-time project metrics, milestone statuses, dependency chains, open risks, and resolved items.
+4. GRAPHRAG TOPOLOGICAL REASONING (From Graph Engine): Upstream root causes, downstream cascade impact paths, and 'what-if' unblock simulations.
 {history_block}
 === USER QUERY ===
 {query}
@@ -378,33 +462,17 @@ def send_chat_message(
 === CONTEXT SOURCE 3: PM EXECUTION ENGINE & DEPENDENCY GRAPH ===
 {pm_context_str}
 
-=== MANDATORY GUARDRAILS & OPERATIONAL INSTRUCTIONS ===
-1. GUARDRAIL 1 — OFF-TOPIC & GENERAL KNOWLEDGE REFUSAL:
-   If the user asks an off-topic or general knowledge question not related to this project (such as world politics, celebrities, general trivia, 'Who is the Prime Minister of India?', general programming exercises, recipes, weather, etc.), you MUST politely refuse.
-   Exact refusal format:
-   "I do not have information on this topic. As the Project AI Assistant, I can only assist with questions regarding this project's scope, documents, deliverables, milestones, and risk tracker."
+=== CONTEXT SOURCE 4: GRAPHRAG TOPOLOGICAL LINEAGE & SIMULATION ===
+{graph_rag_context_str}
 
-2. GUARDRAIL 2 — ANTI-HALLUCINATION & FACTUAL GROUNDING:
-   You MUST base your response 100% on the provided contexts (Sources 1, 2, and 3). NEVER invent, assume, or extrapolate facts, dates, names, or statuses. If an item or detail is not present anywhere in the provided project contexts, state clearly:
-   "I cannot find information about this in the project documents or records."
-
-3. GUARDRAIL 3 — ACTIVE CLARIFICATION (When Ambiguous or 50-60% Confident):
-   If the user asks a question that is vague, ambiguous, or could refer to multiple project entities (e.g. asking about "Integration" when both "CRM Integration" and "SAP ERP Integration" exist in the project), DO NOT guess. Clearly list the possible matching deliverables/items from the project and ask the user to clarify which one they mean, or answer concisely for both possibilities.
-
-4. GUARDRAIL 4 — SOURCE ROUTING & LIVE DATABASE AS AUTHORITATIVE TRUTH:
-   - For questions about whether an item is in-scope or out-of-scope/excluded, USE CONTEXT SOURCE 1 (it contains the currently active approved baseline and its exact version).
-   - For questions about risk counts, active/open risks, blockers, resolved risks, overdue milestones, or dependencies, USE CONTEXT SOURCE 3 (it contains live MySQL metrics and counts).
-   - For historical quotes, meeting minutes evidence, or contractual clause excerpts, USE CONTEXT SOURCE 2 (Vector DB excerpts).
-   - If older document excerpts in Context Source 2 mention an earlier status that was subsequently resolved or updated in Context Source 3, state the current status from Context Source 3 as the authoritative live state.
-
-5. FORMATTING RULES:
-   - CRITICAL: Do NOT use the hyphen/dash symbol (-) or asterisk (*) as bullet points, separators, or list markers.
-   - CRITICAL: Do NOT output raw horizontal line dividers (like ---).
-   - Structure your response cleanly, using double newlines for paragraph breaks and numbered points (e.g., 1., 2., 3.) with bold titles for any lists.
-   - Example of correct points format:
-     1. **Point Title**: Details of the point.
-     2. **Point Title**: Details of the point.
-   - Cite the source documents, page numbers, or baseline items you referenced in your response..
+{RAGGuardrailService.get_guardrail_system_instructions()}
+=== FORMATTING & STYLE RULES ===
+1. DIRECT PINPOINT ANSWER: Always start the response with a direct, 1-2 sentence pinpoint summary answering the user's question immediately.
+2. CONCISE STRUCTURED BREAKDOWN: If the user requires supporting reasons, blockers, or milestone context, provide a brief numbered breakdown (1., 2., 3.) with bold titles. Keep each point short, direct, and free of fluff.
+3. Do NOT use the hyphen/dash symbol (-) or asterisk (*) as bullet points, separators, or list markers.
+4. Do NOT output raw horizontal line dividers (like ---).
+5. Structure your response cleanly, using double newlines for paragraph breaks.
+6. Cite the source documents, page numbers, or baseline items you referenced in your response.
 """
     
     # 4. Generate AI response
