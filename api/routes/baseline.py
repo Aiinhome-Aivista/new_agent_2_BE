@@ -856,7 +856,7 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
     resolved_items_check = cursor.fetchall() or []
     for it in resolved_items_check:
         title = it["title"]
-        is_auto_resolved = (it.get("resolved_by") is None) or (it.get("resolution") == "Deliverable completed.")
+        is_auto_resolved = (it.get("resolution") == "Deliverable completed.")
         if is_auto_resolved:
             matches_active = any(_is_title_match(title, a_name) for a_name in active_scope_names)
             matches_completed = any(_is_title_match(title, c_name) for c_name in completed_scope_names)

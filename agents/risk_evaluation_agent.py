@@ -141,15 +141,22 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
                 return True
         return False
 
-    def _has_blocker_or_dependency(sentence):
+    def _has_blocker_or_dependency(sentence, act=None):
+        verb = (act.get("verb") or "").lower().strip() if act else ""
+        if verb in COMPLETION_VERBS:
+            if re.search(r'\b(not|pending|cannot|can not|failed|blocked|halted|stopped|delayed|deferred|on hold)\b', sentence):
+                return True
+            return False
+
         for signal in BLOCKER_AND_DEPENDENCY_SIGNALS:
             pattern = r'\b' + re.escape(signal) + r'\b'
             if re.search(pattern, sentence):
+                if signal.startswith("after") and re.search(r'\b(completed|executed|passed|signed off|delivered|deployed|finalized)\b.*\bafter\b', sentence):
+                    continue
                 return True
-        # Also check for regex patterns like "cannot ... until", "after ... received"
         if re.search(r'\b(cannot|can not)\b.*\buntil\b', sentence):
             return True
-        if re.search(r'\bafter\b.*\b(received|completed|completion)\b', sentence):
+        if re.search(r'\b(will start|cannot start|cannot begin)\b.*\bafter\b', sentence):
             return True
         return False
 
@@ -180,7 +187,7 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
             continue
 
         # If it has a completion verb AND does NOT have any blocker or dependency phrasing
-        if _has_completion_verb(sentence) and not _has_blocker_or_dependency(sentence):
+        if _has_completion_verb(sentence) and not _has_blocker_or_dependency(sentence, act):
             resolved_entry = {
                 "name": name,
                 "resolution_evidence": act.get("source_sentence", sentence),
@@ -190,6 +197,25 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
             already_resolved.add(name_lower)
             promoted.append(name)
             print(f"  [CompletionNormalizer] Promoted to RESOLVED: '{name}' (sentence: '{sentence[:80]}...')")
+
+            # Generic prerequisite fulfillment extraction: e.g. "after receiving production credentials and VPN access"
+            prereq_match = re.search(r'\b(?:after receiving|following receipt of|upon receiving|after obtaining|after securing|with the provision of|received|granted)\s+([^.]+)', sentence, re.IGNORECASE)
+            if prereq_match:
+                prereq_raw = prereq_match.group(1).strip()
+                parts = re.split(r'\s+and\s+|,\s*|\s*&\s*', prereq_raw)
+                for p in parts:
+                    p_clean = re.sub(r'^(?:the|all|necessary|required)\s+', '', p.strip(), flags=re.IGNORECASE).strip()
+                    p_clean = re.sub(r'[.,;]+$', '', p_clean).strip()
+                    if len(p_clean) >= 3 and p_clean.lower() not in already_resolved and not re.search(r'\b(completed|done|finished|deployed|tested)\b', p_clean.lower()):
+                        p_title = p_clean.title()
+                        resolved_items.append({
+                            "name": p_title,
+                            "resolution_evidence": f"Fulfilled prerequisite: {act.get('source_sentence', sentence)}",
+                            "confidence": 0.95
+                        })
+                        already_resolved.add(p_clean.lower())
+                        promoted.append(p_title)
+                        print(f"  [CompletionNormalizer] Extracted fulfilled prerequisite to RESOLVED: '{p_title}'")
         else:
             remaining.append(act)
 
@@ -712,12 +738,20 @@ class RiskEvaluationAgent:
                 continue
             seen_canonical.add(dedup_key)
 
+            # Build set of resolved names
+            resolved_names_set = {_normalize(r.get("name", "")) for r in resolved_items if r.get("name")}
+            resolved_names_set |= {_normalize(r.get("canonical_name", "")) for r in resolved_items if r.get("canonical_name")}
+            is_item_resolved = (_normalize(name) in resolved_names_set) or (_normalize(canonical_title) in resolved_names_set) or (str(item.get("verb", "")).lower() in ("completed", "done", "finished", "passed", "approved", "deployed", "executed"))
+
             # ── Preserve execution_status separately from risk_status ──
-            # LLM may extract WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, etc.
-            # These must survive as execution_status and must NOT be flattened to UNKNOWN.
             raw_exec_status = str(item.get("status") or item.get("execution_status") or "").strip().upper()
-            if not raw_exec_status or raw_exec_status in ("UNKNOWN", ""):
-                raw_exec_status = "NOT_STARTED"
+            if is_item_resolved:
+                raw_exec_status = "COMPLETED"
+                item_blocked_by = []
+            else:
+                if not raw_exec_status or raw_exec_status in ("UNKNOWN", ""):
+                    raw_exec_status = "NOT_STARTED"
+                item_blocked_by = item.get("blocked_by", [])
 
             cleaned_activities.append({
                 "activity": name,
@@ -728,7 +762,7 @@ class RiskEvaluationAgent:
                 "extraction_confidence": item.get("confidence", 100),
                 # Raw dependency refs — passed to DependencyGraphBuilder for
                 # canonical resolution via EntityResolver (NOT compared as strings)
-                "blocked_by": item.get("blocked_by", []),
+                "blocked_by": item_blocked_by,
                 "blocks": item.get("blocks", []),
                 # Preserved execution status — kept independent of risk_status
                 "execution_status": raw_exec_status,
@@ -893,6 +927,15 @@ class RiskEvaluationAgent:
                     return m_id
             return None
 
+        # Build set of resolved canonical names from Step 2A
+        resolved_canonical_names = set()
+        for r in resolved_items:
+            r_n = r.get("name", "")
+            r_c, _ = _resolve_tracker_title(r_n, None, scope_items, all_baseline_items)
+            resolved_canonical_names.add(_normalize(r_n))
+            if r_c:
+                resolved_canonical_names.add(_normalize(r_c))
+
         # Build status map for dependency analysis
         milestone_status_map = {}
         for i, result in enumerate(llm_risk_results):
@@ -910,6 +953,12 @@ class RiskEvaluationAgent:
                 activity_name, matched_baseline_name, scope_items, all_baseline_items
             )
             result["_canonical_title"] = canonical_title
+            
+            # Deterministic override if extracted as resolved in Step 2A
+            if _normalize(activity_name) in resolved_canonical_names or _normalize(canonical_title) in resolved_canonical_names or result.get("status", "").upper() == "COMPLETED":
+                result["status"] = "COMPLETED"
+                result["execution_status"] = "COMPLETED"
+                result["blocked_by"] = []
             
             m_id = get_milestone_id(canonical_title)
             if m_id:
@@ -956,7 +1005,7 @@ class RiskEvaluationAgent:
         
         # 4a. Commitment Monitoring Engine (Proactive Risk Synthesis)
         from services.commitment_monitoring_engine import CommitmentMonitoringEngine
-        commitment_risks = CommitmentMonitoringEngine.evaluate(state_snapshot, llm_risk_results, all_baseline_items, project_id)
+        commitment_risks = CommitmentMonitoringEngine.evaluate(state_snapshot, llm_risk_results, all_baseline_items, project_id, resolved_items=resolved_items)
         if commitment_risks:
             print(f"  [CommitmentMonitor] Synthesized {len(commitment_risks)} missing update risks.")
             llm_risk_results.extend(commitment_risks)
@@ -2059,8 +2108,11 @@ class RiskEvaluationAgent:
             res_evidence = resolved.get("resolution_evidence", "No evidence provided")
             res_confidence = resolved.get("confidence", 0)
             
-            # Only resolve if confidence > 85 (High Confidence)
-            if res_confidence > 85:
+            # Support both float (0.0 - 1.0) and percentage (0 - 100)
+            conf_val = (res_confidence * 100) if (isinstance(res_confidence, (int, float)) and res_confidence <= 1.0) else float(res_confidence or 0)
+            
+            # Resolve if confidence >= 80%
+            if conf_val >= 80:
                 ref_id = None
                 res_name_clean = res_name.lower().strip()
                 for name, act_id in activity_map.items():
@@ -2099,8 +2151,104 @@ class RiskEvaluationAgent:
                     title=r_title, reference_id=None, # Already matching by title
                     status='RESOLVED', resolve_only=True
                 )
+
+        # Synchronize scope_items status to COMPLETED for completed deliverables from MoM
+        try:
+            from api.routes.baseline import _is_title_match
+            db_cursor.execute("SELECT id, name, completion_status FROM scope_items WHERE project_id = %s", (project_id,))
+            current_scope_items = db_cursor.fetchall() or []
+            
+            for resolved in resolved_items:
+                res_name = resolved.get("name", "")
+                for si in current_scope_items:
+                    si_id = si["id"] if isinstance(si, dict) else si[0]
+                    si_name = si["name"] if isinstance(si, dict) else si[1]
+                    si_status = si["completion_status"] if isinstance(si, dict) else si[2]
+                    
+                    if si_status != 'COMPLETED' and _is_title_match(res_name, si_name):
+                        db_cursor.execute(
+                            "UPDATE scope_items SET completion_status = 'COMPLETED' WHERE id = %s",
+                            (si_id,)
+                        )
+                        # Also update project_milestones table
+                        try:
+                            db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
+                            pms = db_cursor.fetchall() or []
+                            for pm in pms:
+                                pm_id = pm["id"] if isinstance(pm, dict) else pm[0]
+                                pm_name = pm["name"] if isinstance(pm, dict) else pm[1]
+                                if _is_title_match(si_name, pm_name) or _is_title_match(res_name, pm_name):
+                                    db_cursor.execute(
+                                        "UPDATE project_milestones SET status = 'Completed' WHERE id = %s",
+                                        (pm_id,)
+                                    )
+                                    print(f"  [MilestoneSync] Synchronized project_milestone #{pm_id} '{pm_name}' to Completed")
+                        except Exception as e:
+                            print(f"  [MilestoneSync Error] {e}")
+                        print(f"  [DeliverableSync] Synchronized scope deliverable #{si_id} '{si_name}' to COMPLETED from MoM evidence")
+
+            # Also ensure all project_milestones matching already completed scope items are marked Completed
+            try:
+                db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
+                all_pms = db_cursor.fetchall() or []
+                for pm in all_pms:
+                    pm_id = pm["id"] if isinstance(pm, dict) else pm[0]
+                    pm_name = pm["name"] if isinstance(pm, dict) else pm[1]
+                    pm_status = pm["status"] if isinstance(pm, dict) else pm[2]
+                    if (pm_status or "").upper() != "COMPLETED":
+                        for si in current_scope_items:
+                            si_name = si["name"] if isinstance(si, dict) else si[1]
+                            si_status = si["completion_status"] if isinstance(si, dict) else si[2]
+                            if si_status == "COMPLETED" and _is_title_match(si_name, pm_name):
+                                db_cursor.execute(
+                                    "UPDATE project_milestones SET status = 'Completed' WHERE id = %s",
+                                    (pm_id,)
+                                )
+                                print(f"  [MilestoneSync] Backfilled project_milestone #{pm_id} '{pm_name}' to Completed")
+                                break
+            except Exception as e:
+                print(f"  [MilestoneSync Backfill Error] {e}")
+
+            # C) Prerequisite Auto-Resolution: For all completed scope deliverables, resolve their prerequisites
+            for si in current_scope_items:
+                si_id = si["id"] if isinstance(si, dict) else si[0]
+                si_name = si["name"] if isinstance(si, dict) else si[1]
+                si_status = si["completion_status"] if isinstance(si, dict) else si[2]
                 
-        # General Risks remain open unless mentioned (handled by not updating them)
+                is_completed_now = (si_status == 'COMPLETED') or any(_is_title_match(resolved.get("name", ""), si_name) for resolved in resolved_items)
+                if is_completed_now:
+                    db_cursor.execute(
+                        "SELECT dependencies FROM deliverable_progress WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1",
+                        (si_id,)
+                    )
+                    dep_row = db_cursor.fetchone()
+                    raw_deps = dep_row["dependencies"] if isinstance(dep_row, dict) else (dep_row[0] if dep_row else None)
+                    if raw_deps:
+                        try:
+                            deps_list = json.loads(raw_deps) if isinstance(raw_deps, str) else (raw_deps or [])
+                            for d in deps_list:
+                                d_name = d.get("name") if isinstance(d, dict) else str(d)
+                                if d_name:
+                                    TrackerAuditAgent.persist_tracker_item(
+                                        db_cursor, project_id, document_id, 'ACTIVITY',
+                                        False, 0, 'LOW', 'RESOLVED',
+                                        1.0, f"Prerequisite fulfilled: {d.get('evidence', 'Prerequisite fulfilled.') if isinstance(d, dict) else 'Prerequisite fulfilled.'}",
+                                        False,
+                                        title=d_name, reference_id=None,
+                                        status='RESOLVED', resolve_only=True
+                                    )
+                                    print(f"  [PrereqSync] Auto-resolved prerequisite '{d_name}' for completed deliverable '{si_name}'")
+                        except Exception as ex:
+                            print(f"  [PrereqSync] Warning: Failed parsing deps for scope item #{si_id}: {ex}")
+        except Exception as e:
+            print(f"Warning: Failed to sync scope_items completion from MoM: {e}")
+
+        # Re-evaluate topological graph and recalculate execution queues
+        try:
+            from api.routes.baseline import _rebuild_graph_and_recalculate
+            _rebuild_graph_and_recalculate(db_cursor, project_id, None)
+        except Exception as e:
+            print(f"Warning: Auto-recalc after document evaluation failed: {e}")
 
         _emit("Completed", 100)
         return {

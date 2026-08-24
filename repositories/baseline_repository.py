@@ -469,17 +469,31 @@ class BaselineRepository:
                 current_deps_map[norm_name] = prev_obj
                 
         # 3. Apply Explicit Resolutions
+        try:
+            from api.routes.baseline import _is_title_match
+        except Exception:
+            _is_title_match = None
+
         for r_item in resolved_items:
             r_name = r_item.get("name", "")
             r_norm = _normalize(r_name)
             # Find matching prerequisite
             for d_norm in list(current_deps_map.keys()):
-                if r_norm in d_norm or d_norm in r_norm:
+                d_orig_name = current_deps_map[d_norm].get("name", "")
+                if (r_norm in d_norm or d_norm in r_norm) or (_is_title_match and _is_title_match(r_name, d_orig_name)):
                     current_deps_map[d_norm]["status"] = "COMPLETED"
                     current_deps_map[d_norm]["last_updated"] = datetime.datetime.now().isoformat()
                     current_deps_map[d_norm]["evidence"] = r_item.get("resolution_evidence", "Resolved")
                     current_deps_map[d_norm]["resolved_by_document"] = source_document_id
-                    
+
+        # 4. If deliverable is COMPLETED, mark all its prerequisites as SATISFIED / COMPLETED
+        if str(status_code).upper() == "COMPLETED" or (progress_percentage is not None and float(progress_percentage) >= 100):
+            for d_norm in list(current_deps_map.keys()):
+                current_deps_map[d_norm]["status"] = "COMPLETED"
+                current_deps_map[d_norm]["last_updated"] = datetime.datetime.now().isoformat()
+                current_deps_map[d_norm]["evidence"] = execution_summary or "Deliverable completed"
+                current_deps_map[d_norm]["resolved_by_document"] = source_document_id
+
         final_dependencies = list(current_deps_map.values())
 
         sql = """

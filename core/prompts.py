@@ -219,8 +219,14 @@ CRITICAL RULES:
      Validation rule: If you are about to add item X to both activity.blocks AND activity.blocked_by for the same pair of activities, STOP — one of those is wrong. Remove the duplicate and keep only the direction the document states.
 7. Preserve the exact original sentence as `source_sentence`.
 8. Ignore greetings, attendance lists, signatures, and agenda headings.
-9. Extract any items that the document explicitly states are now resolved, received, or completed into the `resolved_items` array. You MUST include a confidence score (0-1) and the exact evidence sentence.
-   IMPORTANT: When extracting a resolved item, if it conceptually matches one of the CURRENT ACTIVE PROJECT RISKS listed above, you MUST use the EXACT title from the active risks list as the `name`.
+9. RESOLUTION & FULFILLMENT EXTRACTION (CRITICAL):
+   Extract EVERY item, deliverable, prerequisite, access, credential, dependency, or blocker that the document explicitly states is now completed, resolved, received, provided, signed off, or fulfilled into the `resolved_items` array.
+   - When a sentence states that an activity/deliverable was completed upon or after receiving prerequisites/dependencies (e.g. "CRM Integration completed after receiving production credentials and VPN access"):
+     You MUST extract separate entries in `resolved_items` for:
+     a) The completed activity/deliverable (e.g. "CRM Integration"), AND
+     b) EACH individual prerequisite, credential, access, approval, or dependency that was received/fulfilled (e.g. "Production CRM API credentials", "Production VPN access").
+   - If an extracted resolved item conceptually matches any deliverable in the baseline or one of the CURRENT ACTIVE PROJECT RISKS listed above, use the normalized/standard title.
+   - Include a confidence score (0.0 to 1.0) and the exact evidence sentence in `resolution_evidence`.
 
 Output MUST be valid JSON conforming to the following structure:
 {{
@@ -237,8 +243,13 @@ Output MUST be valid JSON conforming to the following structure:
   ],
   "resolved_items": [
     {{
-      "name": "API Credentials",
+      "name": "Production CRM API credentials",
       "resolution_evidence": "Production API credentials were received.",
+      "confidence": 0.96
+    }},
+    {{
+      "name": "Production VPN access",
+      "resolution_evidence": "VPN access was granted.",
       "confidence": 0.96
     }}
   ]
@@ -266,10 +277,12 @@ RULES:
 
 2. STATUS EXTRACTION:
    - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, WAITING_ON_CUSTOMER, or UNKNOWN.
+   - If an activity is explicitly stated as completed, finished, resolved, signed off, or delivered (e.g. "CRM Integration completed after receiving credentials and VPN access"), its status MUST be COMPLETED.
 
 3. BLOCKED BY & PREREQUISITES (STRICT EVIDENCE-BACKED ENTITY ONLY):
-   - `blocked_by` MUST contain explicit prerequisite activities, deliverables, or resource dependencies mentioned in the text (e.g. ["Production CRM API Credentials"], ["Production VPN Access"], ["Backend APIs"], ["Security Review"], ["QA Validation"]).
-   - ONLY include items explicitly established in evidence as prerequisites or blockers. NEVER invent, infer, or guess dependencies across unrelated workstreams (e.g. do NOT put "CRM Integration" under "Analytics Dashboard" unless the sentence explicitly says so).
+   - `blocked_by` MUST contain explicit ACTIVE prerequisite activities, deliverables, or resource dependencies mentioned in the text (e.g. ["Production CRM API Credentials"], ["Production VPN Access"], ["Backend APIs"], ["Security Review"], ["QA Validation"]).
+   - ONLY include items explicitly established in evidence as CURRENT active prerequisites or blockers. NEVER invent, infer, or guess dependencies across unrelated workstreams (e.g. do NOT put "CRM Integration" under "Analytics Dashboard" unless the sentence explicitly says so).
+   - If a deliverable is COMPLETED, or if the prerequisites were already RECEIVED/FULFILLED/RESOLVED, they are NO LONGER blocking — return an empty array [] for `blocked_by`. Do NOT list fulfilled prerequisites as active blockers!
    - NEVER include statuses ("Pending review", "Waiting", "Completed"), owners ("Customer", "Vendor", "Internal"), roles ("QA Lead"), dates, or evidence phrases.
    - If not blocked, return an empty array [].
 

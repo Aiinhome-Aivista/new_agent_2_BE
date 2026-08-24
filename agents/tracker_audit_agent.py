@@ -86,6 +86,14 @@ class TrackerAuditAgent:
             elif reference_id and existing_ref == reference_id:
                 matched_row = row
                 break
+            elif title and existing_title:
+                try:
+                    from api.routes.baseline import _is_title_match
+                    if _is_title_match(title, existing_title):
+                        matched_row = row
+                        break
+                except Exception:
+                    pass
 
         if matched_row:
             existing_id       = matched_row['id']            if isinstance(matched_row, dict) else matched_row[0]
@@ -154,7 +162,40 @@ class TrackerAuditAgent:
                 action_type = 'UPDATED'
         else:
             if resolve_only:
-                return None
+                fallback_label = 'Resolved'
+                risk_origin_value = 'Resolved'
+                final_exec_status = 'RESOLVED'
+                final_risk_status = 'RESOLVED'
+                final_risk_score = 0
+                final_exec_score = 0
+                final_risk_sev = 0
+                new_peak = 0
+                risk_level = 'LOW'
+                
+                tracker_sql = """
+                    INSERT INTO tracker_items
+                    (project_id, source_document_id, item_type, reference_id, title, is_out_of_scope,
+                     risk_score, execution_priority_score, risk_severity_score, previous_highest_score,
+                     risk_level, risk_category, risk_origin,
+                     confidence, reasoning, requires_escalation, risk_source,
+                     status, execution_status, risk_status, graph_role, canonical_id, recommended_action,
+                     resolution, resolved_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """
+                db_cursor.execute(tracker_sql, (
+                    project_id, document_id, item_type or 'ACTIVITY', reference_id, title, int(is_out_of_scope),
+                    0, 0, 0, 0,
+                    'LOW', risk_category or 'RESOLVED', risk_origin_value,
+                    confidence, None, int(requires_escalation), risk_source,
+                    'RESOLVED', 'RESOLVED', 'RESOLVED',
+                    graph_role or 'DOWNSTREAM_ACTIVITY',
+                    canonical_id or '',
+                    recommended_action,
+                    reasoning or 'Auto-resolved (Condition cleared)'
+                ))
+                tracker_id = db_cursor.lastrowid
+                action_type = 'RESOLVED'
+                return tracker_id
 
             fallback_label = risk_category.replace('_', ' ').title() if risk_category else 'Execution Risk'
             risk_origin_value = _ORIGIN_MAP.get(risk_category, fallback_label)
