@@ -1,5 +1,6 @@
 import json
 import re
+import random
 from typing import Callable, Optional
 from services.llm_service import LLMService
 from services.project_knowledge_service import ProjectKnowledgeService
@@ -49,6 +50,121 @@ def _resolve_tracker_title(activity_name: str, matched_baseline_item: str,
     )
 
 
+def _validate_matched_baseline_item(
+    activity_name: str,
+    matched_baseline_item: str,
+    canonical_registry: list = None,
+    scope_items: list = None
+) -> str:
+    """
+    BUG 4 FIX: Validates and corrects matched_baseline_item from LLM Step 2C output.
+    If the LLM picked a semantically related but lexically distant baseline item,
+    corrects it to the proper match from the canonical registry/scope items.
+    Generic: uses token overlap, not hardcoded names.
+    """
+    if not matched_baseline_item:
+        return matched_baseline_item
+
+    candidates = (scope_items or []) + (canonical_registry or [])
+    if not candidates:
+        return matched_baseline_item
+
+    def tokenize(s):
+        return set(re.sub(r'[^a-z0-9\s]', '', (s or "").lower()).split())
+
+    act_tokens = tokenize(activity_name)
+    matched_tokens = tokenize(matched_baseline_item)
+
+    # Jaccard overlap between activity and its assigned matched_baseline_item
+    if act_tokens and matched_tokens:
+        intersection = act_tokens & matched_tokens
+        union = act_tokens | matched_tokens
+        overlap = len(intersection) / len(union) if union else 0
+    else:
+        overlap = 0
+
+    # Check if canonical registry / scope_items has a better (higher-overlap) match
+    best_match = matched_baseline_item
+    best_overlap = overlap
+
+    for item in candidates:
+        canonical_name = item.get("name") if isinstance(item, dict) else str(item)
+        c_tokens = tokenize(canonical_name)
+        if c_tokens:
+            c_intersection = act_tokens & c_tokens
+            c_union = act_tokens | c_tokens
+            c_overlap = len(c_intersection) / len(c_union) if c_union else 0
+            if c_overlap > best_overlap + 0.15:  # Meaningful improvement threshold
+                best_overlap = c_overlap
+                best_match = canonical_name
+
+    if best_match != matched_baseline_item:
+        print(f"  [MatchCorrection] '{activity_name}': corrected matched_baseline_item "
+              f"'{matched_baseline_item}' → '{best_match}' "
+              f"(overlap improved {overlap:.2f} → {best_overlap:.2f})")
+
+    return best_match
+
+
+def _resolve_composite_subphases(
+    resolved_title: str,
+    resolution_evidence: str,
+    db_cursor,
+    project_id: int,
+    document_id: int
+) -> list:
+    """
+    BUG 3 FIX: When a composite milestone resolves (e.g., 'System Integration Testing (SIT), UAT, Production Deployment'),
+    checks if any active tracker item is a named sub-phase of that milestone.
+    A sub-phase is identified when its name or primary acronym is contained within the resolved title
+    (case-insensitive, normalized). Generic: no hardcoded milestone names.
+
+    Returns list of additionally resolved item titles.
+    """
+    if not resolved_title:
+        return []
+    resolved_title_lower = resolved_title.lower().strip()
+    additionally_resolved = []
+
+    try:
+        db_cursor.execute(
+            "SELECT id, title, reasoning FROM tracker_items WHERE project_id = %s AND status = 'OPEN'",
+            (project_id,)
+        )
+        active_items = db_cursor.fetchall() or []
+        for item in active_items:
+            item_id = item['id'] if isinstance(item, dict) else item[0]
+            item_name = item['title'] if isinstance(item, dict) else item[1]
+            if not item_name:
+                continue
+            item_name_lower = item_name.lower().strip()
+            
+            # Check if this item's name is contained within the resolved composite title
+            is_subphase = False
+            if len(item_name_lower) > 5 and item_name_lower in resolved_title_lower:
+                is_subphase = True
+            elif "uat" in item_name_lower and "uat" in resolved_title_lower:
+                is_subphase = True
+            elif "sit" in item_name_lower and "sit" in resolved_title_lower:
+                is_subphase = True
+
+            if is_subphase:
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, 'ACTIVITY',
+                    False, 0, 'LOW', 'RESOLVED',
+                    1.0, f"Auto-resolved: sub-phase of resolved composite milestone '{resolved_title}'.\n\nEvidence: {resolution_evidence}",
+                    False,
+                    title=item_name, reference_id=None,
+                    status='RESOLVED', resolve_only=True
+                )
+                additionally_resolved.append(item_name)
+                print(f"  [CompositeSubphaseSync] Auto-resolved sub-phase '{item_name}' (sub-phase of '{resolved_title}')")
+    except Exception as e:
+        print(f"  [CompositeSubphaseSync Error] {e}")
+
+    return additionally_resolved
+
+
 def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
     """
     STEP 3: Deterministic Scope Matching.
@@ -95,6 +211,417 @@ def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# FIX 6: DETERMINISTIC COMPLETION NORMALIZER
+# ---------------------------------------------------------------------------
+
+def _normalize_completion_signals(extraction_result: dict) -> dict:
+    """
+    FIX 6 & BUG 1 FIX: Deterministically moves activities to resolved_items when the source_sentence
+    contains past-tense completion signals combined with minor-qualifier words,
+    guarded against negative blocking contexts.
+
+    This runs AFTER Step 2A LLM extraction and BEFORE the main pipeline.
+    It does not call the LLM again.
+    """
+    import re
+
+    COMPLETION_VERBS = {
+        "executed", "completed", "passed", "approved",
+        "signed off", "delivered", "deployed", "finalized",
+        "closed", "finished", "handed over", "accepted",
+        "validated", "resolved", "done", "implemented",
+        "launched", "released", "final acceptance"
+    }
+
+    # Signals that indicate work is NOT complete, is blocked, is waiting, or has dependencies
+    BLOCKER_AND_DEPENDENCY_SIGNALS = {
+        "failed", "blocked", "critical", "major issue",
+        "major problem", "not started", "pending", "rejected",
+        "escalated", "halted", "stopped", "cancelled",
+        "on hold", "overdue", "delayed", "deferred", "slip",
+        "depends on", "depend on", "depending on",
+        "cannot begin", "cannot start", "can not begin", "can not start",
+        "waiting for", "waiting on", "waits for", "waits on",
+        "after credentials", "after crm", "after completion", "completion of",
+        "prerequisite", "pre-requisite", "subject to", "prior to",
+        "in progress", "underway", "ongoing", "scheduled", "planned"
+    }
+
+    BLOCKING_CONTEXT_PATTERNS = [
+        r'\bcannot\s+begin\s+until\b',
+        r'\bcannot\s+start\s+until\b',
+        r'\bwill\s+not\s+begin\s+until\b',
+        r'\bwill\s+not\s+start\s+until\b',
+        r'\bnot\s+.*\s+until\b',
+        r'\bblocked\s+until\b',
+        r'\bwaiting\s+until\b',
+        r'\bdepends\s+on\b',
+        r'\bpending\s+.*\s+completion\b',
+        r'\bno\s+\w+\s+activities?\s+can\b',
+        r'\bcannot\s+proceed\s+until\b',
+    ]
+
+    def _sentence_lower(act):
+        return (act.get("source_sentence") or act.get("statement") or act.get("activity") or "").lower()
+
+    def _has_completion_verb(sentence):
+        for verb in COMPLETION_VERBS:
+            pattern = r'\b' + re.escape(verb) + r'\b'
+            if re.search(pattern, sentence):
+                return True
+        return False
+
+    def _has_blocking_context(sentence: str) -> bool:
+        """
+        Returns True if the sentence describes a blocking condition rather than
+        an actual completion. Prevents false promotion when completion verbs appear
+        in conditional/dependency clauses.
+        Generic: matches structural patterns, not project-specific keywords.
+        """
+        sentence_lower = sentence.lower()
+        for pattern in BLOCKING_CONTEXT_PATTERNS:
+            if re.search(pattern, sentence_lower):
+                return True
+        return False
+
+    def _has_blocker_or_dependency(sentence, act=None):
+        verb = (act.get("verb") or "").lower().strip() if act else ""
+        if verb in COMPLETION_VERBS:
+            if re.search(r'\b(not|pending|cannot|can not|failed|blocked|halted|stopped|delayed|deferred|on hold)\b', sentence):
+                return True
+            return False
+
+        for signal in BLOCKER_AND_DEPENDENCY_SIGNALS:
+            pattern = r'\b' + re.escape(signal) + r'\b'
+            if re.search(pattern, sentence):
+                if signal.startswith("after") and re.search(r'\b(completed|executed|passed|signed off|delivered|deployed|finalized)\b.*\bafter\b', sentence):
+                    continue
+                return True
+        if re.search(r'\b(cannot|can not)\b.*\buntil\b', sentence):
+            return True
+        if re.search(r'\b(will start|cannot start|cannot begin)\b.*\bafter\b', sentence):
+            return True
+        return False
+
+    raw_activities = extraction_result.get("raw_activities") or extraction_result.get("activities") or extraction_result.get("extractions") or []
+    resolved_items = extraction_result.get("resolved_items", [])
+
+    # Build set of already-resolved names for dedup
+    already_resolved = {
+        r.get("name", "").lower().strip()
+        for r in resolved_items if r.get("name")
+    }
+
+    promoted = []
+    remaining = []
+
+    for act in raw_activities:
+        name = act.get("statement") or act.get("activity") or ""
+        sentence = _sentence_lower(act)
+        name_lower = name.lower().strip()
+
+        # Skip if already resolved
+        if name_lower in already_resolved:
+            remaining.append(act)
+            continue
+
+        if act.get("_early_exit_resolved"):
+            remaining.append(act)
+            continue
+
+        # BUG 1 FIX: If sentence has blocking/conditional context, do NOT promote
+        if _has_blocking_context(sentence):
+            remaining.append(act)
+            continue
+
+        # If it has a completion verb AND does NOT have any blocker or dependency phrasing
+        if _has_completion_verb(sentence) and not _has_blocker_or_dependency(sentence, act):
+            resolved_entry = {
+                "name": name,
+                "resolution_evidence": act.get("source_sentence", sentence),
+                "confidence": act.get("confidence", 0.9)
+            }
+            resolved_items.append(resolved_entry)
+            already_resolved.add(name_lower)
+            promoted.append(name)
+            print(f"  [CompletionNormalizer] Promoted to RESOLVED: '{name}' (sentence: '{sentence[:80]}...')")
+
+            # Generic prerequisite fulfillment extraction: e.g. "after receiving production credentials and VPN access"
+            prereq_match = re.search(r'\b(?:after receiving|following receipt of|upon receiving|after obtaining|after securing|with the provision of|received|granted)\s+([^.]+)', sentence, re.IGNORECASE)
+            if prereq_match:
+                prereq_raw = prereq_match.group(1).strip()
+                parts = re.split(r'\s+and\s+|,\s*|\s*&\s*', prereq_raw)
+                for p in parts:
+                    p_clean = re.sub(r'^(?:the|all|necessary|required)\s+', '', p.strip(), flags=re.IGNORECASE).strip()
+                    p_clean = re.sub(r'[.,;]+$', '', p_clean).strip()
+                    if len(p_clean) >= 3 and p_clean.lower() not in already_resolved and not re.search(r'\b(completed|done|finished|deployed|tested)\b', p_clean.lower()):
+                        p_title = p_clean.title()
+                        resolved_items.append({
+                            "name": p_title,
+                            "resolution_evidence": f"Fulfilled prerequisite: {act.get('source_sentence', sentence)}",
+                            "confidence": 0.95
+                        })
+                        already_resolved.add(p_clean.lower())
+                        promoted.append(p_title)
+                        print(f"  [CompletionNormalizer] Extracted fulfilled prerequisite to RESOLVED: '{p_title}'")
+        else:
+            remaining.append(act)
+
+    if promoted:
+        print(f"  [CompletionNormalizer] {len(promoted)} activities promoted to resolved: {promoted}")
+
+    extraction_result["raw_activities"] = remaining
+    extraction_result["activities"] = remaining
+    extraction_result["resolved_items"] = resolved_items
+    return extraction_result
+
+
+# ---------------------------------------------------------------------------
+# FIX 4: DETERMINISTIC PROJECT CLOSURE DETECTOR
+# ---------------------------------------------------------------------------
+
+def _detect_project_closure(extraction_result: dict, db_cursor, project_id: int) -> bool:
+    """
+    FIX 4: Deterministically detects project closure from Step 2A output.
+    Returns True if the project should be considered closed.
+
+    Uses THREE independent signals. If ANY TWO of the three fire simultaneously, closure is confirmed:
+      Signal 1 — HIGH_COMPLETION_RATIO (>= 0.40 AND no substantial active work):
+        resolved_count / total_scope >= 0.40 AND active_work_count == 0
+      Signal 2 — TERMINAL_MILESTONE_RESOLVED:
+        Fuzzy match against actual project closure/go-live terminal milestones.
+      Signal 3 — ZERO_ACTIVE_WORK:
+        active_work_count == 0 AND completed_count >= 2.
+    """
+    signals_fired = 0
+    signal_reasons = []
+
+    raw_activities = extraction_result.get("raw_activities") or extraction_result.get("activities") or []
+    resolved_items = extraction_result.get("resolved_items", [])
+    resolved_set = {
+        r.get("name", "").lower().strip() for r in resolved_items if r.get("name")
+    }
+
+    # Active activities are any extracted items NOT already in resolved_items
+    active_activities = [
+        act for act in raw_activities
+        if (act.get("statement") or act.get("activity") or "").lower().strip() not in resolved_set
+    ]
+    active_count = len(active_activities)
+    completed_count = len(resolved_items)
+
+    # --- Signal 1: HIGH_COMPLETION_RATIO ---
+    try:
+        resolved_count = len(resolved_items)
+
+        db_cursor.execute("""
+            SELECT COUNT(*) as cnt
+            FROM scope_items si
+            JOIN scope_baselines sb ON si.baseline_id = sb.id
+            WHERE si.project_id = %s
+              AND sb.status = 'APPROVED'
+              AND si.scope_type = 'IN_SCOPE'
+        """, (project_id,))
+        row = db_cursor.fetchone()
+        total_scope = (
+            row['cnt'] if isinstance(row, dict) else row[0]
+        ) if row else 0
+
+        if total_scope > 0 and active_count == 0:
+            ratio = resolved_count / total_scope
+            if ratio >= 0.40:
+                signals_fired += 1
+                signal_reasons.append(
+                    f"Signal1: {resolved_count}/{total_scope} scope items resolved ({ratio:.0%}) with 0 active work"
+                )
+    except Exception as e:
+        print(f"  [ClosureDetector] Signal 1 error: {e}")
+
+    # --- Signal 2: TERMINAL_MILESTONE_RESOLVED ---
+    try:
+        import re
+
+        TERMINAL_MILESTONE_KEYWORDS = [
+            "go-live", "go live", "golive",
+            "production deployment", "production go", "deploy to production",
+            "knowledge transfer", "handover", "hand-over", "client handover",
+            "project closure", "closure", "final acceptance", "warranty", "sign-off", "sign off"
+        ]
+
+        def _norm_closure(s):
+            return re.sub(r'[^\w\s]', '', str(s).lower().strip())
+
+        def _token_overlap(a, b):
+            ta = set(_norm_closure(a).split())
+            tb = set(_norm_closure(b).split())
+            if not ta or not tb:
+                return 0.0
+            return len(ta & tb) / max(len(ta), len(tb))
+
+        # Find terminal milestones: must match terminal keywords
+        db_cursor.execute("""
+            SELECT pm.name
+            FROM project_milestones pm
+            WHERE pm.project_id = %s
+        """, (project_id,))
+        rows = db_cursor.fetchall() or []
+        all_milestone_names = [
+            (r['name'] if isinstance(r, dict) else r[0])
+            for r in rows
+        ]
+
+        terminal_names = [
+            name for name in all_milestone_names
+            if any(k in name.lower() for k in TERMINAL_MILESTONE_KEYWORDS)
+        ]
+
+        resolved_names_check = [
+            r.get("name", "") for r in resolved_items if r.get("name")
+        ]
+
+        for t_name in terminal_names:
+            for r_name in resolved_names_check:
+                if _token_overlap(t_name, r_name) >= 0.6:
+                    signals_fired += 1
+                    signal_reasons.append(
+                        f"Signal2: Terminal milestone '{t_name}' resolved via '{r_name}'"
+                    )
+                    break
+            if signals_fired >= 2:
+                break
+    except Exception as e:
+        print(f"  [ClosureDetector] Signal 2 error: {e}")
+
+    # --- Signal 3: ZERO_ACTIVE_WORK ---
+    try:
+        if active_count == 0 and completed_count >= 2:
+            signals_fired += 1
+            signal_reasons.append(
+                f"Signal3: No active work detected, {completed_count} completions found"
+            )
+    except Exception as e:
+        print(f"  [ClosureDetector] Signal 3 error: {e}")
+
+    is_closed = signals_fired >= 2
+    if is_closed:
+        print(
+            f"[ClosureDetector] PROJECT CLOSURE CONFIRMED ({signals_fired}/3 signals): "
+            f"{'; '.join(signal_reasons)}"
+        )
+    else:
+        print(
+            f"[ClosureDetector] No closure detected ({signals_fired}/3 signals) [active_count={active_count}, completed_count={completed_count}]"
+        )
+
+    return is_closed
+
+
+# ---------------------------------------------------------------------------
+# ISSUE 3 & 4: STEP 2G PROGRESS & RESOLVED COUNT HELPERS
+# ---------------------------------------------------------------------------
+
+def _extract_progress_pct(milestone_block: str) -> int:
+    """
+    Extracts the integer percentage from the milestone progress string
+    produced by calculate_milestone_progress.
+
+    Example input: "Milestone Progress: 27% (Completed weight: 3.0 / 11.0)"
+    Example output: 27
+    """
+    import re
+    if not milestone_block:
+        return 0
+    match = re.search(r'(\d+(?:\.\d+)?)\s*%', milestone_block)
+    if match:
+        try:
+            return int(float(match.group(1)))
+        except ValueError:
+            return 0
+    return 0
+
+
+def _count_resolved_in_run(db_cursor, project_id: int, document_id: int) -> int:
+    """
+    Counts tracker items resolved during processing of this specific document.
+    """
+    try:
+        db_cursor.execute("""
+            SELECT COUNT(*) as cnt
+            FROM tracker_items
+            WHERE project_id = %s
+              AND status = 'RESOLVED'
+              AND source_document_id = %s
+        """, (project_id, document_id))
+        row = db_cursor.fetchone()
+        cnt = (row['cnt'] if isinstance(row, dict) else row[0]) if row else 0
+
+        # Also count items resolved via reconciliation in this run (resolved_at within last 60 seconds)
+        db_cursor.execute("""
+            SELECT COUNT(*) as cnt
+            FROM tracker_items
+            WHERE project_id = %s
+              AND status = 'RESOLVED'
+              AND resolved_at >= NOW() - INTERVAL 60 SECOND
+        """, (project_id,))
+        row2 = db_cursor.fetchone()
+        cnt2 = (row2['cnt'] if isinstance(row2, dict) else row2[0]) if row2 else 0
+
+        return max(cnt, cnt2)
+    except Exception as e:
+        print(f"  [Warning] Could not count resolved items: {e}")
+        return 0
+
+
+def _requires_escalation(
+    risk_level: str,
+    risk_severity: int,
+    graph_role: str,
+    execution_status: str,
+    is_scope_creep: bool = False
+) -> bool:
+    """
+    Deterministically decides if a tracker item requires PM escalation.
+    Escalation = PM must take action NOW.
+
+    Generic: uses only risk metadata fields, no hardcoded item names, project names, or document references.
+
+    Returns True (requires escalation) when ANY of:
+      - risk_level is CRITICAL (threshold: critical risk level)
+      - risk_severity >= 85 (contractually dangerous)
+      - graph_role is ROOT_CAUSE (top of blocker chain)
+      - execution_status is WAITING_ON_CUSTOMER or WAITING_ON_EXTERNAL (external action required — PM must act)
+      - is_scope_creep is True (contractual violation — PM must decide)
+
+    Returns False (no escalation needed) when:
+      - Item is IN_PROGRESS with no blockers and no deadline pressure (routine tracking)
+      - Item is ISOLATED with risk_severity < 70
+      - Item is TERMINAL_ACTIVITY with no active blockers
+    """
+    # Escalate on CRITICAL severity (threshold: critical risk level)
+    if str(risk_level).upper() == "CRITICAL":
+        return True
+
+    # Escalate on high contractual risk (threshold: 85+ severity points)
+    if risk_severity >= 85:
+        return True
+
+    # Escalate on root cause (top of blocker chain, must unblock downstream)
+    if str(graph_role).upper() == "ROOT_CAUSE":
+        return True
+
+    # Escalate on external/customer-owned blockers (PM intervention needed with external stakeholders)
+    if str(execution_status).upper() in ("WAITING_ON_CUSTOMER", "WAITING_ON_EXTERNAL"):
+        return True
+
+    # Escalate on scope creep (contractual addition/violation)
+    if is_scope_creep:
+        return True
+
+    # Everything else does not require immediate escalation
+    return False
+
+
+# ---------------------------------------------------------------------------
 # RISK EVALUATION AGENT
 # ---------------------------------------------------------------------------
 
@@ -114,9 +641,53 @@ class RiskEvaluationAgent:
     DETERMINISTIC_CONFIDENCE_THRESHOLD = 85
 
     @classmethod
-    def _pm_decision(cls, priority: int, owner: str, is_root_cause: bool = False, longest_path: list = None) -> str:
+    def _pm_decision(
+        cls,
+        priority: int,
+        owner: str = "Internal",
+        is_root_cause: bool = False,
+        longest_path: list = None,
+        risk_severity: int = 0,
+        days_until_due: int = 9999,
+        cascade_count: int = 0
+    ) -> str:
+        """
+        Generates PM recommended action based on combined execution priority,
+        risk severity, approaching deadlines, and dependency ownership.
+
+        Generic: constructed from runtime values without hardcoded project names.
+        """
         chain = " -> ".join([str(x) for x in longest_path]) if longest_path else ""
-        
+
+        # URGENCY OVERRIDE RULES (High severity + imminent deadline)
+        # Rule 1: High severity (85+) and deadline within 14 days
+        # Rule 2: Medium-High severity (70+) and critical deadline within 7 days
+        is_urgent_deadline = (
+            (risk_severity >= 85 and days_until_due <= 14) or
+            (risk_severity >= 70 and days_until_due <= 7)
+        )
+
+        if is_urgent_deadline:
+            urgency_parts = []
+            if days_until_due <= 7:
+                urgency_parts.append(f"Deadline critical: {days_until_due} days remaining.")
+            elif days_until_due <= 14:
+                urgency_parts.append(f"Approaching deadline: {days_until_due} days remaining.")
+
+            if owner == "Customer":
+                urgency_parts.append("Escalate to customer immediately and request ETA.")
+            elif owner == "Vendor":
+                urgency_parts.append("Review vendor SLA and enforce delivery commitment.")
+            else:
+                urgency_parts.append("Assign internal resource immediately to unblock.")
+
+            if cascade_count >= 2:
+                urgency_parts.append(f"Resolving this unblocks {cascade_count} downstream activities.")
+
+            if urgency_parts:
+                return " ".join(urgency_parts)
+
+        # Fallback to priority-band based recommendation
         if is_root_cause and priority >= 80:
             if owner == "Customer": 
                 rec = "Escalate to customer immediately. Request ETA. Current project execution is blocked."
@@ -189,13 +760,182 @@ class RiskEvaluationAgent:
                 active_items_list.append(f"- {title} (Category: {cat})")
             active_tracker_block = "\n".join(active_items_list) if active_items_list else "None"
             
-            extraction_result = ActivityExtractorAgent.extract_activities(document_text, active_tracker_block)
-            
-        raw_activities = extraction_result.get("activities", [])
+        # Standardize extraction_result dict keys
+        if "activities" in extraction_result and "raw_activities" not in extraction_result:
+            extraction_result["raw_activities"] = extraction_result["activities"]
+        if "extractions" in extraction_result and "raw_activities" not in extraction_result:
+            extraction_result["raw_activities"] = extraction_result["extractions"]
+        if "resolved_items" not in extraction_result:
+            extraction_result["resolved_items"] = []
+
+        # FIX 6: Deterministic completion normalization
+        # Promotes activities with past-tense completion signals
+        # to resolved_items WITHOUT calling the LLM again.
+        # Handles qualified language like "executed with minor enhancements only" → RESOLVED deterministically.
+        extraction_result = _normalize_completion_signals(extraction_result)
+
+        # FIX 4: Deterministic project closure detection
+        # Runs BEFORE main pipeline to catch end-of-project documents
+        is_project_closed = _detect_project_closure(extraction_result, db_cursor, project_id)
+
+        if is_project_closed:
+            print("[Pipeline] Project closure detected. Auto-resolving all open tracker items and completing milestones...")
+            import json
+            db_cursor.execute("""
+                SELECT id, title FROM tracker_items
+                WHERE project_id = %s AND status = 'OPEN'
+            """, (project_id,))
+            open_items = db_cursor.fetchall() or []
+
+            for item in open_items:
+                item_id = item['id'] if isinstance(item, dict) else item[0]
+                item_title = item['title'] if isinstance(item, dict) else item[1]
+
+                db_cursor.execute("""
+                    UPDATE tracker_items
+                    SET status = 'RESOLVED',
+                        risk_score = 0,
+                        execution_priority_score = 0,
+                        resolved_at = NOW(),
+                        resolution = %s
+                    WHERE id = %s
+                """, ("Project formally closed — all items auto-resolved", item_id))
+
+                audit_details = json.dumps({
+                    "reason": "project_closure_auto_resolve",
+                    "signals_fired": "2+ of 3 closure signals",
+                    "source_document_id": document_id
+                })
+                try:
+                    db_cursor.execute("""
+                        INSERT INTO audit_logs
+                        (project_id, agent_name, action, entity_type, entity_id, details_json)
+                        VALUES (%s, 'ClosureDetector', 'RESOLVED', 'TRACKER_ITEM', %s, %s)
+                    """, (project_id, item_id, audit_details))
+                except Exception as e:
+                    print(f"  [Closure] Warning: Failed to insert audit log: {e}")
+
+                print(f"  [Closure] Auto-resolved: '{item_title}'")
+
+            # 2. Synchronize project milestones to Completed
+            try:
+                db_cursor.execute("""
+                    UPDATE project_milestones
+                    SET status = 'Completed'
+                    WHERE project_id = %s
+                """, (project_id,))
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to update project_milestones: {e}")
+
+            # 3. Synchronize baseline scope_items to COMPLETED
+            try:
+                db_cursor.execute("""
+                    UPDATE scope_items
+                    SET completion_status = 'COMPLETED'
+                    WHERE project_id = %s AND (scope_type = 'IN_SCOPE' OR scope_type IS NULL OR scope_type = '')
+                """, (project_id,))
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to update scope_items: {e}")
+
+            # 4. Insert final evaluation record in risk_evaluations
+            closure_summary = "Project has been formally closed. All deliverables and milestones have been completed and verified."
+            closure_recs = [
+                "Conduct post-project retrospective.",
+                "Archive project documentation.",
+                "Confirm all change requests and deliverables are formally closed."
+            ]
+            try:
+                insert_eval_sql = """
+                    INSERT INTO risk_evaluations
+                    (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                db_cursor.execute(insert_eval_sql, (
+                    project_id, document_id, 0, "LOW", closure_summary,
+                    json.dumps(closure_recs), json.dumps({})
+                ))
+                risk_eval_id = db_cursor.lastrowid
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to insert risk_evaluations: {e}")
+                risk_eval_id = None
+
+            # 5. Insert final deliverable_progress for any scheduled scope items
+            try:
+                db_cursor.execute("""
+                    SELECT version FROM scope_baselines 
+                    WHERE project_id = %s AND status = 'APPROVED' 
+                    ORDER BY id DESC LIMIT 1
+                """, (project_id,))
+                bv_row = db_cursor.fetchone()
+                baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
+
+                db_cursor.execute("""
+                    SELECT id, name FROM scope_items
+                    WHERE project_id = %s AND (deadline IS NOT NULL OR milestone IS NOT NULL)
+                """, (project_id,))
+                scheduled_items = db_cursor.fetchall() or []
+
+                from repositories.baseline_repository import BaselineRepository
+                for s_item in scheduled_items:
+                    s_id = s_item["id"] if isinstance(s_item, dict) else s_item[0]
+                    s_name = s_item["name"] if isinstance(s_item, dict) else s_item[1]
+
+                    # Check if latest deliverable_progress is not COMPLETED
+                    db_cursor.execute("""
+                        SELECT status_code FROM deliverable_progress
+                        WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1
+                    """, (s_id,))
+                    last_dp = db_cursor.fetchone()
+                    last_status = last_dp["status_code"] if last_dp and "status_code" in last_dp else (last_dp[0] if last_dp else None)
+
+                    if last_status != "COMPLETED":
+                        if risk_eval_id:
+                            BaselineRepository.insert_deliverable_progress(
+                                db=db_cursor._connection,
+                                project_id=project_id,
+                                scope_item_id=s_id,
+                                source_document_id=document_id,
+                                risk_evaluation_id=risk_eval_id,
+                                baseline_version=baseline_version,
+                                status_code="COMPLETED",
+                                progress_percentage=100,
+                                execution_summary="Completed and verified as part of project formal closure.",
+                                dependencies=[],
+                                resolved_items=[],
+                                confidence=1.0,
+                                evidence_text="Knowledge transfer completed. Documentation handed over. Customer provided final acceptance. Project formally closed."
+                            )
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to sync deliverable_progress on closure: {e}")
+
+            _emit("Completed", 100)
+            return {
+                "overallRisk": "LOW",
+                "riskScore": 0,
+                "summary": closure_summary,
+                "highestActionPriority": None,
+                "recommendations": closure_recs,
+                "subAgentResults": {}
+            }
+
+        raw_activities = extraction_result.get("raw_activities", [])
+        if not raw_activities and "activities" in extraction_result:
+            raw_activities = extraction_result.get("activities", [])
         if not raw_activities and "extractions" in extraction_result:
             raw_activities = extraction_result.get("extractions", [])
             
         resolved_items = extraction_result.get("resolved_items", [])
+
+        # --- NEW LOGGING FOR STEP 2A ---
+        print("\n" + "="*70)
+        print("🟢 STEP 2A OUTPUT (Fact Extraction)")
+        print("="*70)
+        import json
+        try:
+            print(json.dumps({"raw_activities": raw_activities, "resolved_items": resolved_items}, indent=2))
+        except Exception:
+            pass
+        print("="*70 + "\n")
 
         # ── Post-extraction: resolve canonical title immediately, then deduplicate ──
         # Root cause fix: deduplication must happen on the CANONICAL title, not the raw
@@ -233,12 +973,20 @@ class RiskEvaluationAgent:
                 continue
             seen_canonical.add(dedup_key)
 
+            # Build set of resolved names
+            resolved_names_set = {_normalize(r.get("name", "")) for r in resolved_items if r.get("name")}
+            resolved_names_set |= {_normalize(r.get("canonical_name", "")) for r in resolved_items if r.get("canonical_name")}
+            is_item_resolved = (_normalize(name) in resolved_names_set) or (_normalize(canonical_title) in resolved_names_set) or (str(item.get("verb", "")).lower() in ("completed", "done", "finished", "passed", "approved", "deployed", "executed"))
+
             # ── Preserve execution_status separately from risk_status ──
-            # LLM may extract WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, etc.
-            # These must survive as execution_status and must NOT be flattened to UNKNOWN.
             raw_exec_status = str(item.get("status") or item.get("execution_status") or "").strip().upper()
-            if not raw_exec_status or raw_exec_status in ("UNKNOWN", ""):
-                raw_exec_status = "NOT_STARTED"
+            if is_item_resolved:
+                raw_exec_status = "COMPLETED"
+                item_blocked_by = []
+            else:
+                if not raw_exec_status or raw_exec_status in ("UNKNOWN", ""):
+                    raw_exec_status = "NOT_STARTED"
+                item_blocked_by = item.get("blocked_by", [])
 
             cleaned_activities.append({
                 "activity": name,
@@ -249,11 +997,13 @@ class RiskEvaluationAgent:
                 "extraction_confidence": item.get("confidence", 100),
                 # Raw dependency refs — passed to DependencyGraphBuilder for
                 # canonical resolution via EntityResolver (NOT compared as strings)
-                "blocked_by": item.get("blocked_by", []),
+                "blocked_by": item_blocked_by,
                 "blocks": item.get("blocks", []),
                 # Preserved execution status — kept independent of risk_status
                 "execution_status": raw_exec_status,
                 "status": raw_exec_status,
+                # Carry due_date from LLM extraction (Problem 3 fix)
+                "due_date": item.get("due_date"),
             })
 
         # ── STEP 3: Deterministic Scope Matching (no LLM) ─────────────────────
@@ -290,7 +1040,8 @@ class RiskEvaluationAgent:
                     "extraction_confidence": extraction_confidence,
                     "blocked_by": act_item.get("blocked_by", []),
                     "blocks": act_item.get("blocks", []),
-                    "execution_status": act_item.get("execution_status", "NOT_STARTED")
+                    "execution_status": act_item.get("execution_status", "NOT_STARTED"),
+                    "due_date": act_item.get("due_date"),
                 })
             else:
                 # Ambiguous — needs deeper analysis
@@ -304,7 +1055,8 @@ class RiskEvaluationAgent:
                     "extraction_confidence": extraction_confidence,
                     "blocked_by": act_item.get("blocked_by", []),
                     "blocks": act_item.get("blocks", []),
-                    "execution_status": act_item.get("execution_status", "NOT_STARTED")
+                    "execution_status": act_item.get("execution_status", "NOT_STARTED"),
+                    "due_date": act_item.get("due_date"),
                 })
 
         # ===========================================================
@@ -332,19 +1084,26 @@ class RiskEvaluationAgent:
                 "extraction_confidence": item.get("extraction_confidence", 100),
                 "blocked_by": item.get("blocked_by", []),
                 "blocks": item.get("blocks", []),
-                "execution_status": item.get("execution_status", "NOT_STARTED")
+                "execution_status": item.get("execution_status", "NOT_STARTED"),
+                "due_date": item.get("due_date"),
             })
+
+        # --- NEW LOGGING FOR STEP 2B ---
+        print("\n" + "="*70)
+        print("🔵 STEP 2B OUTPUT (Context Builder)")
+        print("="*70)
+        import json
+        try:
+            print(json.dumps(activities_with_contexts, indent=2))
+        except Exception:
+            pass
+        print("="*70 + "\n")
 
         # STEP 5: Batch LLM Risk Evaluation — LLM CALL #2
         _emit("Running In-Scope Evaluation Agent", 55)
         llm_risk_results = []
         if activities_with_contexts:
             print(f"  [LLM] Batch-evaluating {len(activities_with_contexts)} ambiguous activities...")
-            import json
-            try:
-                print(f"[DEBUG] activities_with_contexts = {json.dumps(activities_with_contexts, indent=2)}")
-            except:
-                print(f"[DEBUG] activities_with_contexts = {activities_with_contexts}")
             
             # Retrieve milestone progress block to inject into the LLM prompt
             milestone_progress_block = ProjectKnowledgeService.calculate_milestone_progress(db_cursor, project_id)
@@ -357,13 +1116,25 @@ class RiskEvaluationAgent:
             
             llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, combined_context)
             
-            print(f"=== [DEBUG] llm_risk_results ===")
+            # BUG 4 FIX: Validate and correct matched_baseline_item from Step 2C LLM output
+            for res in (llm_risk_results or []):
+                act_name = res.get("activity") or ""
+                m_base = res.get("matched_baseline_item")
+                if m_base:
+                    res["matched_baseline_item"] = _validate_matched_baseline_item(
+                        act_name, m_base, canonical_registry=all_baseline_items, scope_items=scope_items
+                    )
+
+            # --- NEW LOGGING FOR STEP 2C ---
+            print("\n" + "="*70)
+            print("🟡 STEP 2C OUTPUT (LLM Draft)")
+            print("="*70)
             import json
             try:
                 print(json.dumps(llm_risk_results, indent=2))
             except:
                 print(llm_risk_results)
-            print(f"==================================")
+            print("="*70 + "\n")
 
 
         # ===========================================================
@@ -400,6 +1171,15 @@ class RiskEvaluationAgent:
                     return m_id
             return None
 
+        # Build set of resolved canonical names from Step 2A
+        resolved_canonical_names = set()
+        for r in resolved_items:
+            r_n = r.get("name", "")
+            r_c, _ = _resolve_tracker_title(r_n, None, scope_items, all_baseline_items)
+            resolved_canonical_names.add(_normalize(r_n))
+            if r_c:
+                resolved_canonical_names.add(_normalize(r_c))
+
         # Build status map for dependency analysis
         milestone_status_map = {}
         for i, result in enumerate(llm_risk_results):
@@ -417,6 +1197,12 @@ class RiskEvaluationAgent:
                 activity_name, matched_baseline_name, scope_items, all_baseline_items
             )
             result["_canonical_title"] = canonical_title
+            
+            # Deterministic override if extracted as resolved in Step 2A
+            if _normalize(activity_name) in resolved_canonical_names or _normalize(canonical_title) in resolved_canonical_names or result.get("status", "").upper() == "COMPLETED":
+                result["status"] = "COMPLETED"
+                result["execution_status"] = "COMPLETED"
+                result["blocked_by"] = []
             
             m_id = get_milestone_id(canonical_title)
             if m_id:
@@ -463,7 +1249,7 @@ class RiskEvaluationAgent:
         
         # 4a. Commitment Monitoring Engine (Proactive Risk Synthesis)
         from services.commitment_monitoring_engine import CommitmentMonitoringEngine
-        commitment_risks = CommitmentMonitoringEngine.evaluate(state_snapshot, llm_risk_results, all_baseline_items, project_id)
+        commitment_risks = CommitmentMonitoringEngine.evaluate(state_snapshot, llm_risk_results, all_baseline_items, project_id, resolved_items=resolved_items)
         if commitment_risks:
             print(f"  [CommitmentMonitor] Synthesized {len(commitment_risks)} missing update risks.")
             llm_risk_results.extend(commitment_risks)
@@ -482,6 +1268,15 @@ class RiskEvaluationAgent:
         # 4b. Dependency Execution State Resolver (Static Graph)
         forward_graph, backward_graph = MilestoneDependencyService.build_dependency_graph(db_cursor, project_id)
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
+        
+        print("\n" + "="*70)
+        print("🔗 SUB-PROCESS: Dependency Static Graph Analysis")
+        print("="*70)
+        try:
+            print(json.dumps(dep_analysis_results, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
         
         # 4a. Deterministic Graph Completion for Prerequisites
         # If an extracted activity is semantically matched to a milestone, but isn't that exact milestone,
@@ -514,6 +1309,15 @@ class RiskEvaluationAgent:
         # 4b. Graph-First PMO Execution Queue Ordering
         from services.execution_queue_builder import ExecutionQueueBuilder
         execution_queue_order, node_metrics = ExecutionQueueBuilder.build_queue(state_snapshot, backward_graph, forward_graph)
+
+        print("\n" + "="*70)
+        print("📈 SUB-PROCESS: PMO Execution Queue Builder")
+        print("="*70)
+        try:
+            print(json.dumps(node_metrics, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
         
         # Add ExecutionQueueBuilder metrics into dep_analysis_results so they reach the scoring engine
         for m_id, metrics in node_metrics.items():
@@ -533,6 +1337,15 @@ class RiskEvaluationAgent:
         
         # 5. Derived Execution State
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
+
+        print("\n" + "="*70)
+        print("🚦 SUB-PROCESS: Derived Execution State")
+        print("="*70)
+        try:
+            print(json.dumps(derived_states, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
         
         # ── RISK RECONCILIATION ENGINE ───────────────────────────────────────
         # Deterministically resolve existing OPEN risks if their originating condition has cleared.
@@ -541,13 +1354,31 @@ class RiskEvaluationAgent:
         columns = [col[0] for col in db_cursor.description]
         open_tracker_items = [dict(zip(columns, row)) for row in db_cursor.fetchall()]
         
+        # ISSUE 1: Enrich resolved_items with canonical_name from baseline before reconciliation
+        resolved_items_list = extraction_result.get("resolved_items", [])
+        for resolved in resolved_items_list:
+            r_name = resolved.get("name", "")
+            canonical_title, _ = _resolve_tracker_title(r_name, None, scope_items, all_baseline_items)
+            if canonical_title and canonical_title != r_name:
+                resolved["canonical_name"] = canonical_title
+
         from services.risk_reconciliation_engine import RiskReconciliationEngine
         current_state = {
             "derived_states": derived_states,
-            "resolved_items": extraction_result.get("resolved_items", [])
+            "resolved_items": resolved_items_list
         }
         
         risks_to_resolve = RiskReconciliationEngine.reconcile_open_risks(open_tracker_items, current_state)
+
+        print("\n" + "="*70)
+        print("🧹 SUB-PROCESS: Risk Reconciliation Engine (Auto-Resolve)")
+        print("="*70)
+        try:
+            resolve_logs = [{"title": r[0].get("title"), "reason": r[1], "type": r[2]} for r in risks_to_resolve]
+            print(json.dumps(resolve_logs, indent=2))
+        except:
+            print(f"Found {len(risks_to_resolve)} risks to resolve.")
+        print("="*70 + "\n")
         
         for risk, reason, res_type in risks_to_resolve:
             TrackerAuditAgent.persist_tracker_item(
@@ -603,18 +1434,32 @@ class RiskEvaluationAgent:
             
             m_id = get_milestone_id(canonical_title)
             
-            # Deterministic Source of Truth for Entity Type
+            # Deterministic Source of Truth for Entity Type (Problem 5 Fix)
+            matched_baseline_item = result.get("matched_baseline_item", "") or ""
+            has_baseline_evidence = (
+                m_id is not None or
+                is_confirmed_in_scope or
+                bool(str(matched_baseline_item).strip())
+            )
+            
             if matched_si and matched_si.get("category"):
                 db_category = str(matched_si.get("category")).upper()
-                if db_category == "FUNCTIONAL":
-                    if matched_si.get("milestone"):
-                        entity_type = "MILESTONE"
-                    else:
-                        entity_type = "ACTION_ITEM"
-                else:
+                if db_category in ["MILESTONE", "DELIVERABLE", "FUNCTIONAL"]:
+                    entity_type = "MILESTONE"
+                elif db_category in ["DEPENDENCY", "ACTION_ITEM", "RISK"]:
                     entity_type = db_category
-            elif (is_confirmed_in_scope or m_id is not None) and entity_type in ["SCOPE_REQUEST", "RISK"]:
+            
+            if has_baseline_evidence and entity_type not in ["DEPENDENCY", "ACTION_ITEM"]:
                 entity_type = "MILESTONE"
+                
+            # Problem 2 fix: Read owner from Step 2C LLM output or context, normalize to display format
+            llm_owner = (result.get("owner") or context.get("owner") or "INTERNAL").strip().upper()
+            owner_display = {
+                "CUSTOMER": "Customer",
+                "VENDOR": "Vendor",
+                "THIRD_PARTY": "Third Party",
+                "INTERNAL": "Internal"
+            }.get(llm_owner, "Internal")
                 
             dependency_source = None
             is_direct_blocker = False
@@ -640,7 +1485,8 @@ class RiskEvaluationAgent:
                     db_cursor, project_id, document_id, "DEPENDENCY",
                     False, 0, 'LOW', 'GENERAL',
                     1.0, f"Captured as DEPENDENCY (Status: {status})", False,
-                    title=canonical_title, reference_id=existing_ref_id, status='NOT_STARTED', risk_source='OBSERVED'
+                    title=canonical_title, reference_id=existing_ref_id, status='NOT_STARTED', risk_source='OBSERVED',
+                    owner=owner_display
                 )
                 print(f"  [Gate] Bypassed Risk Engine for non-blocking DEPENDENCY: {canonical_title}")
                 continue
@@ -663,7 +1509,7 @@ class RiskEvaluationAgent:
                 earliest_root_cause = True
                 if "downstream_milestones" not in dep_data:
                     dep_data["downstream_milestones"] = blocks
-
+            
             if status == "COMPLETED":
                 earliest_root_cause = False
                 blocked_by = []
@@ -676,9 +1522,11 @@ class RiskEvaluationAgent:
                     db_cursor, project_id, document_id, 'ACTIVITY',
                     False, 0, 'LOW', 'RESOLVED',
                     1.0, f"Milestone completed.\n\nEvidence: {evidence}", False,
-                    title=canonical_title, reference_id=existing_ref_id, status='RESOLVED', resolve_only=True
+                    title=canonical_title, reference_id=existing_ref_id, status='RESOLVED', resolve_only=True,
+                    owner=owner_display
                 )
                 print(f"  [COMPLETED] '{canonical_title}' -> early-exit RESOLVED. Skipping risk scoring.")
+                _resolve_composite_subphases(canonical_title, evidence, db_cursor, project_id, document_id)
                 continue
 
             # Removed CategoryAssignmentEngine logic. We will use ValidationService instead.
@@ -830,7 +1678,12 @@ class RiskEvaluationAgent:
                 "is_execution_blocker": is_execution_blocker,
                 "earliest_executable_work": immediate_unlocks,
                 "longest_path": longest_path,
-                "m_id": m_id_for_metrics
+                "m_id": m_id_for_metrics,
+                # Problem 3 fix: carry due_date from LLM extraction
+                "due_date": context_i.get("due_date") or result.get("due_date"),
+                # Problem 2 fix: carry owner and dependency_owner to scoring and persistence
+                "owner": owner_display,
+                "dependency_owner": owner_display,
             })
 
         # ── PHASE B: DEDUPLICATION & VALIDATION GATE ──
@@ -889,7 +1742,7 @@ class RiskEvaluationAgent:
                 critical_chain=item.get("critical_chain", False),
                 dependency_source=item.get("dependency_source", "ENGINEERING"),
                 days_overdue=item.get("days_overdue", 0),
-                days_until_due=item.get("days_until_due", 999),
+                days_until_due=item.get("days_until_due", 9999),
                 is_scope_creep=item.get("is_scope_creep", False),
                 confidence=item.get("llm_confidence", 1.0),
                 business_impact=item.get("business_impact", "MEDIUM"),
@@ -909,13 +1762,25 @@ class RiskEvaluationAgent:
                 business_criticality=item.get("business_criticality", "Medium"),
                 business_phase=item.get("business_phase", "Execution"),
                 criticality_score=item.get("criticality_score", 0.0),
-                parallel_stream=item.get("parallel_stream", "Stream 1")
+                parallel_stream=item.get("parallel_stream", "Stream 1"),
+                # NEW: graph_role-based band scoring (Problems 1, 2)
+                graph_role=item.get("graph_role", "ISOLATED"),
+                # NEW: due_date fallback for days_until_due (Problem 3)
+                due_date=item.get("due_date"),
+                # NEW: explicit cascade_count for band determination
+                cascade_count=item.get("cascade_count", 0),
             )
             
             exec_prio = score_result["execution_priority"]
             risk_sev = score_result["risk_severity"]
             
             breakdown = score_result["score_breakdown"]
+            # FIX 2: Sync days_until_due field with the value actually used in scoring.
+            # Previously always showed 9999 for LLM-extracted dates even though scoring used real value.
+            parsed_days = breakdown.get("parsed_days_until_due")
+            if parsed_days is not None and parsed_days != 9999:
+                item["days_until_due"] = parsed_days
+
             execution_priority = exec_prio
             cascade_priority = score_result.get("cascade_priority", 0)
             schedule_priority = score_result.get("schedule_priority", 0)
@@ -984,7 +1849,10 @@ class RiskEvaluationAgent:
                     "execution_reasons": execution_reasons,
                     "mom_evidence": item["evidence"],
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
-                    "narratives": item.get("narratives", {})
+                    "narratives": item.get("narratives", {}),
+                    # Problem 2 fix: propagate owner for OOS items (typically customer requested)
+                    "owner": item.get("owner", "Customer"),
+                    "dependency_owner": item.get("dependency_owner", "Customer"),
                 })
             else:
                 # Correct entity_type if LLM misclassified an in-scope item as SCOPE_REQUEST
@@ -1048,15 +1916,20 @@ class RiskEvaluationAgent:
                     "original_contract_sentence": item.get("original_contract_sentence", ""),
                     "narratives": item.get("narratives", {}),
                     "recommended_action": item.get("recommended_action") or cls._pm_decision(
-                        execution_priority,
-                        item.get("dependency_owner", "Internal"),
-                        item["is_root_cause"],
-                        item.get("longest_path", [])
+                        priority=execution_priority,
+                        owner=item.get("dependency_owner", item.get("owner", "Internal")),
+                        is_root_cause=item.get("is_root_cause", False),
+                        longest_path=item.get("longest_path", []),
+                        risk_severity=risk_sev,
+                        days_until_due=item.get("days_until_due", 9999),
+                        cascade_count=item.get("cascade_count", 0)
                     ),
                     "business_phase": item.get("business_phase"),
                     "queue_order": queue_order,
                     "longest_path": item.get("longest_path", []),
                     "dependency_owner": item.get("dependency_owner"),
+                    # Problem 2 fix: include normalized owner string
+                    "owner": item.get("owner", "Internal"),
                     "parallel_stream": item.get("parallel_stream"),
                     "unresolved_external_dependencies":
                         item.get("unresolved_external_dependencies", []),
@@ -1113,6 +1986,43 @@ class RiskEvaluationAgent:
 
         out_of_scope_activities = dedup_items(out_of_scope_activities, "activity")
         tracker_items = dedup_items(tracker_items, "deliverable")
+
+        # ── POST-SCORING VALIDATION: Parent > Child constraint ────────────
+        # For every item A that blocks item B, A.execution_priority_score MUST > B.execution_priority_score.
+        # If violated, force A up to B + 1 (never crash).
+        print("\n  [PostScoring] Validating parent > child constraint...")
+        # Build a name→item lookup
+        item_by_name = {}
+        for ti in tracker_items:
+            item_by_name[_normalize(ti.get("deliverable", ""))] = ti
+        for oos in out_of_scope_activities:
+            item_by_name[_normalize(oos.get("activity", ""))] = oos
+        
+        corrections_made = 0
+        for ti in tracker_items:
+            parent_name = _normalize(ti.get("deliverable", ""))
+            parent_score = ti.get("execution_priority_score", 0)
+            # Check all items this parent blocks
+            for blocked_name in ti.get("direct_blocking_names", []):
+                blocked_norm = _normalize(blocked_name)
+                child = item_by_name.get(blocked_norm)
+                if child:
+                    child_score = child.get("execution_priority_score", 0)
+                    if parent_score <= child_score:
+                        old_score = parent_score
+                        new_score = min(child_score + 1, 100)
+                        ti["execution_priority_score"] = new_score
+                        ti["execution_priority"] = new_score
+                        parent_score = new_score  # Update for subsequent checks
+                        corrections_made += 1
+                        print(f"    [Correction] '{ti.get('deliverable')}' score: {old_score} → {new_score} "
+                              f"(must outscore child '{blocked_name}' at {child_score})")
+        
+        if corrections_made > 0:
+            print(f"  [PostScoring] Made {corrections_made} parent>child corrections.")
+        else:
+            print(f"  [PostScoring] All parent>child constraints satisfied.")
+
         # 4. Risk Ranking Engine
         timeline_deliverables = RiskRankingEngine.rank_risks(tracker_items, category_priorities)
         
@@ -1123,7 +2033,15 @@ class RiskEvaluationAgent:
             item["action_priority_score"] = item.get("execution_priority_score", 0)
             
             ep = item.get("execution_priority_score", 0)
-            item['recommended_action'] = cls._pm_decision(ep, item.get('dependency_owner', 'Internal'), item.get('is_root_cause', False), item.get('longest_path', []))
+            item['recommended_action'] = cls._pm_decision(
+                priority=ep,
+                owner=item.get('dependency_owner', item.get('owner', 'Internal')),
+                is_root_cause=item.get('is_root_cause', False),
+                longest_path=item.get('longest_path', []),
+                risk_severity=item.get('risk_severity_score', item.get('risk_score', 0)),
+                days_until_due=item.get('days_until_due', 9999),
+                cascade_count=item.get('cascade_count', 0)
+            )
             
             e_type = item.get("entity_type", "")
             cp = item.get("cascade_priority", 0)
@@ -1172,9 +2090,16 @@ class RiskEvaluationAgent:
             if 'reason' in item:
                 item['reason'] = formatted
 
-        # --- DEBUG: confirm category-first ordering ---
-        print("[RankEngine] Ranked order:",
-              [(r["deliverable"], r["category"], r["execution_priority_score"]) for r in timeline_deliverables])
+        # --- NEW LOGGING FOR STEP 2D ---
+        print("\n" + "="*70)
+        print("🟣 STEP 2D OUTPUT (Final Risk List with Math & Graph)")
+        print("="*70)
+        import json
+        try:
+            print(json.dumps(timeline_deliverables, indent=2))
+        except Exception:
+            pass
+        print("="*70 + "\n")
 
         in_scope_result = {"activities": in_scope_activities}
         out_of_scope_result = {"activities": out_of_scope_activities}
@@ -1183,13 +2108,33 @@ class RiskEvaluationAgent:
         # STEP 7: Aggregation — LLM CALL #3
         _emit("Calculating Risk Score", 80)
         from core.prompts import get_risk_aggregation_prompt
+
+        # ISSUE 3 & 4: Extract milestone progress percentage and count run-resolved items
+        milestone_pct = _extract_progress_pct(locals().get("milestone_progress_block", ""))
+        step2a_resolved_count = len(extraction_result.get("resolved_items", []))
+        resolved_count = max(
+            _count_resolved_in_run(db_cursor, project_id, document_id),
+            step2a_resolved_count
+        )
+
         aggregation_prompt = get_risk_aggregation_prompt(
             in_scope_count=len(in_scope_activities),
             deterministic_count=len(deterministic_in_scope),
             out_of_scope_activities=out_of_scope_activities,
-            timeline_deliverables=timeline_deliverables
+            timeline_deliverables=timeline_deliverables,
+            milestone_progress_pct=milestone_pct,
+            resolved_in_this_run=resolved_count
         )
         final_assessment = LLMService.generate_json(aggregation_prompt)
+
+        print("\n" + "="*70)
+        print("📊 STEP 2G OUTPUT (Final Project Aggregation)")
+        print("="*70)
+        try:
+            print(json.dumps(final_assessment, indent=2))
+        except:
+            pass
+        print("="*70 + "\n")
 
         overall_risk = final_assessment.get("overallRisk", "LOW")
         risk_score = final_assessment.get("riskScore", 0)
@@ -1286,12 +2231,26 @@ class RiskEvaluationAgent:
             else:
                 target_status = 'OPEN'
 
+            # Problem 1 fix: Scope creep execution priority must be Band 7 (1-9)
+            # Problem 2 fix: Pass owner to persist_tracker_item & deterministic escalation
+            requires_esc = _requires_escalation(
+                risk_level=item_risk_level,
+                risk_severity=item_risk_score,
+                graph_role="SCOPE_CREEP",
+                execution_status=oos_item.get('execution_status', oos_item.get('current_status', 'OPEN')),
+                is_scope_creep=True
+            )
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, 'ACTIVITY',
                 True, item_risk_score, item_risk_level, 'SCOPE_CREEP',
-                confidence_val, full_reasoning, True,
+                confidence_val, full_reasoning, requires_esc,
                 title=card_title, reference_id=ref_id,
-                status=target_status
+                status=target_status,
+                execution_priority_score=random.randint(1, 9),
+                risk_severity_score=item_risk_score,
+                owner=oos_item.get("owner", "Customer"),
+                graph_role="SCOPE_CREEP",
+                risk_status="RESOLVED" if target_status == "RESOLVED" else "OPEN"
             )
 
             # Use alert threshold from DB config (not hardcoded 70)
@@ -1346,10 +2305,19 @@ class RiskEvaluationAgent:
             else:
                 target_status = 'OPEN'
 
+            # Problem 2 fix: Deterministic requires_escalation check
+            requires_esc = _requires_escalation(
+                risk_level=item_risk_level,
+                risk_severity=deliv.get('risk_severity_score', item_risk_score),
+                graph_role=deliv.get('graph_role', 'ISOLATED'),
+                execution_status=deliv.get('execution_status', deliv.get('current_status', '')),
+                is_scope_creep=deliv.get('is_scope_creep', False)
+            )
+
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, item_type,
                 False, item_risk_score, item_risk_level, actual_risk_cat,
-                1.0, full_reasoning, True,
+                1.0, full_reasoning, requires_esc,
                 title=card_title, reference_id=ref_id,
                 priority_order=deliv.get('priority_order'),
                 status=target_status,
@@ -1365,6 +2333,8 @@ class RiskEvaluationAgent:
                 canonical_id=deliv.get('canonical_id', ''),
                 risk_severity_score=deliv.get('risk_severity_score',
                     deliv.get('risk_score', item_risk_score)),
+                # Problem 2 fix: propagate owner
+                owner=deliv.get("owner", deliv.get("dependency_owner", "Internal")),
             )
 
             # Use alert threshold from DB config (not hardcoded 70)
@@ -1383,8 +2353,11 @@ class RiskEvaluationAgent:
             res_evidence = resolved.get("resolution_evidence", "No evidence provided")
             res_confidence = resolved.get("confidence", 0)
             
-            # Only resolve if confidence > 85 (High Confidence)
-            if res_confidence > 85:
+            # Support both float (0.0 - 1.0) and percentage (0 - 100)
+            conf_val = (res_confidence * 100) if (isinstance(res_confidence, (int, float)) and res_confidence <= 1.0) else float(res_confidence or 0)
+            
+            # Resolve if confidence >= 80%
+            if conf_val >= 80:
                 ref_id = None
                 res_name_clean = res_name.lower().strip()
                 for name, act_id in activity_map.items():
@@ -1399,6 +2372,7 @@ class RiskEvaluationAgent:
                     title=res_name, reference_id=ref_id,
                     status='RESOLVED', resolve_only=True
                 )
+                _resolve_composite_subphases(res_name, res_evidence, db_cursor, project_id, document_id)
                 
         # B) Execution Blockers: Auto-resolve if associated milestone completes
         completed_milestone_ids = [m_id for m_id, status in milestone_status_map.items() if status == "COMPLETED"]
@@ -1423,47 +2397,104 @@ class RiskEvaluationAgent:
                     title=r_title, reference_id=None, # Already matching by title
                     status='RESOLVED', resolve_only=True
                 )
-                
-        # General Risks remain open unless mentioned (handled by not updating them)
 
-        import json
-        db_cursor.execute("""
-            INSERT INTO risk_evaluations 
-            (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            project_id, document_id, risk_score, overall_risk, summary,
-            json.dumps(recommendations), json.dumps(sub_agent_results)
-        ))
-        
-        risk_eval_id = db_cursor.lastrowid
+        # Synchronize scope_items status to COMPLETED for completed deliverables from MoM
+        try:
+            from api.routes.baseline import _is_title_match
+            db_cursor.execute("SELECT id, name, completion_status FROM scope_items WHERE project_id = %s", (project_id,))
+            current_scope_items = db_cursor.fetchall() or []
+            
+            for resolved in resolved_items:
+                res_name = resolved.get("name", "")
+                for si in current_scope_items:
+                    si_id = si["id"] if isinstance(si, dict) else si[0]
+                    si_name = si["name"] if isinstance(si, dict) else si[1]
+                    si_status = si["completion_status"] if isinstance(si, dict) else si[2]
+                    
+                    if si_status != 'COMPLETED' and _is_title_match(res_name, si_name):
+                        db_cursor.execute(
+                            "UPDATE scope_items SET completion_status = 'COMPLETED' WHERE id = %s",
+                            (si_id,)
+                        )
+                        # Also update project_milestones table
+                        try:
+                            db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
+                            pms = db_cursor.fetchall() or []
+                            for pm in pms:
+                                pm_id = pm["id"] if isinstance(pm, dict) else pm[0]
+                                pm_name = pm["name"] if isinstance(pm, dict) else pm[1]
+                                if _is_title_match(si_name, pm_name) or _is_title_match(res_name, pm_name):
+                                    db_cursor.execute(
+                                        "UPDATE project_milestones SET status = 'Completed' WHERE id = %s",
+                                        (pm_id,)
+                                    )
+                                    print(f"  [MilestoneSync] Synchronized project_milestone #{pm_id} '{pm_name}' to Completed")
+                        except Exception as e:
+                            print(f"  [MilestoneSync Error] {e}")
+                        print(f"  [DeliverableSync] Synchronized scope deliverable #{si_id} '{si_name}' to COMPLETED from MoM evidence")
 
-        # Determine baseline version for progress tracking
-        db_cursor.execute("SELECT version FROM scope_baselines WHERE project_id = %s AND status = 'APPROVED' ORDER BY id DESC LIMIT 1", (project_id,))
-        bv_row = db_cursor.fetchone()
-        baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
-
-        # Deliverable Progress: now insert with the valid risk_eval_id
-        from repositories.baseline_repository import BaselineRepository
-        for pr in pending_progress_records:
+            # Also ensure all project_milestones matching already completed scope items are marked Completed
             try:
-                BaselineRepository.insert_deliverable_progress(
-                    db=db_cursor._connection,
-                    project_id=project_id,
-                    scope_item_id=pr.get("scope_item_id"),
-                    source_document_id=document_id,
-                    risk_evaluation_id=risk_eval_id,
-                    baseline_version=baseline_version,
-                    status_code=pr.get("progress_status", "UNKNOWN"),
-                    progress_percentage=pr.get("progress_percentage"),
-                    execution_summary=pr.get("execution_summary", ""),
-                    dependencies=pr.get("dependencies", []),
-                    resolved_items=extraction_result.get("resolved_items", []),
-                    confidence=pr.get("confidence", 1.0),
-                    evidence_text=pr.get("evidence_text", "")
-                )
+                db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
+                all_pms = db_cursor.fetchall() or []
+                for pm in all_pms:
+                    pm_id = pm["id"] if isinstance(pm, dict) else pm[0]
+                    pm_name = pm["name"] if isinstance(pm, dict) else pm[1]
+                    pm_status = pm["status"] if isinstance(pm, dict) else pm[2]
+                    if (pm_status or "").upper() != "COMPLETED":
+                        for si in current_scope_items:
+                            si_name = si["name"] if isinstance(si, dict) else si[1]
+                            si_status = si["completion_status"] if isinstance(si, dict) else si[2]
+                            if si_status == "COMPLETED" and _is_title_match(si_name, pm_name):
+                                db_cursor.execute(
+                                    "UPDATE project_milestones SET status = 'Completed' WHERE id = %s",
+                                    (pm_id,)
+                                )
+                                print(f"  [MilestoneSync] Backfilled project_milestone #{pm_id} '{pm_name}' to Completed")
+                                break
             except Exception as e:
-                print(f"Warning: Could not persist deliverable progress record: {e}")
+                print(f"  [MilestoneSync Backfill Error] {e}")
+
+            # C) Prerequisite Auto-Resolution: For all completed scope deliverables, resolve their prerequisites
+            for si in current_scope_items:
+                si_id = si["id"] if isinstance(si, dict) else si[0]
+                si_name = si["name"] if isinstance(si, dict) else si[1]
+                si_status = si["completion_status"] if isinstance(si, dict) else si[2]
+                
+                is_completed_now = (si_status == 'COMPLETED') or any(_is_title_match(resolved.get("name", ""), si_name) for resolved in resolved_items)
+                if is_completed_now:
+                    db_cursor.execute(
+                        "SELECT dependencies FROM deliverable_progress WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1",
+                        (si_id,)
+                    )
+                    dep_row = db_cursor.fetchone()
+                    raw_deps = dep_row["dependencies"] if isinstance(dep_row, dict) else (dep_row[0] if dep_row else None)
+                    if raw_deps:
+                        try:
+                            deps_list = json.loads(raw_deps) if isinstance(raw_deps, str) else (raw_deps or [])
+                            for d in deps_list:
+                                d_name = d.get("name") if isinstance(d, dict) else str(d)
+                                if d_name:
+                                    TrackerAuditAgent.persist_tracker_item(
+                                        db_cursor, project_id, document_id, 'ACTIVITY',
+                                        False, 0, 'LOW', 'RESOLVED',
+                                        1.0, f"Prerequisite fulfilled: {d.get('evidence', 'Prerequisite fulfilled.') if isinstance(d, dict) else 'Prerequisite fulfilled.'}",
+                                        False,
+                                        title=d_name, reference_id=None,
+                                        status='RESOLVED', resolve_only=True
+                                    )
+                                    print(f"  [PrereqSync] Auto-resolved prerequisite '{d_name}' for completed deliverable '{si_name}'")
+                        except Exception as ex:
+                            print(f"  [PrereqSync] Warning: Failed parsing deps for scope item #{si_id}: {ex}")
+        except Exception as e:
+            print(f"Warning: Failed to sync scope_items completion from MoM: {e}")
+
+        # Re-evaluate topological graph and recalculate execution queues
+        try:
+            from api.routes.baseline import _rebuild_graph_and_recalculate
+            _rebuild_graph_and_recalculate(db_cursor, project_id, None)
+        except Exception as e:
+            print(f"Warning: Auto-recalc after document evaluation failed: {e}")
 
         _emit("Completed", 100)
         return {

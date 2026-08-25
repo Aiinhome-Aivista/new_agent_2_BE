@@ -34,7 +34,6 @@ def truncate_all_except_users():
             'master_document_types',
             'risk_parameter_config',
             'risk_threshold_config',
-            'business_rule_config',
             'impact_matrix',
             'alert_rule_config',
             'progress_status_config',

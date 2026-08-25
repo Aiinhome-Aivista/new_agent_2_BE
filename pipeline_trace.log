@@ -1,0 +1,99 @@
+  [DependencyRisk] Detected blocking relationships:
+=== DEPENDENCY RISK CONTEXT ===
+- User Acceptance Testing [Planned] blocks: Production Go-Live (MEDIUM IMPACT)
+- Production Go-Live [Planned] blocks: Knowledge Transfer & Closure (MEDIUM IMPACT)
+  [CompletionNormalizer] Promoted to RESOLVED: 'Project' (sentence: 'project formally closed....')
+  [CompletionNormalizer] 1 activities promoted to resolved: ['Project']
+[ClosureDetector] PROJECT CLOSURE CONFIRMED (2/3 signals): Signal2: Terminal milestone 'Knowledge Transfer & Closure' resolved via 'Knowledge transfer'; Signal3: No active work detected, 5 completions found
+[Pipeline] Project closure detected. Auto-resolving all open tracker items...
+  [Closure] Auto-resolved: 'SAP ERP Integration'
+  [Closure] Auto-resolved: 'Voice Bot support'
+  [Closure] Auto-resolved: 'Microsoft Teams notification integration'
+
+======================================================================
+🚀 [GRAPH RECALC PIPELINE] Starting PMO Evaluation for Project 49
+======================================================================
+
+----------------------------------------------------------------------
+🟢 STEP 2A: Fact Extraction & Completed Deliverables Verification
+   Completed Scope Items (13): ['AI Knowledge Search (RAG-based search for enterprise...', 'Project Kickoff', 'Solution Design', 'Requirement Gathering', 'AI Knowledge Search (RAG-based search for enterprise', 'System Integration Testing (SIT), UAT, Production Deployment', 'CRM Integration for customer information and ticket...', 'Azure AD Single Sign-On (SSO)', 'User management and administration', 'Audit logs and activity tracking', 'Analytics Dashboard with operational KPIs', 'Azure AD SSO', 'CRM Integration for customer information and ticket']
+
+----------------------------------------------------------------------
+🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
+   Remaining Active Items (0)
+   Resolved Ancestor Nodes (24)
+   ℹ️ No active items remaining to recalculate.
+======================================================================
+
+
+======================================================================
+🚀 [GRAPH RECALC PIPELINE] Starting PMO Evaluation for Project 49
+======================================================================
+
+----------------------------------------------------------------------
+🟢 STEP 2A: Fact Extraction & Completed Deliverables Verification
+   Completed Scope Items (13): ['AI Knowledge Search (RAG-based search for enterprise...', 'Project Kickoff', 'Solution Design', 'Requirement Gathering', 'AI Knowledge Search (RAG-based search for enterprise', 'System Integration Testing (SIT), UAT, Production Deployment', 'CRM Integration for customer information and ticket...', 'Azure AD Single Sign-On (SSO)', 'User management and administration', 'Audit logs and activity tracking', 'Analytics Dashboard with operational KPIs', 'Azure AD SSO', 'CRM Integration for customer information and ticket']
+
+----------------------------------------------------------------------
+🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
+   Remaining Active Items (0)
+   Resolved Ancestor Nodes (24)
+   ℹ️ No active items remaining to recalculate.
+======================================================================
+
+
+======================================================================
+🚀 [GRAPH RECALC PIPELINE] Starting PMO Evaluation for Project 49
+======================================================================
+
+----------------------------------------------------------------------
+🟢 STEP 2A: Fact Extraction & Completed Deliverables Verification
+   Completed Scope Items (13): ['AI Knowledge Search (RAG-based search for enterprise...', 'Project Kickoff', 'Solution Design', 'Requirement Gathering', 'AI Knowledge Search (RAG-based search for enterprise', 'System Integration Testing (SIT), UAT, Production Deployment', 'CRM Integration for customer information and ticket...', 'Azure AD Single Sign-On (SSO)', 'User management and administration', 'Audit logs and activity tracking', 'Analytics Dashboard with operational KPIs', 'Azure AD SSO', 'CRM Integration for customer information and ticket']
+
+----------------------------------------------------------------------
+🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
+   Remaining Active Items (0)
+   Resolved Ancestor Nodes (24)
+   ℹ️ No active items remaining to recalculate.
+======================================================================
+
+Running database migration for tracker_items columns...
+Migration: Updating item_type ENUM...
+Successfully ran tracker migrations on startup.
+Drive tables ensured on startup.
+Running database migration for tracker_items columns...
+Migration: Updating item_type ENUM...
+Successfully ran tracker migrations on startup.
+Drive tables ensured on startup.
+
+======================================================================
+🚀 [GRAPH RECALC PIPELINE] Starting PMO Evaluation for Project 49
+======================================================================
+
+----------------------------------------------------------------------
+🟢 STEP 2A: Fact Extraction & Completed Deliverables Verification
+   Completed Scope Items (20): ['Role-based access control', 'Project Kickoff', 'Audit logs and activity tracking', 'Analytics Dashboard with operational KPIs', 'Azure AD Single Sign-On (SSO)', 'Change Control', 'Knowledge Transfer and project documentation', 'User Acceptance Testing', 'Production Go-Live', 'AI Knowledge Search (RAG-based search for enterprise', 'AI Knowledge Search (RAG-based search for enterprise...', 'System Integration Testing (SIT), UAT, Production Deployment', 'CRM Integration for customer information and ticket', 'Solution Design', 'CRM Integration for customer information and ticket...', 'Requirement Gathering', 'Azure AD SSO', 'Document upload and indexing', 'User management and administration', 'Knowledge Transfer & Closure']
+
+----------------------------------------------------------------------
+🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
+   Remaining Active Items (0)
+   Resolved Ancestor Nodes (30)
+   ℹ️ No active items remaining to recalculate.
+======================================================================
+
+
+======================================================================
+🚀 [GRAPH RECALC PIPELINE] Starting PMO Evaluation for Project 49
+======================================================================
+
+----------------------------------------------------------------------
+🟢 STEP 2A: Fact Extraction & Completed Deliverables Verification
+   Completed Scope Items (20): ['Role-based access control', 'Project Kickoff', 'Audit logs and activity tracking', 'Analytics Dashboard with operational KPIs', 'Azure AD Single Sign-On (SSO)', 'Change Control', 'Knowledge Transfer and project documentation', 'User Acceptance Testing', 'Production Go-Live', 'AI Knowledge Search (RAG-based search for enterprise', 'AI Knowledge Search (RAG-based search for enterprise...', 'System Integration Testing (SIT), UAT, Production Deployment', 'CRM Integration for customer information and ticket', 'Solution Design', 'CRM Integration for customer information and ticket...', 'Requirement Gathering', 'Azure AD SSO', 'Document upload and indexing', 'User management and administration', 'Knowledge Transfer & Closure']
+
+----------------------------------------------------------------------
+🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
+   Remaining Active Items (0)
+   Resolved Ancestor Nodes (30)
+   ℹ️ No active items remaining to recalculate.
+======================================================================
+

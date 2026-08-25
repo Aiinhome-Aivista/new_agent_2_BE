@@ -5,7 +5,50 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
 from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers, drive
- 
+import sys
+import os
+
+import threading
+
+class TeeLogger(object):
+    def __init__(self, filename):
+        self.terminal = sys.stdout if not isinstance(sys.stdout, TeeLogger) else sys.stdout.terminal
+        self.filename = filename
+        self.lock = threading.Lock()
+        # Open in append mode 'a' so file writes always go to the end without creating sparse NULL byte gaps on Windows
+        self.log = open(filename, "a", encoding="utf-8", errors="replace")
+
+    def write(self, message):
+        try:
+            self.terminal.write(message)
+        except Exception:
+            pass
+        if message:
+            # Strip any accidental NULL bytes to prevent file corruption
+            cleaned = message.replace("\x00", "")
+            if cleaned:
+                with self.lock:
+                    try:
+                        self.log.write(cleaned)
+                        self.log.flush()
+                    except Exception:
+                        pass
+
+    def flush(self):
+        try:
+            self.terminal.flush()
+        except Exception:
+            pass
+        with self.lock:
+            try:
+                self.log.flush()
+            except Exception:
+                pass
+
+# Redirect all print statements to both the terminal AND a log file safely
+if not isinstance(sys.stdout, TeeLogger):
+    sys.stdout = TeeLogger(os.path.join(os.path.dirname(__file__), "pipeline_trace.log"))
+
 app = FastAPI(
     title=settings.APP_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json",

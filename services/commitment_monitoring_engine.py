@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 
 class CommitmentMonitoringEngine:
     @classmethod
-    def evaluate(cls, state_snapshot, llm_extracted_activities, all_baseline_items, project_id, document_date=None):
+    def evaluate(cls, state_snapshot, llm_extracted_activities, all_baseline_items, project_id, document_date=None, resolved_items=None):
         """
         Compares expected baseline milestones against MoM extraction to find missing updates.
         Returns a list of synthetic risks to inject into the graph.
@@ -16,9 +16,23 @@ class CommitmentMonitoringEngine:
                 pass
                 
         # What did the LLM extract as having an update?
-        extracted_names = [a.get("canonical_title", "").strip().lower() for a in llm_extracted_activities]
-        extracted_names.extend([a.get("_canonical_title", "").strip().lower() for a in llm_extracted_activities])
+        extracted_names = [a.get("canonical_title", "").strip().lower() for a in llm_extracted_activities if a.get("canonical_title")]
+        extracted_names.extend([a.get("_canonical_title", "").strip().lower() for a in llm_extracted_activities if a.get("_canonical_title")])
+        extracted_names.extend([a.get("activity", "").strip().lower() for a in llm_extracted_activities if a.get("activity")])
+        extracted_names.extend([a.get("statement", "").strip().lower() for a in llm_extracted_activities if a.get("statement")])
+
+        # Include resolved items from this document so completed deliverables are not marked missing
+        for res in (resolved_items or []):
+            if res.get("name"):
+                extracted_names.append(res["name"].strip().lower())
+            if res.get("canonical_name"):
+                extracted_names.append(res["canonical_name"].strip().lower())
         
+        try:
+            from api.routes.baseline import _is_title_match
+        except Exception:
+            _is_title_match = None
+
         for m_id, name in state_snapshot.milestone_id_to_name.items():
             # Only track actual project milestones, not virtual nodes
             if str(m_id).startswith("VIRTUAL_"): continue
@@ -42,10 +56,14 @@ class CommitmentMonitoringEngine:
             if days_overdue >= -30:
                 name_clean = name.strip().lower()
                 
-                # Was it mentioned?
+                # Was it mentioned or resolved?
                 mentioned = False
                 for e_name in extracted_names:
-                    if e_name and (e_name == name_clean or e_name in name_clean or name_clean in e_name):
+                    if not e_name: continue
+                    if e_name == name_clean or e_name in name_clean or name_clean in e_name:
+                        mentioned = True
+                        break
+                    if _is_title_match and _is_title_match(name, e_name):
                         mentioned = True
                         break
                         
