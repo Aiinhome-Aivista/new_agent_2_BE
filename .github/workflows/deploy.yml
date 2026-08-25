@@ -15,7 +15,7 @@ jobs:
 
   # =========================================================
   # 1. BUILD DOCKER IMAGE AND PUSH TO GHCR
-  # =========================================================
+  # ==========================================================
   build-and-push:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
