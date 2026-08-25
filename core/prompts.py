@@ -270,10 +270,18 @@ Evaluate each of the following activities using ONLY their provided baseline con
 {activities_block}
 
 RULES:
-1. TRACKER TITLE PRIORITY (in order):
+1. TRACKER TITLE PRIORITY & STRICT MATCHING (in order):
    a. If baseline context shows a confirmed IN_SCOPE match → use that baseline item name as "matched_baseline_item".
    b. If baseline context shows a confirmed OUT_OF_SCOPE/excluded match → use that baseline item name.
    c. If NO baseline match exists → use the normalized activity name.
+
+   CRITICAL RULE — matched_baseline_item STRICT MATCHING:
+   When assigning matched_baseline_item, you MUST prefer the baseline item whose name has the HIGHEST lexical overlap with the activity name.
+   - If the activity name contains words that exactly appear in a baseline item name (e.g., "Azure AD", "SSO", "Single Sign-On"), use THAT baseline item — do not substitute a semantically related but lexically different item.
+   - Only use a semantically related baseline item if NO baseline item shares significant lexical overlap (3+ words or a distinctive proper noun) with the activity.
+   - "Role-based access control" is a separate baseline item from "Azure AD Single Sign-On (SSO)". Do not assign an SSO activity to "Role-based access control" — they are distinct deliverables.
+   - If matched_baseline_item is set, it MUST appear verbatim (or near-verbatim) in the baseline scope items list provided in the context.
+   - GENERAL PRINCIPLE: Prefer lexical match over semantic match for matched_baseline_item. The deterministic Python resolver handles semantics — your job is lexical accuracy.
 
 2. STATUS EXTRACTION:
    - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, WAITING_ON_CUSTOMER, or UNKNOWN.

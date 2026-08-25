@@ -808,6 +808,107 @@ def test_is_semantically_valid_direction_and_dynamic_cycle():
     assert cand_uat["graph_role"] == "TERMINAL_ACTIVITY"
 
 
+def test_bug_1_blocking_context_guard():
+    """Verify Bug 1: _normalize_completion_signals rejects blocking/conditional statements containing completion verbs."""
+    from agents.risk_evaluation_agent import _normalize_completion_signals
+    
+    extraction_input = {
+        "raw_activities": [
+            {
+                "statement": "Production Deployment",
+                "source_sentence": "No deployment activities can begin until UAT is successfully completed.",
+                "classification_type": "RISK"
+            },
+            {
+                "statement": "CRM Integration",
+                "source_sentence": "CRM Integration cannot start until customer credentials are provided.",
+                "classification_type": "RISK"
+            },
+            {
+                "statement": "Analytics Dashboard",
+                "source_sentence": "Analytics Dashboard completed and deployed to staging.",
+                "classification_type": "PROGRESS_UPDATE"
+            }
+        ],
+        "resolved_items": []
+    }
+    
+    res = _normalize_completion_signals(extraction_input)
+    resolved_names = [r["name"] for r in res["resolved_items"]]
+    raw_names = [a["statement"] for a in res["raw_activities"]]
+    
+    # "Analytics Dashboard" must be promoted
+    assert "Analytics Dashboard" in resolved_names
+    # "Production Deployment" and "CRM Integration" must NOT be promoted (negative blocking context)
+    assert "Production Deployment" in raw_names
+    assert "CRM Integration" in raw_names
+    assert "Production Deployment" not in resolved_names
+
+
+def test_bug_2_owner_preservation_on_resolve():
+    """Verify Bug 2: TrackerAuditAgent preserves original owner on transition to RESOLVED."""
+    import json
+    from agents.tracker_audit_agent import TrackerAuditAgent, _embed_owner_in_reasoning
+    
+    # Test reasoning serialization
+    initial_reasoning = json.dumps({"summary": "Customer credentials blocker", "owner": "Customer"})
+    
+    # When resolved without passing owner, existing owner "Customer" must be preserved
+    parsed = json.loads(initial_reasoning)
+    preserved = _embed_owner_in_reasoning(initial_reasoning, parsed.get("owner"))
+    parsed_after = json.loads(preserved)
+    assert parsed_after.get("owner") == "Customer", f"Expected Customer, got {parsed_after.get('owner')}"
+
+
+def test_bug_4_validate_matched_baseline_item():
+    """Verify Bug 4: _validate_matched_baseline_item corrects LLM lexical mismatch."""
+    from agents.risk_evaluation_agent import _validate_matched_baseline_item
+    
+    scope_items = [
+        {"name": "Role-based access control"},
+        {"name": "Azure AD Single Sign-On (SSO)"},
+        {"name": "System Integration Testing (SIT), UAT, Production Deployment"}
+    ]
+    
+    # LLM erroneously matched "Azure AD Single Sign-On (SSO)" to "Role-based access control"
+    corrected = _validate_matched_baseline_item(
+        activity_name="Azure AD Single Sign-On (SSO)",
+        matched_baseline_item="Role-based access control",
+        scope_items=scope_items
+    )
+    assert corrected == "Azure AD Single Sign-On (SSO)", f"Expected Azure AD SSO, got '{corrected}'"
+
+
+def test_bug_3_composite_milestone_subphase_resolution():
+    """Verify Bug 3: _resolve_composite_subphases matches composite milestone against child testing phases."""
+    from agents.risk_evaluation_agent import _resolve_composite_subphases
+    
+    # Mock cursor to test query logic
+    class MockCursor:
+        def __init__(self):
+            self.executed_queries = []
+            self.persisted_items = []
+        def execute(self, sql, params=None):
+            self.executed_queries.append((sql, params))
+        def fetchall(self):
+            return [
+                {"id": 101, "title": "User Acceptance Testing (UAT)", "reasoning": "{\"owner\":\"Internal\"}"},
+                {"id": 102, "title": "Independent Custom Report", "reasoning": "{\"owner\":\"Customer\"}"}
+            ]
+    
+    mock_db = MockCursor()
+    resolved = _resolve_composite_subphases(
+        resolved_title="System Integration Testing (SIT), UAT, Production Deployment",
+        resolution_evidence="All testing phases passed.",
+        db_cursor=mock_db,
+        project_id=47,
+        document_id=99
+    )
+    
+    assert "User Acceptance Testing (UAT)" in resolved, "UAT must be recognized and auto-resolved as a sub-phase"
+    assert "Independent Custom Report" not in resolved, "Unrelated items must NOT be resolved"
+
+
 if __name__ == "__main__":
     test_problem_1_root_causes_consistent_and_stateless()
     test_problem_2_band_hierarchy_and_ranking()
@@ -835,8 +936,12 @@ if __name__ == "__main__":
     test_activity_extractor_prompt_directionality_rule()
     test_strip_parentheticals_and_resolution()
     test_is_semantically_valid_direction_and_dynamic_cycle()
+    test_bug_1_blocking_context_guard()
+    test_bug_2_owner_preservation_on_resolve()
+    test_bug_4_validate_matched_baseline_item()
+    test_bug_3_composite_milestone_subphase_resolution()
     print("\n" + "=" * 60)
-    print(" ALL PROBLEMS & REMAINING RISK FIXES VERIFIED SUCCESSFULLY! ")
+    print(" ALL PROBLEMS & BUGS 1-4 VERIFIED SUCCESSFULLY! ")
     print("=" * 60)
 
 

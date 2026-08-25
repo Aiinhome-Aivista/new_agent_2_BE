@@ -60,13 +60,27 @@ class MilestoneExecutionStateManager:
         """
         final_statuses = {}
         for m_id, new_status in incoming_statuses.items():
-            db_cursor.execute("SELECT status FROM project_milestones WHERE id = %s", (m_id,))
+            db_cursor.execute("SELECT name, status FROM project_milestones WHERE id = %s", (m_id,))
             current_row = db_cursor.fetchone()
             if current_row:
-                current_status = current_row['status'].upper() if isinstance(current_row, dict) else current_row[0].upper()
+                current_status = current_row['status'].upper() if isinstance(current_row, dict) else current_row[1].upper()
+                m_name = current_row['name'] if isinstance(current_row, dict) else current_row[0]
                 if TransitionValidator.is_valid_transition(current_status, new_status):
                     db_cursor.execute("UPDATE project_milestones SET status = %s WHERE id = %s", (new_status, m_id))
                     final_statuses[m_id] = new_status
+                    if new_status.upper() == "COMPLETED":
+                        try:
+                            db_cursor.execute("""
+                                UPDATE scope_items
+                                SET completion_status = 'COMPLETED'
+                                WHERE project_id = %s AND (
+                                    LOWER(TRIM(name)) = LOWER(TRIM(%s))
+                                    OR LOWER(TRIM(COALESCE(milestone, ''))) = LOWER(TRIM(%s))
+                                    OR LOWER(TRIM(COALESCE(milestone_normalized, ''))) = LOWER(TRIM(%s))
+                                )
+                            """, (project_id, m_name, m_name, m_name))
+                        except Exception as e:
+                            print(f"  [MilestoneManager] Warning: Failed to sync scope_items for milestone {m_name}: {e}")
                 else:
                     final_statuses[m_id] = current_status
         return final_statuses

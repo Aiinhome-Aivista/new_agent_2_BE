@@ -508,6 +508,27 @@ class BaselineRepository:
             status_code, progress_percentage, execution_summary, json.dumps(final_dependencies), 
             confidence, evidence_text
         ))
+
+        # Synchronize scope_items and project_milestones if deliverable is completed
+        if str(status_code).upper() == "COMPLETED" or (progress_percentage is not None and float(progress_percentage) >= 100):
+            try:
+                cursor.execute(
+                    "UPDATE scope_items SET completion_status = 'COMPLETED' WHERE id = %s AND project_id = %s",
+                    (scope_item_id, project_id)
+                )
+                cursor.execute("""
+                    UPDATE project_milestones pm
+                    JOIN scope_items si ON (
+                        LOWER(TRIM(pm.name)) = LOWER(TRIM(si.name)) 
+                        OR LOWER(TRIM(pm.name)) = LOWER(TRIM(COALESCE(si.milestone, '')))
+                        OR LOWER(TRIM(pm.name)) = LOWER(TRIM(COALESCE(si.milestone_normalized, '')))
+                    )
+                    SET pm.status = 'Completed'
+                    WHERE si.id = %s AND pm.project_id = %s
+                """, (scope_item_id, project_id))
+            except Exception as e:
+                print(f"  [BaselineRepo] Warning: Failed to sync scope_items/milestones: {e}")
+
         cursor.close()
 
     @staticmethod

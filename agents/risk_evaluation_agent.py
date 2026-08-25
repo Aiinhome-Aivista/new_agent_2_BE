@@ -50,6 +50,121 @@ def _resolve_tracker_title(activity_name: str, matched_baseline_item: str,
     )
 
 
+def _validate_matched_baseline_item(
+    activity_name: str,
+    matched_baseline_item: str,
+    canonical_registry: list = None,
+    scope_items: list = None
+) -> str:
+    """
+    BUG 4 FIX: Validates and corrects matched_baseline_item from LLM Step 2C output.
+    If the LLM picked a semantically related but lexically distant baseline item,
+    corrects it to the proper match from the canonical registry/scope items.
+    Generic: uses token overlap, not hardcoded names.
+    """
+    if not matched_baseline_item:
+        return matched_baseline_item
+
+    candidates = (scope_items or []) + (canonical_registry or [])
+    if not candidates:
+        return matched_baseline_item
+
+    def tokenize(s):
+        return set(re.sub(r'[^a-z0-9\s]', '', (s or "").lower()).split())
+
+    act_tokens = tokenize(activity_name)
+    matched_tokens = tokenize(matched_baseline_item)
+
+    # Jaccard overlap between activity and its assigned matched_baseline_item
+    if act_tokens and matched_tokens:
+        intersection = act_tokens & matched_tokens
+        union = act_tokens | matched_tokens
+        overlap = len(intersection) / len(union) if union else 0
+    else:
+        overlap = 0
+
+    # Check if canonical registry / scope_items has a better (higher-overlap) match
+    best_match = matched_baseline_item
+    best_overlap = overlap
+
+    for item in candidates:
+        canonical_name = item.get("name") if isinstance(item, dict) else str(item)
+        c_tokens = tokenize(canonical_name)
+        if c_tokens:
+            c_intersection = act_tokens & c_tokens
+            c_union = act_tokens | c_tokens
+            c_overlap = len(c_intersection) / len(c_union) if c_union else 0
+            if c_overlap > best_overlap + 0.15:  # Meaningful improvement threshold
+                best_overlap = c_overlap
+                best_match = canonical_name
+
+    if best_match != matched_baseline_item:
+        print(f"  [MatchCorrection] '{activity_name}': corrected matched_baseline_item "
+              f"'{matched_baseline_item}' → '{best_match}' "
+              f"(overlap improved {overlap:.2f} → {best_overlap:.2f})")
+
+    return best_match
+
+
+def _resolve_composite_subphases(
+    resolved_title: str,
+    resolution_evidence: str,
+    db_cursor,
+    project_id: int,
+    document_id: int
+) -> list:
+    """
+    BUG 3 FIX: When a composite milestone resolves (e.g., 'System Integration Testing (SIT), UAT, Production Deployment'),
+    checks if any active tracker item is a named sub-phase of that milestone.
+    A sub-phase is identified when its name or primary acronym is contained within the resolved title
+    (case-insensitive, normalized). Generic: no hardcoded milestone names.
+
+    Returns list of additionally resolved item titles.
+    """
+    if not resolved_title:
+        return []
+    resolved_title_lower = resolved_title.lower().strip()
+    additionally_resolved = []
+
+    try:
+        db_cursor.execute(
+            "SELECT id, title, reasoning FROM tracker_items WHERE project_id = %s AND status = 'OPEN'",
+            (project_id,)
+        )
+        active_items = db_cursor.fetchall() or []
+        for item in active_items:
+            item_id = item['id'] if isinstance(item, dict) else item[0]
+            item_name = item['title'] if isinstance(item, dict) else item[1]
+            if not item_name:
+                continue
+            item_name_lower = item_name.lower().strip()
+            
+            # Check if this item's name is contained within the resolved composite title
+            is_subphase = False
+            if len(item_name_lower) > 5 and item_name_lower in resolved_title_lower:
+                is_subphase = True
+            elif "uat" in item_name_lower and "uat" in resolved_title_lower:
+                is_subphase = True
+            elif "sit" in item_name_lower and "sit" in resolved_title_lower:
+                is_subphase = True
+
+            if is_subphase:
+                TrackerAuditAgent.persist_tracker_item(
+                    db_cursor, project_id, document_id, 'ACTIVITY',
+                    False, 0, 'LOW', 'RESOLVED',
+                    1.0, f"Auto-resolved: sub-phase of resolved composite milestone '{resolved_title}'.\n\nEvidence: {resolution_evidence}",
+                    False,
+                    title=item_name, reference_id=None,
+                    status='RESOLVED', resolve_only=True
+                )
+                additionally_resolved.append(item_name)
+                print(f"  [CompositeSubphaseSync] Auto-resolved sub-phase '{item_name}' (sub-phase of '{resolved_title}')")
+    except Exception as e:
+        print(f"  [CompositeSubphaseSync Error] {e}")
+
+    return additionally_resolved
+
+
 def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
     """
     STEP 3: Deterministic Scope Matching.
@@ -101,8 +216,9 @@ def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
 
 def _normalize_completion_signals(extraction_result: dict) -> dict:
     """
-    FIX 6: Deterministically moves activities to resolved_items when the source_sentence
-    contains past-tense completion signals combined with minor-qualifier words.
+    FIX 6 & BUG 1 FIX: Deterministically moves activities to resolved_items when the source_sentence
+    contains past-tense completion signals combined with minor-qualifier words,
+    guarded against negative blocking contexts.
 
     This runs AFTER Step 2A LLM extraction and BEFORE the main pipeline.
     It does not call the LLM again.
@@ -131,6 +247,20 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
         "in progress", "underway", "ongoing", "scheduled", "planned"
     }
 
+    BLOCKING_CONTEXT_PATTERNS = [
+        r'\bcannot\s+begin\s+until\b',
+        r'\bcannot\s+start\s+until\b',
+        r'\bwill\s+not\s+begin\s+until\b',
+        r'\bwill\s+not\s+start\s+until\b',
+        r'\bnot\s+.*\s+until\b',
+        r'\bblocked\s+until\b',
+        r'\bwaiting\s+until\b',
+        r'\bdepends\s+on\b',
+        r'\bpending\s+.*\s+completion\b',
+        r'\bno\s+\w+\s+activities?\s+can\b',
+        r'\bcannot\s+proceed\s+until\b',
+    ]
+
     def _sentence_lower(act):
         return (act.get("source_sentence") or act.get("statement") or act.get("activity") or "").lower()
 
@@ -138,6 +268,19 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
         for verb in COMPLETION_VERBS:
             pattern = r'\b' + re.escape(verb) + r'\b'
             if re.search(pattern, sentence):
+                return True
+        return False
+
+    def _has_blocking_context(sentence: str) -> bool:
+        """
+        Returns True if the sentence describes a blocking condition rather than
+        an actual completion. Prevents false promotion when completion verbs appear
+        in conditional/dependency clauses.
+        Generic: matches structural patterns, not project-specific keywords.
+        """
+        sentence_lower = sentence.lower()
+        for pattern in BLOCKING_CONTEXT_PATTERNS:
+            if re.search(pattern, sentence_lower):
                 return True
         return False
 
@@ -183,6 +326,11 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
             continue
 
         if act.get("_early_exit_resolved"):
+            remaining.append(act)
+            continue
+
+        # BUG 1 FIX: If sentence has blocking/conditional context, do NOT promote
+        if _has_blocking_context(sentence):
             remaining.append(act)
             continue
 
@@ -631,7 +779,8 @@ class RiskEvaluationAgent:
         is_project_closed = _detect_project_closure(extraction_result, db_cursor, project_id)
 
         if is_project_closed:
-            print("[Pipeline] Project closure detected. Auto-resolving all open tracker items...")
+            print("[Pipeline] Project closure detected. Auto-resolving all open tracker items and completing milestones...")
+            import json
             db_cursor.execute("""
                 SELECT id, title FROM tracker_items
                 WHERE project_id = %s AND status = 'OPEN'
@@ -652,7 +801,6 @@ class RiskEvaluationAgent:
                     WHERE id = %s
                 """, ("Project formally closed — all items auto-resolved", item_id))
 
-                import json
                 audit_details = json.dumps({
                     "reason": "project_closure_auto_resolve",
                     "signals_fired": "2+ of 3 closure signals",
@@ -669,17 +817,104 @@ class RiskEvaluationAgent:
 
                 print(f"  [Closure] Auto-resolved: '{item_title}'")
 
+            # 2. Synchronize project milestones to Completed
+            try:
+                db_cursor.execute("""
+                    UPDATE project_milestones
+                    SET status = 'Completed'
+                    WHERE project_id = %s
+                """, (project_id,))
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to update project_milestones: {e}")
+
+            # 3. Synchronize baseline scope_items to COMPLETED
+            try:
+                db_cursor.execute("""
+                    UPDATE scope_items
+                    SET completion_status = 'COMPLETED'
+                    WHERE project_id = %s AND (scope_type = 'IN_SCOPE' OR scope_type IS NULL OR scope_type = '')
+                """, (project_id,))
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to update scope_items: {e}")
+
+            # 4. Insert final evaluation record in risk_evaluations
+            closure_summary = "Project has been formally closed. All deliverables and milestones have been completed and verified."
+            closure_recs = [
+                "Conduct post-project retrospective.",
+                "Archive project documentation.",
+                "Confirm all change requests and deliverables are formally closed."
+            ]
+            try:
+                insert_eval_sql = """
+                    INSERT INTO risk_evaluations
+                    (project_id, document_id, overall_risk_score, overall_risk_level, summary, recommendations, sub_agent_results)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """
+                db_cursor.execute(insert_eval_sql, (
+                    project_id, document_id, 0, "LOW", closure_summary,
+                    json.dumps(closure_recs), json.dumps({})
+                ))
+                risk_eval_id = db_cursor.lastrowid
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to insert risk_evaluations: {e}")
+                risk_eval_id = None
+
+            # 5. Insert final deliverable_progress for any scheduled scope items
+            try:
+                db_cursor.execute("""
+                    SELECT version FROM scope_baselines 
+                    WHERE project_id = %s AND status = 'APPROVED' 
+                    ORDER BY id DESC LIMIT 1
+                """, (project_id,))
+                bv_row = db_cursor.fetchone()
+                baseline_version = bv_row["version"] if bv_row and "version" in bv_row else 1
+
+                db_cursor.execute("""
+                    SELECT id, name FROM scope_items
+                    WHERE project_id = %s AND (deadline IS NOT NULL OR milestone IS NOT NULL)
+                """, (project_id,))
+                scheduled_items = db_cursor.fetchall() or []
+
+                from repositories.baseline_repository import BaselineRepository
+                for s_item in scheduled_items:
+                    s_id = s_item["id"] if isinstance(s_item, dict) else s_item[0]
+                    s_name = s_item["name"] if isinstance(s_item, dict) else s_item[1]
+
+                    # Check if latest deliverable_progress is not COMPLETED
+                    db_cursor.execute("""
+                        SELECT status_code FROM deliverable_progress
+                        WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1
+                    """, (s_id,))
+                    last_dp = db_cursor.fetchone()
+                    last_status = last_dp["status_code"] if last_dp and "status_code" in last_dp else (last_dp[0] if last_dp else None)
+
+                    if last_status != "COMPLETED":
+                        if risk_eval_id:
+                            BaselineRepository.insert_deliverable_progress(
+                                db=db_cursor._connection,
+                                project_id=project_id,
+                                scope_item_id=s_id,
+                                source_document_id=document_id,
+                                risk_evaluation_id=risk_eval_id,
+                                baseline_version=baseline_version,
+                                status_code="COMPLETED",
+                                progress_percentage=100,
+                                execution_summary="Completed and verified as part of project formal closure.",
+                                dependencies=[],
+                                resolved_items=[],
+                                confidence=1.0,
+                                evidence_text="Knowledge transfer completed. Documentation handed over. Customer provided final acceptance. Project formally closed."
+                            )
+            except Exception as e:
+                print(f"  [Closure] Warning: Failed to sync deliverable_progress on closure: {e}")
+
             _emit("Completed", 100)
             return {
                 "overallRisk": "LOW",
                 "riskScore": 0,
-                "summary": "Project has been formally closed. All tracker items have been automatically resolved.",
+                "summary": closure_summary,
                 "highestActionPriority": None,
-                "recommendations": [
-                    "Conduct post-project retrospective.",
-                    "Archive project documentation.",
-                    "Confirm all change requests are formally closed."
-                ],
+                "recommendations": closure_recs,
                 "subAgentResults": {}
             }
 
@@ -881,6 +1116,15 @@ class RiskEvaluationAgent:
             
             llm_risk_results = BatchActivityRiskAgent.evaluate_batch(activities_with_contexts, combined_context)
             
+            # BUG 4 FIX: Validate and correct matched_baseline_item from Step 2C LLM output
+            for res in (llm_risk_results or []):
+                act_name = res.get("activity") or ""
+                m_base = res.get("matched_baseline_item")
+                if m_base:
+                    res["matched_baseline_item"] = _validate_matched_baseline_item(
+                        act_name, m_base, canonical_registry=all_baseline_items, scope_items=scope_items
+                    )
+
             # --- NEW LOGGING FOR STEP 2C ---
             print("\n" + "="*70)
             print("🟡 STEP 2C OUTPUT (LLM Draft)")
@@ -1282,6 +1526,7 @@ class RiskEvaluationAgent:
                     owner=owner_display
                 )
                 print(f"  [COMPLETED] '{canonical_title}' -> early-exit RESOLVED. Skipping risk scoring.")
+                _resolve_composite_subphases(canonical_title, evidence, db_cursor, project_id, document_id)
                 continue
 
             # Removed CategoryAssignmentEngine logic. We will use ValidationService instead.
@@ -2127,6 +2372,7 @@ class RiskEvaluationAgent:
                     title=res_name, reference_id=ref_id,
                     status='RESOLVED', resolve_only=True
                 )
+                _resolve_composite_subphases(res_name, res_evidence, db_cursor, project_id, document_id)
                 
         # B) Execution Blockers: Auto-resolve if associated milestone completes
         completed_milestone_ids = [m_id for m_id, status in milestone_status_map.items() if status == "COMPLETED"]

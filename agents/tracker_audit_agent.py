@@ -76,8 +76,8 @@ class TrackerAuditAgent:
 
         matched_row = None
         for row in (all_items or []):
-            existing_title = row['title'] if isinstance(row, dict) else (row[3] if len(row) > 3 else "")
-            existing_ref   = row['reference_id'] if isinstance(row, dict) else (row[4] if len(row) > 4 else None)
+            existing_title = row.get('title', '') if isinstance(row, dict) else (row[3] if len(row) > 3 else "")
+            existing_ref   = row.get('reference_id') if isinstance(row, dict) else (row[4] if len(row) > 4 else None)
             norm_existing  = re.sub(r'[^\w\s]', '', (existing_title or "").lower().strip())
 
             if norm_title and norm_existing == norm_title:
@@ -96,13 +96,13 @@ class TrackerAuditAgent:
                     pass
 
         if matched_row:
-            existing_id       = matched_row['id']            if isinstance(matched_row, dict) else matched_row[0]
-            existing_score    = matched_row['risk_score']    if isinstance(matched_row, dict) else matched_row[1]
-            existing_reasoning= matched_row['reasoning']     if isinstance(matched_row, dict) else matched_row[2]
-            existing_level    = matched_row['risk_level']    if isinstance(matched_row, dict) else matched_row[5]
-            existing_priority = matched_row['priority_order']if isinstance(matched_row, dict) else matched_row[6]
-            existing_origin   = matched_row['risk_origin']   if isinstance(matched_row, dict) else matched_row[7]
-            existing_peak     = matched_row['previous_highest_score'] if isinstance(matched_row, dict) else matched_row[8]
+            existing_id       = matched_row.get('id') if isinstance(matched_row, dict) else matched_row[0]
+            existing_score    = matched_row.get('risk_score') if isinstance(matched_row, dict) else (matched_row[1] if len(matched_row) > 1 else None)
+            existing_reasoning= matched_row.get('reasoning') if isinstance(matched_row, dict) else (matched_row[2] if len(matched_row) > 2 else None)
+            existing_level    = matched_row.get('risk_level', 'LOW') if isinstance(matched_row, dict) else (matched_row[5] if len(matched_row) > 5 else 'LOW')
+            existing_priority = matched_row.get('priority_order') if isinstance(matched_row, dict) else (matched_row[6] if len(matched_row) > 6 else None)
+            existing_origin   = matched_row.get('risk_origin') if isinstance(matched_row, dict) else (matched_row[7] if len(matched_row) > 7 else None)
+            existing_peak     = matched_row.get('previous_highest_score') if isinstance(matched_row, dict) else (matched_row[8] if len(matched_row) > 8 else None)
 
             risk_origin_value = existing_origin
             candidate_scores = [s for s in [existing_peak, existing_score, risk_score] if s is not None]
@@ -118,7 +118,19 @@ class TrackerAuditAgent:
                 final_exec_score = 0
                 final_risk_level = existing_level
                 final_priority   = None
-                final_reasoning  = None
+                
+                # BUG 2 FIX: Preserve original owner from existing reasoning JSON on resolution
+                preserved_owner = owner
+                if not preserved_owner and existing_reasoning:
+                    try:
+                        p_ex = json.loads(existing_reasoning)
+                        if isinstance(p_ex, dict) and p_ex.get("owner"):
+                            preserved_owner = p_ex["owner"]
+                    except Exception:
+                        pass
+                
+                # Maintain reasoning JSON with preserved owner
+                final_reasoning = _embed_owner_in_reasoning(existing_reasoning or reasoning or "Resolved", preserved_owner)
             else:
                 final_risk_score = risk_score
                 final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
@@ -128,9 +140,6 @@ class TrackerAuditAgent:
                     final_reasoning = (existing_reasoning or "") + "\nUpdate: " + reasoning
                 else:
                     final_reasoning = existing_reasoning
-
-            # FIX 1: Embed owner in final_reasoning JSON before UPDATE
-            if status != 'RESOLVED':
                 final_reasoning = _embed_owner_in_reasoning(final_reasoning, owner)
 
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
@@ -172,6 +181,8 @@ class TrackerAuditAgent:
                 new_peak = 0
                 risk_level = 'LOW'
                 
+                resolved_reasoning = _embed_owner_in_reasoning(reasoning or 'Auto-resolved (Condition cleared)', owner)
+                
                 tracker_sql = """
                     INSERT INTO tracker_items
                     (project_id, source_document_id, item_type, reference_id, title, is_out_of_scope,
@@ -186,7 +197,7 @@ class TrackerAuditAgent:
                     project_id, document_id, item_type or 'ACTIVITY', reference_id, title, int(is_out_of_scope),
                     0, 0, 0, 0,
                     'LOW', risk_category or 'RESOLVED', risk_origin_value,
-                    confidence, None, int(requires_escalation), risk_source,
+                    confidence, resolved_reasoning, int(requires_escalation), risk_source,
                     'RESOLVED', 'RESOLVED', 'RESOLVED',
                     graph_role or 'DOWNSTREAM_ACTIVITY',
                     canonical_id or '',
