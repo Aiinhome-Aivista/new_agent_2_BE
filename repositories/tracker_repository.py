@@ -106,7 +106,7 @@ class TrackerRepository:
         items = cursor.fetchall() or []
         cursor.close()
         
-        # FIX 1 & BUG 2: Populate owner and dependency_owner from embedded reasoning JSON if present
+        # FIX 1 & BUG 2: Populate owner, deliverable and dependency_owner from embedded reasoning JSON if present
         for it in items:
             owner = None
             if it.get("reasoning"):
@@ -122,6 +122,10 @@ class TrackerRepository:
             it["owner"] = owner
             if not it.get("dependency_owner"):
                 it["dependency_owner"] = owner
+            if not it.get("deliverable"):
+                it["deliverable"] = it.get("title") or it.get("name")
+            if not it.get("title"):
+                it["title"] = it.get("name")
         
         TrackerRepository._fetch_and_attach_audit_trails(db, items, project_id)
         
@@ -149,6 +153,10 @@ class TrackerRepository:
             item["owner"] = owner
             if not item.get("dependency_owner"):
                 item["dependency_owner"] = owner
+            if not item.get("deliverable"):
+                item["deliverable"] = item.get("title") or item.get("name")
+            if not item.get("title"):
+                item["title"] = item.get("name")
             TrackerRepository._fetch_and_attach_audit_trails(db, [item], project_id)
             
         return item

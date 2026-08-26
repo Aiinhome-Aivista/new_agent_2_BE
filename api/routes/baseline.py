@@ -937,6 +937,65 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
         if filtered_targets:
             graph[src] = filtered_targets
 
+    # STEP 2B SUPPLEMENT: Include static milestone dependency edges for tracker items
+    # that have an m_id set or match a project milestone, whose downstream milestone has no tracker item.
+    # This prevents cascade count loss when downstream milestones are not tracked separately.
+    # Generic: works for any tracker item matching project_milestones.
+    try:
+        cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
+        all_pm = cursor.fetchall() or []
+        open_tracker_mids = {}
+        for item in open_items:
+            ref_id = item.get('reference_id')
+            title = item.get('title') or ''
+            found_mid = None
+            if ref_id and any((pm['id'] == ref_id if isinstance(pm, dict) else pm[0] == ref_id) for pm in all_pm):
+                found_mid = ref_id
+            else:
+                for pm in all_pm:
+                    pm_name = pm['name'] if isinstance(pm, dict) else pm[1]
+                    if _is_title_match(title, pm_name):
+                        found_mid = pm['id'] if isinstance(pm, dict) else pm[0]
+                        break
+            if found_mid and title:
+                open_tracker_mids[found_mid] = title
+
+        if open_tracker_mids:
+            mid_list = list(open_tracker_mids.keys())
+            format_str = ','.join(['%s'] * len(mid_list))
+            cursor.execute(f"""
+                SELECT md.parent_milestone_id, md.child_milestone_id, pm.name as downstream_name
+                FROM milestone_dependencies md
+                JOIN project_milestones pm ON md.child_milestone_id = pm.id
+                WHERE md.parent_milestone_id IN ({format_str})
+                AND pm.project_id = %s
+                AND pm.status NOT IN ('Completed', 'COMPLETED')
+            """, (*mid_list, project_id))
+
+            milestone_deps = cursor.fetchall() or []
+            for dep in milestone_deps:
+                upstream_mid = dep['parent_milestone_id'] if isinstance(dep, dict) else dep[0]
+                downstream_name = dep['downstream_name'] if isinstance(dep, dict) else dep[2]
+
+                if upstream_mid in open_tracker_mids:
+                    upstream_title = open_tracker_mids[upstream_mid]
+                    # Add edge if downstream is not already resolved/completed
+                    downstream_is_resolved = any(_is_title_match(downstream_name, res) for res in resolved_titles)
+                    downstream_is_tracker = any(
+                        _is_title_match(downstream_name, t.get('title', ''))
+                        for t in open_items
+                    )
+                    if not downstream_is_resolved and not downstream_is_tracker and downstream_name:
+                        # Add virtual downstream node to the runtime graph
+                        if upstream_title not in graph:
+                            graph[upstream_title] = []
+                        if not any(_is_title_match(downstream_name, existing_t) for existing_t in graph[upstream_title]):
+                            graph[upstream_title].append(downstream_name)
+                            print(f"  [MilestoneEdgeSupp] Added milestone edge: "
+                                  f"'{upstream_title}' → '{downstream_name}' (m_id={upstream_mid})")
+    except Exception as e:
+        print(f"  [MilestoneEdgeSupp] Warning: {e}")
+
     print(f"   Active Runtime Graph Edges: {graph if graph else 'None (All isolated/independent)'}")
 
     def _bfs_cascade(start_node: str) -> int:

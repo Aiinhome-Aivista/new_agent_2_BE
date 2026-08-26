@@ -100,8 +100,8 @@ def _validate_matched_baseline_item(
 
     if best_match != matched_baseline_item:
         print(f"  [MatchCorrection] '{activity_name}': corrected matched_baseline_item "
-              f"'{matched_baseline_item}' → '{best_match}' "
-              f"(overlap improved {overlap:.2f} → {best_overlap:.2f})")
+              f"'{matched_baseline_item}' -> '{best_match}' "
+              f"(overlap improved {overlap:.2f} -> {best_overlap:.2f})")
 
     return best_match
 

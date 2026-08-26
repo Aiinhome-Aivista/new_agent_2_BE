@@ -137,7 +137,14 @@ class TrackerAuditAgent:
                 final_risk_level = risk_level
                 final_priority   = priority_order if priority_order is not None else existing_priority
                 if reasoning and (reasoning[:50] not in (existing_reasoning or "")):
-                    final_reasoning = (existing_reasoning or "") + "\nUpdate: " + reasoning
+                    base_text = existing_reasoning or ""
+                    try:
+                        ex_parsed = json.loads(existing_reasoning)
+                        if isinstance(ex_parsed, dict) and "text" in ex_parsed and isinstance(ex_parsed["text"], str):
+                            base_text = ex_parsed["text"]
+                    except Exception:
+                        pass
+                    final_reasoning = (base_text + "\nUpdate: " + reasoning).strip()
                 else:
                     final_reasoning = existing_reasoning
                 final_reasoning = _embed_owner_in_reasoning(final_reasoning, owner)
@@ -145,7 +152,12 @@ class TrackerAuditAgent:
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
             if final_exec_status in ('UNKNOWN', ''):
                 final_exec_status = 'NOT_STARTED'
-            final_risk_status = risk_status or 'OPEN'
+            # BUG C FIX: When status is RESOLVED, always set risk_status to RESOLVED.
+            # Callers using resolve_only=True often don't pass risk_status explicitly.
+            if status == 'RESOLVED':
+                final_risk_status = 'RESOLVED'
+            else:
+                final_risk_status = risk_status or 'OPEN'
             final_risk_sev = risk_severity_score if risk_severity_score is not None else risk_score
 
             db_cursor.execute("""
