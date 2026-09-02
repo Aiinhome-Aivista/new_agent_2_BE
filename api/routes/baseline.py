@@ -369,7 +369,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         cursor.close()
         
         # ── Step 6.5: Detect and expand recurring commitments ──
-        emit("Detecting Recurring Commitments", 93)
+        emit("Detecting Recurring Commitments", 97)
         try:
             # Fetch the project record to get start/end dates
             proj_cursor = thread_conn.cursor(dictionary=True)
