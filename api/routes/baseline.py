@@ -720,6 +720,22 @@ def _is_title_match(a: str, b: str) -> bool:
     if a_clean == b_clean:
         return True
 
+    # Check for period/month or year conflict (e.g. May 2026 vs Aug 2026)
+    MONTH_TOKENS = {
+        'january', 'february', 'march', 'april', 'may', 'june',
+        'july', 'august', 'september', 'october', 'november', 'december',
+        'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
+    }
+    months_a = {w for w in re.findall(r'\b[a-zA-Z]+\b', a.lower()) if w in MONTH_TOKENS}
+    months_b = {w for w in re.findall(r'\b[a-zA-Z]+\b', b.lower()) if w in MONTH_TOKENS}
+    if months_a and months_b and not (months_a & months_b):
+        return False
+
+    years_a = {w for w in re.findall(r'\b20\d{2}\b', a)}
+    years_b = {w for w in re.findall(r'\b20\d{2}\b', b)}
+    if years_a and years_b and not (years_a & years_b):
+        return False
+
     # 1. Parenthetical aliases
     def get_parentheses_aliases(raw: str):
         aliases = [raw.lower().strip()]
@@ -787,6 +803,58 @@ def _is_title_match(a: str, b: str) -> bool:
         return True
 
     return False
+
+MONTH_MAP = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+def _extract_months_from_text(text: str) -> set:
+    if not text:
+        return set()
+    t = text.lower()
+    found = set()
+    for m_name, m_num in MONTH_MAP.items():
+        if re.search(r'\b' + re.escape(m_name) + r'\b', t):
+            found.add(m_num)
+    return found
+
+def _is_scope_item_match_for_resolution(resolved_item: dict, si: dict) -> bool:
+    res_name = resolved_item.get("name", "") if isinstance(resolved_item, dict) else str(resolved_item)
+    res_ev = resolved_item.get("resolution_evidence", "") if isinstance(resolved_item, dict) else ""
+    si_name = si.get("name", "") if isinstance(si, dict) else (si[1] if len(si) > 1 else "")
+    si_rec = bool(si.get("is_recurring") if isinstance(si, dict) else (si[3] if len(si) > 3 else False))
+    si_pid = si.get("parent_scope_item_id") if isinstance(si, dict) else (si[4] if len(si) > 4 else None)
+    si_dl = si.get("deadline") if isinstance(si, dict) else (si[5] if len(si) > 5 else None)
+
+    # Child occurrence of a recurring commitment
+    if si_rec and si_pid is not None:
+        si_base = re.sub(r'\s*[—\-–]\s*[A-Za-z]{3,9}\s*\d{4}.*$', '', si_name).strip()
+        if not (_is_title_match(res_name, si_name) or _is_title_match(res_name, si_base)):
+            return False
+        occ_months = set()
+        if si_dl:
+            try:
+                from datetime import datetime, date as date_type
+                d = si_dl if isinstance(si_dl, (date_type, datetime)) else datetime.strptime(str(si_dl)[:10], '%Y-%m-%d').date()
+                occ_months.add(d.month)
+            except Exception:
+                pass
+        occ_months |= _extract_months_from_text(si_name)
+        res_months = _extract_months_from_text(res_name) | _extract_months_from_text(res_ev)
+        if res_months:
+            return bool(occ_months & res_months)
+        return False
+
+    # Parent of a recurring commitment (ongoing process)
+    if si_rec and si_pid is None:
+        return False
+
+    # Standard non-recurring deliverable
+    return _is_title_match(res_name, si_name)
 
 def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Optional[str] = None) -> None:
     """

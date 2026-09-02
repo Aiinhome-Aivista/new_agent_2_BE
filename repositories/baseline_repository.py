@@ -236,13 +236,47 @@ class BaselineRepository:
             """, (item["id"],))
             item["latest_progress"] = cursor.fetchone()
             # Attach recurring occurrences to parent items
-            if item.get("is_recurring") and not item.get("parent_scope_item_id"):
+            is_rec = item.get("is_recurring")
+            if not is_rec and not item.get("parent_scope_item_id"):
+                from services.recurring_deliverable_service import _detect_recurrence_cadence
+                cadence = _detect_recurrence_cadence(item.get("name", "") + " " + item.get("description", ""))
+                if cadence:
+                    is_rec = True
+                    cursor.execute("UPDATE scope_items SET is_recurring=1, recurrence_cadence=%s WHERE id=%s", (cadence, item["id"]))
+                    item["is_recurring"] = 1
+                    item["recurrence_cadence"] = cadence
+
+            if is_rec and not item.get("parent_scope_item_id"):
                 cursor.execute("""
                     SELECT * FROM scope_items
                     WHERE parent_scope_item_id = %s
                     ORDER BY deadline ASC
                 """, (item["id"],))
                 occurrences = cursor.fetchall()
+                if not occurrences:
+                    try:
+                        from services.recurring_deliverable_service import RecurringDeliverableService
+                        cursor.execute("SELECT * FROM projects WHERE id = %s", (project_id,))
+                        proj_rec = cursor.fetchone() or {}
+                        items_copy = list(items)
+                        for ic in items_copy:
+                            ic["_db_id"] = ic["id"]
+                        RecurringDeliverableService.process_recurring_commitments(
+                            db=db,
+                            baseline_id=baseline["id"],
+                            project_id=project_id,
+                            scope_items=items_copy,
+                            project=proj_rec,
+                        )
+                        cursor.execute("""
+                            SELECT * FROM scope_items
+                            WHERE parent_scope_item_id = %s
+                            ORDER BY deadline ASC
+                        """, (item["id"],))
+                        occurrences = cursor.fetchall()
+                    except Exception as _e:
+                        print(f"  [BaselineRepository] Warning: auto-generating occurrences failed: {_e}")
+
                 for occ in occurrences:
                     cursor.execute("""
                         SELECT dp.*, psc.label as status_label
@@ -603,3 +637,46 @@ class BaselineRepository:
         cursor.close()
         return affected
 
+    @staticmethod
+    def insert_recurring_occurrence(
+        db,
+        baseline_id: int,
+        project_id: int,
+        parent_scope_item_id: int,
+        name: str,
+        occurrence_label: str,
+        deadline: str,
+        scope_type: str,
+        category: str,
+        recurrence_cadence: str,
+    ) -> int:
+        """
+        Insert one child occurrence row for a recurring parent scope item.
+        Each occurrence represents one period's commitment (e.g. 'CSI – Month 1').
+        Generic: works for any cadence and any recurring item.
+        Returns the new row's ID.
+        """
+        try:
+            cursor = db.cursor()
+            cursor.execute("""
+                INSERT INTO scope_items
+                (baseline_id, project_id, name, scope_type, category,
+                 deadline, deadline_normalized, is_recurring, recurrence_cadence,
+                 parent_scope_item_id, completion_status, confidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 0, %s, %s, 'ACTIVE', 1.0)
+            """, (
+                baseline_id, project_id,
+                f"{name} \u2013 {occurrence_label}",  # e.g. "CSI Process – Month 1"
+                scope_type, category,
+                deadline, deadline,
+                recurrence_cadence,
+                parent_scope_item_id
+            ))
+            occ_id = cursor.lastrowid
+            cursor.close()
+            print(f"  [RecurringService] Created occurrence: '{name} \u2013 {occurrence_label}' "
+                  f"(due={deadline}, parent={parent_scope_item_id})")
+            return occ_id
+        except Exception as e:
+            print(f"  [RecurringService] Warning: insert_recurring_occurrence failed: {e}")
+            return 0
