@@ -211,6 +211,153 @@ def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
 
 
 # ---------------------------------------------------------------------------
+# GAP 2: OCCURRENCE RESOLVER — match MoM completion to specific period occurrence
+# ---------------------------------------------------------------------------
+
+def _resolve_to_specific_occurrence(
+    db_cursor,
+    matched_scope_item: dict,
+    resolved_item: dict,
+    document_date,
+    evidence_text: str = "",
+) -> dict:
+    """
+    If the matched scope item is a recurring PARENT, find the specific
+    child occurrence that this resolution belongs to.
+
+    Matching priority:
+    1. Period keyword in resolution evidence
+       e.g. "January CSI done" -> Month 1 occurrence (deadline in January)
+    2. "last month" / "this month" / "this quarter" -> relative calendar match
+    3. Fallback -> earliest OPEN (non-COMPLETED) occurrence
+
+    Returns the child occurrence dict to write progress against,
+    or the original parent if no children exist.
+    Generic: works for any cadence, no hardcoded item names.
+    """
+    import re
+    from datetime import datetime, date as date_type
+    try:
+        # Only applies to recurring parents (parent_scope_item_id is NULL and is_recurring=True)
+        if not matched_scope_item.get('is_recurring'):
+            return matched_scope_item
+        parent_id = matched_scope_item.get('id')
+        if not parent_id:
+            return matched_scope_item
+
+        # Fetch all child occurrences ordered by deadline
+        db_cursor.execute(
+            "SELECT * FROM scope_items WHERE parent_scope_item_id = %s "
+            "ORDER BY deadline ASC",
+            (parent_id,)
+        )
+        occurrences = db_cursor.fetchall() or []
+        if not occurrences:
+            return matched_scope_item
+
+        evidence = (
+            evidence_text or
+            (resolved_item.get('resolution_evidence') if isinstance(resolved_item, dict) else '') or
+            (resolved_item.get('evidence_text') if isinstance(resolved_item, dict) else '') or
+            (resolved_item.get('execution_summary') if isinstance(resolved_item, dict) else '') or
+            (resolved_item.get('name') if isinstance(resolved_item, dict) else '') or ''
+        ).lower()
+
+        # Parse document date for "this month/quarter" matching
+        try:
+            doc_date = datetime.strptime(
+                str(document_date)[:10], '%Y-%m-%d'
+            ).date() if document_date else date_type.today()
+        except Exception:
+            doc_date = date_type.today()
+            doc_date = date_type.today()
+
+        # Priority 1: Month name in evidence (with word boundary protection)
+        MONTH_NAMES = {
+            'january': 1, 'february': 2, 'march': 3, 'april': 4,
+            'may': 5, 'june': 6, 'july': 7, 'august': 8,
+            'september': 9, 'october': 10, 'november': 11, 'december': 12,
+            'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
+            'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+        }
+        for month_name, month_num in MONTH_NAMES.items():
+            if re.search(r'\b' + re.escape(month_name) + r'\b', evidence):
+                for occ in occurrences:
+                    occ_dict = occ if isinstance(occ, dict) else dict(occ)
+                    occ_deadline = occ_dict.get('deadline') or occ_dict.get('deadline_normalized')
+                    if occ_deadline:
+                        try:
+                            occ_date = datetime.strptime(
+                                str(occ_deadline)[:10], '%Y-%m-%d'
+                            ).date()
+                            if occ_date.month == month_num:
+                                print(f"  [RecurringMatch] Month match: "
+                                      f"'{month_name}' -> occurrence due {occ_deadline}")
+                                return occ_dict
+                        except Exception:
+                            continue
+
+        # Priority 2: "last month" / "previous month" -> previous calendar month from doc_date
+        if re.search(r'\blast\s+month\b|\bprevious\s+month\b|\bprior\s+month\b', evidence):
+            target_month = 12 if doc_date.month == 1 else doc_date.month - 1
+            target_year = doc_date.year - 1 if doc_date.month == 1 else doc_date.year
+            for occ in occurrences:
+                occ_dict = occ if isinstance(occ, dict) else dict(occ)
+                occ_deadline = occ_dict.get('deadline') or occ_dict.get('deadline_normalized')
+                if occ_deadline:
+                    try:
+                        occ_date = datetime.strptime(str(occ_deadline)[:10], '%Y-%m-%d').date()
+                        if occ_date.year == target_year and occ_date.month == target_month:
+                            print(f"  [RecurringMatch] 'Last month' match -> occurrence due {occ_deadline}")
+                            return occ_dict
+                    except Exception:
+                        continue
+
+        # Priority 3: "this month" / "current month" -> same month as doc
+        if re.search(r'\bthis\s+month\b|\bcurrent\s+month\b|\bthis\s+quarter\b|\bcurrent\s+quarter\b', evidence):
+            for occ in occurrences:
+                occ_dict = occ if isinstance(occ, dict) else dict(occ)
+                occ_deadline = occ_dict.get('deadline') or occ_dict.get('deadline_normalized')
+                if occ_deadline:
+                    try:
+                        occ_date = datetime.strptime(
+                            str(occ_deadline)[:10], '%Y-%m-%d'
+                        ).date()
+                        if occ_date.year == doc_date.year and occ_date.month == doc_date.month:
+                            print(f"  [RecurringMatch] 'This month' match -> "
+                                  f"occurrence due {occ_deadline}")
+                            return occ_dict
+                    except Exception:
+                        continue
+
+        # Priority 4: Fallback -> earliest non-COMPLETED occurrence
+        for occ in occurrences:
+            occ_dict = occ if isinstance(occ, dict) else dict(occ)
+            if (occ_dict.get('completion_status') or '').upper() == 'COMPLETED':
+                continue
+            occ_id = occ_dict.get('id')
+            if occ_id:
+                db_cursor.execute(
+                    "SELECT status_code FROM deliverable_progress "
+                    "WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1",
+                    (occ_id,)
+                )
+                last_dp = db_cursor.fetchone()
+                last_status = (last_dp.get('status_code') if isinstance(last_dp, dict)
+                               else last_dp[0] if last_dp else None)
+                if str(last_status).upper() != 'COMPLETED':
+                    print(f"  [RecurringMatch] Fallback -> earliest open occurrence: "
+                          f"'{occ_dict.get('name')}' (due={occ_dict.get('deadline')})")
+                    return occ_dict
+
+        # All occurrences completed — return parent
+        return matched_scope_item
+    except Exception as e:
+        print(f"  [RecurringMatch] Warning: _resolve_to_specific_occurrence failed: {e}")
+        return matched_scope_item
+
+
+# ---------------------------------------------------------------------------
 # FIX 6: DETERMINISTIC COMPLETION NORMALIZER (3-TIER CLASSIFIER)
 # ---------------------------------------------------------------------------
 
@@ -809,6 +956,22 @@ class RiskEvaluationAgent:
         _emit("Loading Project Baseline", 10)
         scope_items = ProjectKnowledgeService.get_approved_baseline(db_cursor, project_id)
 
+        # Fetch document_date if available
+        document_date = None
+        try:
+            if db_cursor and document_id:
+                db_cursor.execute(
+                    "SELECT uploaded_at FROM documents WHERE id = %s", (document_id,)
+                )
+                doc_row = db_cursor.fetchone()
+                if doc_row:
+                    document_date = (
+                        doc_row.get('uploaded_at') if isinstance(doc_row, dict)
+                        else doc_row[0] if doc_row else None
+                    )
+        except Exception as _doc_e:
+            document_date = None
+
         # Fetch ALL baseline items (IN_SCOPE + OUT_OF_SCOPE) for canonical name resolution.
         all_baseline_items = ProjectKnowledgeService.get_full_baseline(db_cursor, project_id)
 
@@ -1346,7 +1509,16 @@ class RiskEvaluationAgent:
         
         # 4a. Commitment Monitoring Engine (Proactive Risk Synthesis)
         from services.commitment_monitoring_engine import CommitmentMonitoringEngine
-        commitment_risks = CommitmentMonitoringEngine.evaluate(state_snapshot, llm_risk_results, all_baseline_items, project_id, resolved_items=resolved_items)
+        commitment_risks = CommitmentMonitoringEngine.evaluate(
+            state_snapshot,
+            llm_risk_results,
+            all_baseline_items,
+            project_id,
+            resolved_items=resolved_items,
+            db_cursor=db_cursor,
+            document_id=document_id,
+            document_date=document_date,
+        )
         if commitment_risks:
             print(f"  [CommitmentMonitor] Synthesized {len(commitment_risks)} missing update risks.")
             llm_risk_results.extend(commitment_risks)
@@ -1675,6 +1847,31 @@ class RiskEvaluationAgent:
                             days_overdue = 0
                     except Exception:
                         pass
+
+            # Fallback for recurring child occurrences or scope items not in milestone_details
+            if not p_date_str:
+                if result.get("planned_date"):
+                    p_date_str = str(result["planned_date"])
+                else:
+                    for si in all_baseline_items:
+                        if _normalize(si.get("name", "")) == c_norm and si.get("deadline"):
+                            p_date_str = str(si["deadline"])
+                            break
+
+                if p_date_str:
+                    try:
+                        p_date = datetime.strptime(str(p_date_str).split(' ')[0], "%Y-%m-%d").date()
+                        if today > p_date:
+                            days_overdue = (today - p_date).days
+                            days_until_due = 0
+                        else:
+                            days_until_due = (p_date - today).days
+                            days_overdue = 0
+                    except Exception:
+                        pass
+                elif result.get("days_overdue"):
+                    days_overdue = int(result["days_overdue"])
+                    days_until_due = 0
 
             direct_downstream = dep_data.get("direct_downstream_milestones", [])
             all_downstream = dep_data.get("downstream_milestones", [])
@@ -2281,10 +2478,52 @@ class RiskEvaluationAgent:
         from repositories.baseline_repository import BaselineRepository
         for pr in pending_progress_records:
             try:
+                # GAP 2 FIX: Resolve to the specific period occurrence for recurring items
+                raw_scope_item_id = pr.get("scope_item_id")
+                final_scope_item_id = raw_scope_item_id
+                try:
+                    if raw_scope_item_id:
+                        db_cursor.execute(
+                            "SELECT * FROM scope_items WHERE id = %s", (raw_scope_item_id,)
+                        )
+                        matched_si = db_cursor.fetchone()
+                        if matched_si:
+                            matched_si_dict = matched_si if isinstance(matched_si, dict) else dict(matched_si)
+                            # Find the right resolved_item for this progress record (match by name or id)
+                            pr_name = (pr.get("name") or pr.get("title") or "").lower()
+                            matching_resolved = next(
+                                (ri for ri in (resolved_items or []) if (ri.get("name") or "").lower() in pr_name or pr_name in (ri.get("name") or "").lower()),
+                                {}
+                            )
+                            _doc_date = locals().get('document_date', None) or document_date
+                            if _doc_date is None and db_cursor and document_id:
+                                try:
+                                    db_cursor.execute(
+                                        "SELECT uploaded_at FROM documents WHERE id = %s", (document_id,)
+                                    )
+                                    _d_row = db_cursor.fetchone()
+                                    _doc_date = (
+                                        _d_row.get('uploaded_at') if isinstance(_d_row, dict)
+                                        else _d_row[0] if _d_row else None
+                                    )
+                                except Exception:
+                                    _doc_date = None
+
+                            target_item = _resolve_to_specific_occurrence(
+                                db_cursor=db_cursor,
+                                matched_scope_item=matched_si_dict,
+                                resolved_item=matching_resolved,
+                                document_date=_doc_date,
+                                evidence_text=pr.get("evidence_text") or pr.get("execution_summary") or "",
+                            )
+                            final_scope_item_id = target_item.get("id", raw_scope_item_id)
+                except Exception as _gap2_e:
+                    print(f"  [GAP2] Warning: occurrence resolution failed: {_gap2_e}")
+                    final_scope_item_id = raw_scope_item_id
                 BaselineRepository.insert_deliverable_progress(
                     db=db_cursor._connection,
                     project_id=project_id,
-                    scope_item_id=pr.get("scope_item_id"),
+                    scope_item_id=final_scope_item_id,
                     source_document_id=document_id,
                     risk_evaluation_id=risk_eval_id,
                     baseline_version=baseline_version,
@@ -2495,7 +2734,61 @@ class RiskEvaluationAgent:
         # Synchronize scope_items status to COMPLETED for completed deliverables from MoM
         try:
             from api.routes.baseline import _is_title_match
-            db_cursor.execute("SELECT id, name, completion_status FROM scope_items WHERE project_id = %s", (project_id,))
+            import re
+            from datetime import datetime, date as date_type
+
+            MONTH_MAP = {
+                'january': 1, 'february': 2, 'march': 3, 'april': 4,
+                'may': 5, 'june': 6, 'july': 7, 'august': 8,
+                'september': 9, 'october': 10, 'november': 11, 'december': 12,
+                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
+                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+            }
+
+            def _extract_months(text: str) -> set:
+                if not text:
+                    return set()
+                t = text.lower()
+                found = set()
+                for m_name, m_num in MONTH_MAP.items():
+                    if re.search(r'\b' + re.escape(m_name) + r'\b', t):
+                        found.add(m_num)
+                return found
+
+            def _match_resolution_to_scope_item(resolved_item: dict, si: dict) -> bool:
+                res_name = resolved_item.get("name", "")
+                res_ev = resolved_item.get("resolution_evidence", "")
+                si_name = si["name"] if isinstance(si, dict) else si[1]
+                si_rec = bool(si.get("is_recurring") if isinstance(si, dict) else (si[3] if len(si) > 3 else False))
+                si_pid = si.get("parent_scope_item_id") if isinstance(si, dict) else (si[4] if len(si) > 4 else None)
+                si_dl = si.get("deadline") if isinstance(si, dict) else (si[5] if len(si) > 5 else None)
+
+                # Child occurrence of a recurring commitment
+                if si_rec and si_pid is not None:
+                    si_base = re.sub(r'\s*[—\-–]\s*[A-Za-z]{3,9}\s*\d{4}.*$', '', si_name).strip()
+                    if not (_is_title_match(res_name, si_name) or _is_title_match(res_name, si_base)):
+                        return False
+                    occ_months = set()
+                    if si_dl:
+                        try:
+                            d = si_dl if isinstance(si_dl, (date_type, datetime)) else datetime.strptime(str(si_dl)[:10], '%Y-%m-%d').date()
+                            occ_months.add(d.month)
+                        except Exception:
+                            pass
+                    occ_months |= _extract_months(si_name)
+                    res_months = _extract_months(res_name) | _extract_months(res_ev)
+                    if res_months:
+                        return bool(occ_months & res_months)
+                    return False
+
+                # Parent of a recurring commitment (ongoing continuous process)
+                if si_rec and si_pid is None:
+                    return False
+
+                # Standard non-recurring deliverable
+                return _is_title_match(res_name, si_name)
+
+            db_cursor.execute("SELECT id, name, completion_status, is_recurring, parent_scope_item_id, deadline FROM scope_items WHERE project_id = %s", (project_id,))
             current_scope_items = db_cursor.fetchall() or []
             
             for resolved in resolved_items:
@@ -2505,7 +2798,7 @@ class RiskEvaluationAgent:
                     si_name = si["name"] if isinstance(si, dict) else si[1]
                     si_status = si["completion_status"] if isinstance(si, dict) else si[2]
                     
-                    if si_status != 'COMPLETED' and _is_title_match(res_name, si_name):
+                    if si_status != 'COMPLETED' and _match_resolution_to_scope_item(resolved, si):
                         db_cursor.execute(
                             "UPDATE scope_items SET completion_status = 'COMPLETED' WHERE id = %s",
                             (si_id,)
@@ -2517,7 +2810,7 @@ class RiskEvaluationAgent:
                             for pm in pms:
                                 pm_id = pm["id"] if isinstance(pm, dict) else pm[0]
                                 pm_name = pm["name"] if isinstance(pm, dict) else pm[1]
-                                if _is_title_match(si_name, pm_name) or _is_title_match(res_name, pm_name):
+                                if _is_title_match(si_name, pm_name):
                                     db_cursor.execute(
                                         "UPDATE project_milestones SET status = 'Completed' WHERE id = %s",
                                         (pm_id,)
@@ -2527,7 +2820,7 @@ class RiskEvaluationAgent:
                             print(f"  [MilestoneSync Error] {e}")
                         print(f"  [DeliverableSync] Synchronized scope deliverable #{si_id} '{si_name}' to COMPLETED from MoM evidence")
 
-            # Also ensure all project_milestones matching already completed scope items are marked Completed
+            # Also ensure all project_milestones matching already completed non-recurring scope items are marked Completed
             try:
                 db_cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
                 all_pms = db_cursor.fetchall() or []
@@ -2539,7 +2832,8 @@ class RiskEvaluationAgent:
                         for si in current_scope_items:
                             si_name = si["name"] if isinstance(si, dict) else si[1]
                             si_status = si["completion_status"] if isinstance(si, dict) else si[2]
-                            if si_status == "COMPLETED" and _is_title_match(si_name, pm_name):
+                            si_rec = bool(si.get("is_recurring") if isinstance(si, dict) else (si[3] if len(si) > 3 else False))
+                            if si_status == "COMPLETED" and not si_rec and _is_title_match(si_name, pm_name):
                                 db_cursor.execute(
                                     "UPDATE project_milestones SET status = 'Completed' WHERE id = %s",
                                     (pm_id,)
@@ -2555,7 +2849,7 @@ class RiskEvaluationAgent:
                 si_name = si["name"] if isinstance(si, dict) else si[1]
                 si_status = si["completion_status"] if isinstance(si, dict) else si[2]
                 
-                is_completed_now = (si_status == 'COMPLETED') or any(_is_title_match(resolved.get("name", ""), si_name) for resolved in resolved_items)
+                is_completed_now = (si_status == 'COMPLETED') or any(_match_resolution_to_scope_item(resolved, si) for resolved in resolved_items)
                 if is_completed_now:
                     db_cursor.execute(
                         "SELECT dependencies FROM deliverable_progress WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1",

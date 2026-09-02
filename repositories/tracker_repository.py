@@ -24,6 +24,11 @@ class TrackerRepository:
                     "ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(40) NULL COMMENT 'Graph-derived role: ROOT_CAUSE, EXECUTION_BLOCKER, DOWNSTREAM_ACTIVITY, etc.'",
                     "ALTER TABLE tracker_items ADD COLUMN canonical_id VARCHAR(40) NULL COMMENT 'Canonical entity ID from EntityResolver registry'",
                     "ALTER TABLE tracker_items ADD COLUMN risk_severity_score INT NULL COMMENT 'Risk severity score, independent of execution_priority_score'",
+                    # Recurring commitment columns on scope_items (safe ALTER TABLE — idempotent)
+                    "ALTER TABLE scope_items ADD COLUMN is_recurring TINYINT(1) NOT NULL DEFAULT 0",
+                    "ALTER TABLE scope_items ADD COLUMN recurrence_cadence VARCHAR(20) NULL COMMENT 'monthly, weekly, biweekly, quarterly, annually, daily'",
+                    "ALTER TABLE scope_items ADD COLUMN parent_scope_item_id INT NULL COMMENT 'NULL for parent recurring item; set for child occurrence rows'",
+                    "ALTER TABLE scope_items ADD COLUMN occurrence_label VARCHAR(50) NULL COMMENT 'Human label for this occurrence: Month 1, Q2, Week 3, etc.'",
                 ]
                 for sql in new_columns:
                     try:
