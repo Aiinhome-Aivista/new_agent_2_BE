@@ -720,7 +720,7 @@ def _is_title_match(a: str, b: str) -> bool:
     if a_clean == b_clean:
         return True
 
-    # Check for period/month or year conflict (e.g. May 2026 vs Aug 2026)
+    # Check for period/month or year conflict (e.g. May 2026 vs Aug 2026 vs generic CSI)
     MONTH_TOKENS = {
         'january', 'february', 'march', 'april', 'may', 'june',
         'july', 'august', 'september', 'october', 'november', 'december',
@@ -728,12 +728,21 @@ def _is_title_match(a: str, b: str) -> bool:
     }
     months_a = {w for w in re.findall(r'\b[a-zA-Z]+\b', a.lower()) if w in MONTH_TOKENS}
     months_b = {w for w in re.findall(r'\b[a-zA-Z]+\b', b.lower()) if w in MONTH_TOKENS}
+    
+    # If both specify different months -> Conflict!
     if months_a and months_b and not (months_a & months_b):
+        return False
+
+    # If one specifies a month and the other does not -> Conflict!
+    # A generic activity title cannot match a specific monthly occurrence.
+    if bool(months_a) != bool(months_b):
         return False
 
     years_a = {w for w in re.findall(r'\b20\d{2}\b', a)}
     years_b = {w for w in re.findall(r'\b20\d{2}\b', b)}
     if years_a and years_b and not (years_a & years_b):
+        return False
+    if bool(years_a) != bool(years_b) and (months_a or months_b):
         return False
 
     # 1. Parenthetical aliases
