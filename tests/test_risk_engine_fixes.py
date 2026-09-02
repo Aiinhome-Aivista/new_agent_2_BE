@@ -909,6 +909,205 @@ def test_bug_3_composite_milestone_subphase_resolution():
     assert "Independent Custom Report" not in resolved, "Unrelated items must NOT be resolved"
 
 
+def test_pending_confirmation_suggest_resolution():
+    """Verify suggest_resolution marks items as PENDING_CONFIRMATION with pending_suggestion metadata."""
+    from agents.tracker_audit_agent import TrackerAuditAgent, suggest_resolution
+    import json
+
+    class MockCursor:
+        def __init__(self):
+            self.items = [{
+                "id": 42,
+                "title": "Azure AD Single Sign-On (SSO)",
+                "reasoning": json.dumps({"owner": "Internal", "text": "Initial blocker"})
+            }]
+            self.updates = []
+            self.audit_logs = []
+
+        def execute(self, query, params=None):
+            q_clean = " ".join(query.split()).upper()
+            if "SELECT ID, TITLE, REASONING FROM TRACKER_ITEMS" in q_clean:
+                pass
+            elif "UPDATE TRACKER_ITEMS" in q_clean:
+                self.updates.append((query, params))
+            elif "INSERT INTO AUDIT_LOGS" in q_clean:
+                self.audit_logs.append((query, params))
+
+        def fetchall(self):
+            return self.items
+
+    mock_db = MockCursor()
+    TrackerAuditAgent.suggest_resolution(
+        mock_db,
+        project_id=49,
+        document_id=101,
+        title="Azure AD Single Sign-On (SSO)",
+        reason="LLM identified this as resolved with 85% confidence.",
+        evidence="Azure AD completed in sprint 4.",
+        suggestion_source="LLMConfidence"
+    )
+
+    assert len(mock_db.updates) == 1, "Should execute exactly one UPDATE query"
+    up_query, up_params = mock_db.updates[0]
+    assert "risk_status = 'PENDING_CONFIRMATION'" in up_query
+    
+    updated_reasoning_str = up_params[0]
+    updated_doc_id = up_params[1]
+    updated_item_id = up_params[2]
+    
+    assert updated_item_id == 42
+    assert updated_doc_id == 101
+    
+    parsed = json.loads(updated_reasoning_str)
+    assert parsed["owner"] == "Internal"
+    assert "pending_suggestion" in parsed
+    assert parsed["pending_suggestion"]["source"] == "LLMConfidence"
+    assert parsed["pending_suggestion"]["reason"] == "LLM identified this as resolved with 85% confidence."
+    assert parsed["pending_suggestion"]["document_id"] == 101
+
+    assert len(mock_db.audit_logs) == 1, "Should insert one audit log"
+    audit_query, audit_params = mock_db.audit_logs[0]
+    assert "SUGGESTED_RESOLUTION" in audit_query
+    print("  [PendingConfirmation] suggest_resolution validated successfully!")
+
+
+def test_completion_normalizer_3tier():
+    """Verifies 3-tier classification: HIGH auto-resolves, MEDIUM suggests, LOW stays open."""
+    import re
+    from agents.risk_evaluation_agent import _normalize_completion_signals
+
+    # Inline the classifier logic for isolated testing
+    HIGH = {"completed","executed","passed","approved","signed off","delivered",
+            "deployed","finalized","closed","finished","handed over","accepted",
+            "validated","resolved","implemented","launched","released",
+            "final acceptance","go-live","commissioned","signed","certified",
+            "authorized","ratified"}
+    MEDIUM = {"done","ready","live","working","stable","running","shipped",
+              "merged","wrapped up","wrapped","concluded","confirmed","verified",
+              "reviewed","submitted","conducted","sent","provided","received",
+              "shared","published","up and running","in production","went live"}
+    PARTIAL = [r'\bmost\s+of\b',r'\bsome\s+of\b',r'\bpartially?\b',
+               r'\b\d+\s*%\b',r'\balmost\b',r'\bnearly\b',r'\bprimarily\b',
+               r'\bstill\s+\w+ing\b',r'\binformal\w*\b',r'\bseems?\b',r'\bappears?\b']
+    IN_PROG = [r'\bbeing\s+\w+',r'\bunder\s+\w+',r'\bcurrently\s+\w+ing\b',
+               r'\bin\s+progress\b',r'\bunderway\b',r'\bongoing\b',
+               r'\bscheduled\b',r'\bplanned\b']
+    BLOCK_P = [r'\bcannot\s+begin\s+until\b',r'\bcannot\s+start\s+until\b',
+               r'\bwill\s+not\s+begin\s+until\b',r'\bwill\s+not\s+start\s+until\b',
+               r'\bnot\s+.*\s+until\b',r'\bblocked\s+until\b',
+               r'\bwaiting\s+until\b',r'\bdepends\s+on\b',
+               r'\bpending\s+.*\s+completion\b',r'\bno\s+\w+\s+activities?\s+can\b',
+               r'\bcannot\s+proceed\s+until\b']
+    BLOCK_S = {"failed","blocked","critical","major issue","major problem",
+               "not started","pending","rejected","escalated","halted",
+               "stopped","cancelled","on hold","overdue","delayed","deferred",
+               "slip","depends on","depend on","depending on",
+               "cannot begin","cannot start","waiting for","waiting on",
+               "waits for","waits on","prerequisite","pre-requisite",
+               "subject to","prior to"}
+
+    def classify(s):
+        sl = s.lower()
+        if any(re.search(p, sl) for p in BLOCK_P): return 'LOW'
+        for sig in BLOCK_S:
+            if re.search(r'\b'+re.escape(sig)+r'\b', sl): return 'LOW'
+        if any(re.search(p, sl) for p in IN_PROG): return 'LOW'
+        partial = any(re.search(p, sl) for p in PARTIAL)
+        for v in HIGH:
+            if re.search(r'\b'+re.escape(v)+r'\b', sl):
+                return 'MEDIUM' if partial else 'HIGH'
+        for v in MEDIUM:
+            if re.search(r'\b'+re.escape(v)+r'\b', sl):
+                return 'LOW' if partial else 'MEDIUM'
+        return 'LOW'
+
+    cases = [
+        ("CRM Integration completed after receiving credentials", "HIGH"),
+        ("SIT executed successfully", "HIGH"),
+        ("UAT executed with minor enhancements only", "HIGH"),
+        ("Smoke testing passed", "HIGH"),
+        ("Knowledge transfer handed over to client", "HIGH"),
+        ("Customer provided final acceptance", "HIGH"),
+        ("Feature is live and running in production", "MEDIUM"),
+        ("Integration is up and running", "MEDIUM"),
+        ("Build has been merged and is stable", "MEDIUM"),
+        ("Testing is now wrapped up", "MEDIUM"),
+        ("Knowledge transfer sessions conducted", "MEDIUM"),
+        ("Team reviewed the implementation", "MEDIUM"),
+        ("Documentation is being finalized", "LOW"),
+        ("Most of the integration work is done", "LOW"),
+        ("CRM Integration is 90% complete", "LOW"),
+        ("UAT testing is currently underway", "LOW"),
+        ("SIT environment is being prepared", "LOW"),
+        ("QA team has reviewed it informally", "LOW"),
+        ("No deployment activities can begin until UAT is completed", "LOW"),
+    ]
+
+    failed = []
+    for sentence, expected in cases:
+        result = classify(sentence)
+        if result != expected:
+            failed.append(f"  FAIL: [{result}] expected [{expected}]: {sentence}")
+
+    if failed:
+        print("test_completion_normalizer_3tier FAILED:")
+        for f in failed: print(f)
+        assert False, f"{len(failed)} classification failures"
+    else:
+        print("  [CompletionNormalizer] test_completion_normalizer_3tier PASSED - all 19 cases correct")
+
+    # Also test _normalize_completion_signals directly with mock DB
+    class MockCursor:
+        def __init__(self):
+            self.items = [{
+                "id": 99,
+                "title": "Feature Flag Integration",
+                "reasoning": "{}"
+            }]
+            self.updates = []
+            self.audit_logs = []
+
+        def execute(self, query, params=None):
+            q_clean = " ".join(query.split()).upper()
+            if "UPDATE TRACKER_ITEMS" in q_clean:
+                self.updates.append((query, params))
+            elif "INSERT INTO AUDIT_LOGS" in q_clean:
+                self.audit_logs.append((query, params))
+
+        def fetchall(self):
+            return self.items
+
+    mock_db = MockCursor()
+    extraction_input = {
+        "raw_activities": [
+            {"statement": "Core Service", "source_sentence": "Core Service completed and deployed.", "confidence": 0.9},
+            {"statement": "Feature Flag Integration", "source_sentence": "Feature Flag Integration is live and running in production.", "confidence": 0.8},
+            {"statement": "Legacy Migration", "source_sentence": "Legacy Migration is currently underway.", "confidence": 0.5},
+        ],
+        "resolved_items": []
+    }
+
+    res = _normalize_completion_signals(
+        extraction_input,
+        db_cursor=mock_db,
+        project_id=49,
+        document_id=200
+    )
+
+    resolved_names = [r["name"] for r in res["resolved_items"]]
+    raw_names = [a["statement"] for a in res["raw_activities"]]
+
+    # Core Service (HIGH) promoted to resolved
+    assert "Core Service" in resolved_names
+    # Feature Flag Integration (MEDIUM) suggested to PM and left in raw_activities
+    assert "Feature Flag Integration" in raw_names
+    assert len(mock_db.updates) == 1
+    assert "PENDING_CONFIRMATION" in mock_db.updates[0][0]
+    # Legacy Migration (LOW) stays in raw_activities with no extra update
+    assert "Legacy Migration" in raw_names
+    print("  [CompletionNormalizer] Functional 3-tier pipeline execution verified successfully!")
+
+
 if __name__ == "__main__":
     test_problem_1_root_causes_consistent_and_stateless()
     test_problem_2_band_hierarchy_and_ranking()
@@ -940,8 +1139,10 @@ if __name__ == "__main__":
     test_bug_2_owner_preservation_on_resolve()
     test_bug_4_validate_matched_baseline_item()
     test_bug_3_composite_milestone_subphase_resolution()
+    test_pending_confirmation_suggest_resolution()
+    test_completion_normalizer_3tier()
     print("\n" + "=" * 60)
-    print(" ALL PROBLEMS & BUGS 1-4 VERIFIED SUCCESSFULLY! ")
+    print(" ALL PROBLEMS & BUGS 1-4 + 3-TIER NORMALIZER VERIFIED! ")
     print("=" * 60)
 
 

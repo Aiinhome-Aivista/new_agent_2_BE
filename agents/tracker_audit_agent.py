@@ -42,7 +42,112 @@ def _embed_owner_in_reasoning(reasoning: str, owner: str) -> str:
     except Exception:
         return json.dumps({"text": str(reasoning or ""), "owner": owner})
 
+def suggest_resolution(db_cursor, project_id: int, document_id: int,
+                       title: str, reason: str, evidence: str,
+                       suggestion_source: str) -> None:
+    """
+    Marks an existing OPEN tracker item as PENDING_CONFIRMATION instead of
+    resolving it outright. The PM sees it as a suggestion and can Confirm or Dismiss.
+
+    - Does NOT change status (item stays OPEN so it appears in execution queue)
+    - Sets risk_status = 'PENDING_CONFIRMATION'
+    - Stores the suggestion reason and evidence in a new JSON field in reasoning
+    - Writes an audit log entry with action='SUGGESTED_RESOLUTION'
+    - Generic: works for any tracker item type
+
+    suggestion_source: label for what generated the suggestion
+                       (e.g. 'RiskReconciliation', 'LLMConfidence', 'ProjectClosure')
+    """
+    import re, json
+    try:
+        norm_title = re.sub(r'[^\w\s]', '', (title or '').lower().strip())
+
+        # Find the existing OPEN tracker item
+        db_cursor.execute(
+            "SELECT id, title, reasoning FROM tracker_items WHERE project_id = %s AND status = 'OPEN' ORDER BY id DESC",
+            (project_id,)
+        )
+        rows = db_cursor.fetchall() or []
+        matched_id = None
+        matched_reasoning = None
+
+        for row in rows:
+            existing_title = row.get('title', '') if isinstance(row, dict) else (row[1] if len(row) > 1 else '')
+            existing_id = row.get('id') if isinstance(row, dict) else row[0]
+            existing_reasoning = row.get('reasoning') if isinstance(row, dict) else (row[2] if len(row) > 2 else '')
+            norm_existing = re.sub(r'[^\w\s]', '', (existing_title or '').lower().strip())
+            if norm_title and norm_existing == norm_title:
+                matched_id = existing_id
+                matched_reasoning = existing_reasoning
+                break
+            # Fuzzy fallback
+            try:
+                from api.routes.baseline import _is_title_match
+                if _is_title_match(title, existing_title):
+                    matched_id = existing_id
+                    matched_reasoning = existing_reasoning
+                    break
+            except Exception:
+                pass
+
+        if not matched_id:
+            # Item doesn't exist yet — nothing to suggest on
+            print(f"  [SuggestResolution] No OPEN item found for '{title}' — skipping suggestion")
+            return
+
+        # Append suggestion metadata to reasoning JSON
+        try:
+            r_parsed = json.loads(matched_reasoning) if matched_reasoning else {}
+            if not isinstance(r_parsed, dict):
+                r_parsed = {"text": str(matched_reasoning)}
+        except Exception:
+            r_parsed = {"text": str(matched_reasoning or "")}
+
+        r_parsed["pending_suggestion"] = {
+            "reason": reason,
+            "evidence": (evidence or "")[:500],
+            "source": suggestion_source,
+            "document_id": document_id
+        }
+        new_reasoning = json.dumps(r_parsed)
+
+        db_cursor.execute("""
+            UPDATE tracker_items
+            SET risk_status = 'PENDING_CONFIRMATION',
+                reasoning = %s,
+                source_document_id = %s
+            WHERE id = %s
+        """, (new_reasoning, document_id, matched_id))
+
+        # Audit log
+        audit_details = json.dumps({
+            "suggestion_source": suggestion_source,
+            "reason": reason,
+            "evidence": (evidence or "")[:200],
+            "source_document_id": document_id
+        })
+        try:
+            db_cursor.execute("""
+                INSERT INTO audit_logs
+                (project_id, agent_name, action, entity_type, entity_id, details_json)
+                VALUES (%s, 'SuggestionAgent', 'SUGGESTED_RESOLUTION', 'TRACKER_ITEM', %s, %s)
+            """, (project_id, matched_id, audit_details))
+        except Exception as e:
+            print(f"  [SuggestResolution] Warning: audit log failed: {e}")
+
+        print(f"  [SuggestResolution] Suggested resolution for '{title}' "
+              f"(source: {suggestion_source}). PM confirmation required.")
+    except Exception as e:
+        print(f"  [SuggestResolution] Error suggesting resolution for '{title}': {e}")
+
+
 class TrackerAuditAgent:
+    @classmethod
+    def suggest_resolution(cls, db_cursor, project_id: int, document_id: int,
+                           title: str, reason: str, evidence: str,
+                           suggestion_source: str) -> None:
+        return suggest_resolution(db_cursor, project_id, document_id, title, reason, evidence, suggestion_source)
+
     @classmethod
     def persist_tracker_item(cls, db_cursor, project_id: int, document_id: int, item_type: str,
                              is_out_of_scope: bool, risk_score: int, risk_level: str,

@@ -20,7 +20,7 @@ class TrackerRepository:
                     "ALTER TABLE tracker_items ADD COLUMN execution_priority_score INT NULL",
                     # New decoupled status and graph metadata columns
                     "ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(60) NULL COMMENT 'Operational status from document: WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, IN_PROGRESS'",
-                    "ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(30) NULL DEFAULT 'OPEN' COMMENT 'Risk lifecycle: OPEN, RESOLVED, NO_ACTIVE_RISK'",
+                    "ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(30) NULL DEFAULT 'OPEN' COMMENT 'Risk lifecycle: OPEN, RESOLVED, PENDING_CONFIRMATION, NO_ACTIVE_RISK'",
                     "ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(40) NULL COMMENT 'Graph-derived role: ROOT_CAUSE, EXECUTION_BLOCKER, DOWNSTREAM_ACTIVITY, etc.'",
                     "ALTER TABLE tracker_items ADD COLUMN canonical_id VARCHAR(40) NULL COMMENT 'Canonical entity ID from EntityResolver registry'",
                     "ALTER TABLE tracker_items ADD COLUMN risk_severity_score INT NULL COMMENT 'Risk severity score, independent of execution_priority_score'",
