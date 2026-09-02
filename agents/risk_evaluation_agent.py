@@ -100,8 +100,8 @@ def _validate_matched_baseline_item(
 
     if best_match != matched_baseline_item:
         print(f"  [MatchCorrection] '{activity_name}': corrected matched_baseline_item "
-              f"'{matched_baseline_item}' → '{best_match}' "
-              f"(overlap improved {overlap:.2f} → {best_overlap:.2f})")
+              f"'{matched_baseline_item}' -> '{best_match}' "
+              f"(overlap improved {overlap:.2f} -> {best_overlap:.2f})")
 
     return best_match
 
@@ -211,42 +211,83 @@ def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
 
 
 # ---------------------------------------------------------------------------
-# FIX 6: DETERMINISTIC COMPLETION NORMALIZER
+# FIX 6: DETERMINISTIC COMPLETION NORMALIZER (3-TIER CLASSIFIER)
 # ---------------------------------------------------------------------------
 
-def _normalize_completion_signals(extraction_result: dict) -> dict:
+def _normalize_completion_signals(extraction_result: dict,
+                                  db_cursor=None, project_id: int = None,
+                                  document_id: int = None) -> dict:
     """
-    FIX 6 & BUG 1 FIX: Deterministically moves activities to resolved_items when the source_sentence
-    contains past-tense completion signals combined with minor-qualifier words,
-    guarded against negative blocking contexts.
+    3-Tier completion signal classifier. Runs after Step 2A LLM extraction,
+    before the main pipeline. No LLM call.
 
-    This runs AFTER Step 2A LLM extraction and BEFORE the main pipeline.
-    It does not call the LLM again.
+    TIER 1 — HIGH confidence: MoM uses explicit past-tense completion verbs.
+              Action: auto-resolve immediately.
+
+    TIER 2 — MEDIUM confidence: MoM context strongly implies completion
+              but verb is informal or indirect (e.g. "live", "stable", "wrapped up").
+              Action: call suggest_resolution() so PM sees a confirmation prompt.
+              Item stays OPEN in the execution queue until PM confirms or dismisses.
+
+    TIER 3 — LOW confidence: In-progress, partial, ambiguous, or no signal.
+              Action: leave OPEN. Do not ask PM. No noise.
+
+    All verb lists and patterns are generic — no project-specific keywords.
+    Function signature adds 3 optional params (all default None) so existing
+    callers with 1 argument still work without change.
     """
     import re
 
-    COMPLETION_VERBS = {
-        "executed", "completed", "passed", "approved",
-        "signed off", "delivered", "deployed", "finalized",
-        "closed", "finished", "handed over", "accepted",
-        "validated", "resolved", "done", "implemented",
-        "launched", "released", "final acceptance"
+    # ── TIER 1: HIGH confidence verbs ────────────────────────────────────────
+    # Explicit past-tense completion. MoM literally says it is done.
+    HIGH_CONFIDENCE_VERBS = {
+        "completed", "executed", "passed", "approved", "signed off",
+        "delivered", "deployed", "finalized", "closed", "finished",
+        "handed over", "accepted", "validated", "resolved", "implemented",
+        "launched", "released", "final acceptance", "go-live",
+        "commissioned", "signed", "certified", "authorized", "ratified",
     }
 
-    # Signals that indicate work is NOT complete, is blocked, is waiting, or has dependencies
-    BLOCKER_AND_DEPENDENCY_SIGNALS = {
-        "failed", "blocked", "critical", "major issue",
-        "major problem", "not started", "pending", "rejected",
-        "escalated", "halted", "stopped", "cancelled",
-        "on hold", "overdue", "delayed", "deferred", "slip",
-        "depends on", "depend on", "depending on",
-        "cannot begin", "cannot start", "can not begin", "can not start",
-        "waiting for", "waiting on", "waits for", "waits on",
-        "after credentials", "after crm", "after completion", "completion of",
-        "prerequisite", "pre-requisite", "subject to", "prior to",
-        "in progress", "underway", "ongoing", "scheduled", "planned"
+    # ── TIER 2: MEDIUM confidence verbs ──────────────────────────────────────
+    # Contextually implies completion but less explicit. Needs PM confirmation.
+    MEDIUM_CONFIDENCE_VERBS = {
+        "done", "ready", "live", "working", "stable", "running",
+        "shipped", "merged", "wrapped up", "wrapped", "concluded",
+        "confirmed", "verified", "reviewed", "submitted", "conducted",
+        "sent", "provided", "received", "shared", "published",
+        "up and running", "in production", "went live",
     }
 
+    # ── PATTERNS that downgrade HIGH → MEDIUM (partial completion) ───────────
+    # e.g. "mostly done", "almost finalized", "90% completed"
+    PARTIAL_COMPLETION_PATTERNS = [
+        r'\bmost\s+of\b',
+        r'\bsome\s+of\b',
+        r'\bpartially?\b',
+        r'\b\d+\s*%\b',
+        r'\balmost\b',
+        r'\bnearly\b',
+        r'\bprimarily\b',
+        r'\bstill\s+\w+ing\b',
+        r'\binformal\w*\b',
+        r'\bseems?\b',
+        r'\bappears?\b',
+    ]
+
+    # ── PATTERNS that force LOW regardless of any verb found ─────────────────
+    # e.g. "being finalized", "currently underway", "in progress"
+    IN_PROGRESS_PATTERNS = [
+        r'\bbeing\s+\w+',
+        r'\bunder\s+\w+',
+        r'\bcurrently\s+\w+ing\b',
+        r'\bin\s+progress\b',
+        r'\bunderway\b',
+        r'\bongoing\b',
+        r'\bscheduled\b',
+        r'\bplanned\b',
+    ]
+
+    # ── PATTERNS that block all resolution (explicit negative context) ────────
     BLOCKING_CONTEXT_PATTERNS = [
         r'\bcannot\s+begin\s+until\b',
         r'\bcannot\s+start\s+until\b',
@@ -261,58 +302,66 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
         r'\bcannot\s+proceed\s+until\b',
     ]
 
+    BLOCKER_SIGNALS = {
+        "failed", "blocked", "critical", "major issue", "major problem",
+        "not started", "pending", "rejected", "escalated", "halted",
+        "stopped", "cancelled", "on hold", "overdue", "delayed", "deferred",
+        "slip", "depends on", "depend on", "depending on",
+        "cannot begin", "cannot start", "waiting for", "waiting on",
+        "waits for", "waits on", "prerequisite", "pre-requisite",
+        "subject to", "prior to",
+    }
+
     def _sentence_lower(act):
-        return (act.get("source_sentence") or act.get("statement") or act.get("activity") or "").lower()
+        return (act.get("source_sentence") or act.get("statement")
+                or act.get("activity") or "").lower()
 
-    def _has_completion_verb(sentence):
-        for verb in COMPLETION_VERBS:
-            pattern = r'\b' + re.escape(verb) + r'\b'
-            if re.search(pattern, sentence):
+    def _is_blocked(sentence: str) -> bool:
+        for p in BLOCKING_CONTEXT_PATTERNS:
+            if re.search(p, sentence):
+                return True
+        for sig in BLOCKER_SIGNALS:
+            if re.search(r'\b' + re.escape(sig) + r'\b', sentence):
                 return True
         return False
 
-    def _has_blocking_context(sentence: str) -> bool:
+    def _classify_tier(sentence: str):
         """
-        Returns True if the sentence describes a blocking condition rather than
-        an actual completion. Prevents false promotion when completion verbs appear
-        in conditional/dependency clauses.
-        Generic: matches structural patterns, not project-specific keywords.
+        Returns ('HIGH'|'MEDIUM'|'LOW', matched_verb_or_reason).
+        Generic: no project-specific logic anywhere.
         """
-        sentence_lower = sentence.lower()
-        for pattern in BLOCKING_CONTEXT_PATTERNS:
-            if re.search(pattern, sentence_lower):
-                return True
-        return False
+        if _is_blocked(sentence):
+            return 'LOW', 'blocked_context'
 
-    def _has_blocker_or_dependency(sentence, act=None):
-        verb = (act.get("verb") or "").lower().strip() if act else ""
-        if verb in COMPLETION_VERBS:
-            if re.search(r'\b(not|pending|cannot|can not|failed|blocked|halted|stopped|delayed|deferred|on hold)\b', sentence):
-                return True
-            return False
+        for p in IN_PROGRESS_PATTERNS:
+            if re.search(p, sentence):
+                return 'LOW', 'in_progress'
 
-        for signal in BLOCKER_AND_DEPENDENCY_SIGNALS:
-            pattern = r'\b' + re.escape(signal) + r'\b'
-            if re.search(pattern, sentence):
-                if signal.startswith("after") and re.search(r'\b(completed|executed|passed|signed off|delivered|deployed|finalized)\b.*\bafter\b', sentence):
-                    continue
-                return True
-        if re.search(r'\b(cannot|can not)\b.*\buntil\b', sentence):
-            return True
-        if re.search(r'\b(will start|cannot start|cannot begin)\b.*\bafter\b', sentence):
-            return True
-        return False
+        is_partial = any(re.search(p, sentence) for p in PARTIAL_COMPLETION_PATTERNS)
 
-    raw_activities = extraction_result.get("raw_activities") or extraction_result.get("activities") or extraction_result.get("extractions") or []
+        for verb in HIGH_CONFIDENCE_VERBS:
+            if re.search(r'\b' + re.escape(verb) + r'\b', sentence):
+                return ('MEDIUM', verb) if is_partial else ('HIGH', verb)
+
+        for verb in MEDIUM_CONFIDENCE_VERBS:
+            if re.search(r'\b' + re.escape(verb) + r'\b', sentence):
+                return ('LOW', verb) if is_partial else ('MEDIUM', verb)
+
+        return 'LOW', None
+
+    # ── MAIN LOOP ─────────────────────────────────────────────────────────────
+    raw_activities = (extraction_result.get("raw_activities")
+                      or extraction_result.get("activities")
+                      or extraction_result.get("extractions") or [])
     resolved_items = extraction_result.get("resolved_items", [])
 
-    # Build set of already-resolved names for dedup
     already_resolved = {
         r.get("name", "").lower().strip()
         for r in resolved_items if r.get("name")
     }
 
     promoted = []
+    suggested = []
     remaining = []
 
     for act in raw_activities:
@@ -320,55 +369,82 @@ def _normalize_completion_signals(extraction_result: dict) -> dict:
         sentence = _sentence_lower(act)
         name_lower = name.lower().strip()
 
-        # Skip if already resolved
-        if name_lower in already_resolved:
+        if name_lower in already_resolved or act.get("_early_exit_resolved"):
             remaining.append(act)
             continue
 
-        if act.get("_early_exit_resolved"):
-            remaining.append(act)
-            continue
+        tier, matched = _classify_tier(sentence)
 
-        # BUG 1 FIX: If sentence has blocking/conditional context, do NOT promote
-        if _has_blocking_context(sentence):
-            remaining.append(act)
-            continue
-
-        # If it has a completion verb AND does NOT have any blocker or dependency phrasing
-        if _has_completion_verb(sentence) and not _has_blocker_or_dependency(sentence, act):
-            resolved_entry = {
+        if tier == 'HIGH':
+            # MoM explicitly says done — auto-resolve, same as current behavior
+            resolved_items.append({
                 "name": name,
                 "resolution_evidence": act.get("source_sentence", sentence),
                 "confidence": act.get("confidence", 0.9)
-            }
-            resolved_items.append(resolved_entry)
+            })
             already_resolved.add(name_lower)
             promoted.append(name)
-            print(f"  [CompletionNormalizer] Promoted to RESOLVED: '{name}' (sentence: '{sentence[:80]}...')")
+            print(f"  [CompletionNormalizer] HIGH -> AUTO-RESOLVED: "
+                  f"'{name}' (verb='{matched}', sentence='{sentence[:80]}')")
 
-            # Generic prerequisite fulfillment extraction: e.g. "after receiving production credentials and VPN access"
-            prereq_match = re.search(r'\b(?:after receiving|following receipt of|upon receiving|after obtaining|after securing|with the provision of|received|granted)\s+([^.]+)', sentence, re.IGNORECASE)
+            # Prerequisite fulfillment extraction (unchanged from original)
+            prereq_match = re.search(
+                r'\b(?:after receiving|following receipt of|upon receiving|'
+                r'after obtaining|after securing|with the provision of|received|granted)'
+                r'\s+([^.]+)', sentence, re.IGNORECASE)
             if prereq_match:
                 prereq_raw = prereq_match.group(1).strip()
                 parts = re.split(r'\s+and\s+|,\s*|\s*&\s*', prereq_raw)
                 for p in parts:
-                    p_clean = re.sub(r'^(?:the|all|necessary|required)\s+', '', p.strip(), flags=re.IGNORECASE).strip()
+                    p_clean = re.sub(r'^(?:the|all|necessary|required)\s+', '',
+                                     p.strip(), flags=re.IGNORECASE).strip()
                     p_clean = re.sub(r'[.,;]+$', '', p_clean).strip()
-                    if len(p_clean) >= 3 and p_clean.lower() not in already_resolved and not re.search(r'\b(completed|done|finished|deployed|tested)\b', p_clean.lower()):
+                    if (len(p_clean) >= 3
+                            and p_clean.lower() not in already_resolved
+                            and not re.search(
+                                r'\b(completed|done|finished|deployed|tested)\b',
+                                p_clean.lower())):
                         p_title = p_clean.title()
                         resolved_items.append({
                             "name": p_title,
-                            "resolution_evidence": f"Fulfilled prerequisite: {act.get('source_sentence', sentence)}",
+                            "resolution_evidence":
+                                f"Fulfilled prerequisite: {act.get('source_sentence', sentence)}",
                             "confidence": 0.95
                         })
                         already_resolved.add(p_clean.lower())
                         promoted.append(p_title)
-                        print(f"  [CompletionNormalizer] Extracted fulfilled prerequisite to RESOLVED: '{p_title}'")
+                        print(f"  [CompletionNormalizer] Prerequisite resolved: '{p_title}'")
+
+        elif tier == 'MEDIUM':
+            # MoM implies done but not explicit — ask PM to confirm
+            remaining.append(act)  # stays OPEN until PM confirms
+            suggested.append(name)
+            print(f"  [CompletionNormalizer] MEDIUM -> SUGGEST to PM: "
+                  f"'{name}' (verb='{matched}', sentence='{sentence[:80]}')")
+
+            if db_cursor and project_id and document_id:
+                try:
+                    from agents.tracker_audit_agent import TrackerAuditAgent
+                    TrackerAuditAgent.suggest_resolution(
+                        db_cursor, project_id, document_id,
+                        title=name,
+                        reason=(f"MoM implies this may be complete "
+                                f"('{matched}' detected) but wording is indirect. "
+                                f"Please confirm."),
+                        evidence=act.get("source_sentence", sentence),
+                        suggestion_source="CompletionNormalizer_MEDIUM"
+                    )
+                except Exception as e:
+                    print(f"  [CompletionNormalizer] Warning: suggest_resolution failed: {e}")
+
         else:
+            # LOW — stay OPEN, no action, no noise
             remaining.append(act)
 
     if promoted:
-        print(f"  [CompletionNormalizer] {len(promoted)} activities promoted to resolved: {promoted}")
+        print(f"  [CompletionNormalizer] {len(promoted)} auto-resolved: {promoted}")
+    if suggested:
+        print(f"  [CompletionNormalizer] {len(suggested)} pending PM confirmation: {suggested}")
 
     extraction_result["raw_activities"] = remaining
     extraction_result["activities"] = remaining
@@ -771,18 +847,23 @@ class RiskEvaluationAgent:
         # FIX 6: Deterministic completion normalization
         # Promotes activities with past-tense completion signals
         # to resolved_items WITHOUT calling the LLM again.
-        # Handles qualified language like "executed with minor enhancements only" → RESOLVED deterministically.
-        extraction_result = _normalize_completion_signals(extraction_result)
+        # Handles qualified language like "executed with minor enhancements only" -> RESOLVED deterministically.
+        extraction_result = _normalize_completion_signals(
+            extraction_result,
+            db_cursor=db_cursor,
+            project_id=project_id,
+            document_id=document_id
+        )
 
         # FIX 4: Deterministic project closure detection
         # Runs BEFORE main pipeline to catch end-of-project documents
         is_project_closed = _detect_project_closure(extraction_result, db_cursor, project_id)
 
         if is_project_closed:
-            print("[Pipeline] Project closure detected. Auto-resolving all open tracker items and completing milestones...")
+            print("[Pipeline] Project closure detected. Suggesting resolution for open tracker items (pending PM confirmation)...")
             import json
             db_cursor.execute("""
-                SELECT id, title FROM tracker_items
+                SELECT id, title, reasoning FROM tracker_items
                 WHERE project_id = %s AND status = 'OPEN'
             """, (project_id,))
             open_items = db_cursor.fetchall() or []
@@ -790,32 +871,48 @@ class RiskEvaluationAgent:
             for item in open_items:
                 item_id = item['id'] if isinstance(item, dict) else item[0]
                 item_title = item['title'] if isinstance(item, dict) else item[1]
+                item_reasoning = item.get('reasoning') if isinstance(item, dict) else (item[2] if len(item) > 2 else '')
+
+                # PRODUCT FIX: Project closure should suggest resolution, not force it.
+                # The PM may want to handle scope creep items (e.g., raise a CR)
+                # or other open items differently even at project end.
+                # Surface as PENDING_CONFIRMATION for PM to confirm or dismiss.
+                try:
+                    r_parsed = json.loads(item_reasoning) if item_reasoning else {}
+                    if not isinstance(r_parsed, dict):
+                        r_parsed = {"text": str(item_reasoning)}
+                except Exception:
+                    r_parsed = {"text": str(item_reasoning or "")}
+
+                r_parsed["pending_suggestion"] = {
+                    "reason": "Project closure detected — please confirm resolution.",
+                    "source": "ProjectClosure",
+                    "document_id": document_id
+                }
+                new_reasoning = json.dumps(r_parsed)
 
                 db_cursor.execute("""
                     UPDATE tracker_items
-                    SET status = 'RESOLVED',
-                        risk_score = 0,
-                        execution_priority_score = 0,
-                        resolved_at = NOW(),
-                        resolution = %s
+                    SET risk_status = 'PENDING_CONFIRMATION',
+                        reasoning = %s
                     WHERE id = %s
-                """, ("Project formally closed — all items auto-resolved", item_id))
+                """, (new_reasoning, item_id))
 
-                audit_details = json.dumps({
-                    "reason": "project_closure_auto_resolve",
-                    "signals_fired": "2+ of 3 closure signals",
-                    "source_document_id": document_id
-                })
                 try:
+                    audit_details = json.dumps({
+                        "reason": "project_closure_pending_confirmation",
+                        "signals_fired": "2+ of 3 closure signals",
+                        "source_document_id": document_id
+                    })
                     db_cursor.execute("""
                         INSERT INTO audit_logs
                         (project_id, agent_name, action, entity_type, entity_id, details_json)
-                        VALUES (%s, 'ClosureDetector', 'RESOLVED', 'TRACKER_ITEM', %s, %s)
+                        VALUES (%s, 'ClosureDetector', 'SUGGESTED_RESOLUTION', 'TRACKER_ITEM', %s, %s)
                     """, (project_id, item_id, audit_details))
                 except Exception as e:
                     print(f"  [Closure] Warning: Failed to insert audit log: {e}")
 
-                print(f"  [Closure] Auto-resolved: '{item_title}'")
+                print(f"  [Closure] Suggested resolution (pending PM confirmation): '{item_title}'")
 
             # 2. Synchronize project milestones to Completed
             try:
@@ -1381,14 +1478,17 @@ class RiskEvaluationAgent:
         print("="*70 + "\n")
         
         for risk, reason, res_type in risks_to_resolve:
-            TrackerAuditAgent.persist_tracker_item(
-                db_cursor, project_id, document_id, risk.get("item_type", "ACTIVITY"),
-                False, 0, 'LOW', 'RESOLVED',
-                1.0, f"[Type: {res_type}]\nReason: {reason}", False,
-                title=risk.get("title"), reference_id=risk.get("reference_id"),
-                status='RESOLVED', resolve_only=True
+            # PRODUCT FIX: Reconciliation uses fuzzy matching — not explicit MoM text.
+            # Instead of silently resolving, surface as PENDING_CONFIRMATION for PM review.
+            TrackerAuditAgent.suggest_resolution(
+                db_cursor, project_id, document_id,
+                title=risk.get("title"),
+                reason=f"[Type: {res_type}] {reason}",
+                evidence=reason,
+                suggestion_source="RiskReconciliation"
             )
-            print(f"  [Reconciliation] Auto-resolved stale risk: {risk.get('title')} ({res_type})")
+            print(f"  [Reconciliation] Suggested resolution (pending PM confirmation): "
+                  f"{risk.get('title')} ({res_type})")
         # ─────────────────────────────────────────────────────────────────────
 
         tracker_items = []
@@ -2358,21 +2458,15 @@ class RiskEvaluationAgent:
             
             # Resolve if confidence >= 80%
             if conf_val >= 80:
-                ref_id = None
-                res_name_clean = res_name.lower().strip()
-                for name, act_id in activity_map.items():
-                    if name in res_name_clean or res_name_clean in name:
-                        ref_id = act_id
-                        break
-                        
-                TrackerAuditAgent.persist_tracker_item(
-                    db_cursor, project_id, document_id, 'ACTIVITY',
-                    False, 0, 'LOW', 'RESOLVED',
-                    1.0, f"Explicitly resolved in document.\n\nEvidence: {res_evidence}", False,
-                    title=res_name, reference_id=ref_id,
-                    status='RESOLVED', resolve_only=True
+                # PRODUCT FIX: LLM confidence >= 80% is not the same as MoM explicitly
+                # stating completion. Convert to suggestion for PM review.
+                TrackerAuditAgent.suggest_resolution(
+                    db_cursor, project_id, document_id,
+                    title=res_name,
+                    reason=f"LLM identified this as resolved with {conf_val:.0f}% confidence.",
+                    evidence=res_evidence,
+                    suggestion_source="LLMConfidence"
                 )
-                _resolve_composite_subphases(res_name, res_evidence, db_cursor, project_id, document_id)
                 
         # B) Execution Blockers: Auto-resolve if associated milestone completes
         completed_milestone_ids = [m_id for m_id, status in milestone_status_map.items() if status == "COMPLETED"]

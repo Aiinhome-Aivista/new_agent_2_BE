@@ -4,6 +4,8 @@ COLLATE utf8mb4_unicode_ci;
 
 USE acse_db;
 
+SET FOREIGN_KEY_CHECKS = 0;
+
 CREATE TABLE users (
 id BIGINT PRIMARY KEY AUTO_INCREMENT,
 name VARCHAR(150) NOT NULL,
@@ -104,6 +106,9 @@ processing_status ENUM(
 processing_error TEXT,
 uploaded_by BIGINT NOT NULL,
 uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+processing_progress INT DEFAULT 0,
+processing_step VARCHAR(255) NULL,
+processing_started_at TIMESTAMP NULL,
 
     CONSTRAINT fk_documents_project
         FOREIGN KEY (project_id)
@@ -159,8 +164,12 @@ status ENUM(
 ) NOT NULL DEFAULT 'DRAFT',
 approved_by BIGINT NULL,
 approved_at DATETIME NULL,
-source_document_id BIGINT NULL,
 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+source_document_id BIGINT NULL,
+parser_version VARCHAR(50) NULL,
+layout_version VARCHAR(50) NULL,
+extractor_version VARCHAR(50) NULL,
+llm_prompt_version VARCHAR(50) NULL,
 
     CONSTRAINT uq_baseline_version
         UNIQUE (project_id, version),
@@ -192,16 +201,34 @@ scope_type ENUM(
 'OUT_OF_SCOPE',
 'UNCERTAIN'
 ) NOT NULL,
-source_document_id BIGINT NOT NULL,
+source_document_id BIGINT NULL,
 source_page INT NULL,
 source_section VARCHAR(255),
-evidence_text TEXT NOT NULL,
+evidence_text TEXT,
 confidence DECIMAL(5,4),
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+status_change_tag VARCHAR(255) NULL,
 deadline DATE NULL,
 deadline_original VARCHAR(255),
 deadline_normalized DATE NULL,
 milestone_normalized VARCHAR(255),
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+completion_status ENUM('ACTIVE','COMPLETED','CANCELLED') DEFAULT 'ACTIVE',
+milestone VARCHAR(255) NULL,
+deadline_text VARCHAR(255) NULL,
+extraction_confidence DECIMAL(5,4) NULL,
+extraction_method VARCHAR(50) NULL,
+category ENUM('FUNCTIONAL','TECHNICAL','DELIVERABLE','OUT_OF_SCOPE','MILESTONE') DEFAULT 'FUNCTIONAL',
+category_id INT NULL,
+entity_type_id INT NULL,
+is_recurring TINYINT(1) NOT NULL DEFAULT 0,
+recurrence_frequency ENUM('WEEKLY','MONTHLY','QUARTERLY','YEARLY') NULL,
+recurrence_interval INT NOT NULL DEFAULT 1,
+recurrence_start_date DATE NULL,
+recurrence_end_date DATE NULL,
+recurrence_source VARCHAR(50) DEFAULT 'EL',
+parent_scope_item_id BIGINT NULL,
+occurrence_period VARCHAR(20) NULL,
+recurrence_confidence DECIMAL(5,4) NULL,
 
     CONSTRAINT fk_scope_item_baseline
         FOREIGN KEY (baseline_id)
@@ -215,7 +242,24 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
     CONSTRAINT fk_scope_item_document
         FOREIGN KEY (source_document_id)
-        REFERENCES documents(id)
+        REFERENCES documents(id),
+
+    CONSTRAINT fk_scope_item_parent
+        FOREIGN KEY (parent_scope_item_id)
+        REFERENCES scope_items(id)
+        ON DELETE CASCADE,
+
+    CONSTRAINT fk_scope_category
+        FOREIGN KEY (category_id)
+        REFERENCES scope_category_config(id)
+        ON DELETE SET NULL,
+
+    CONSTRAINT fk_scope_entity_type
+        FOREIGN KEY (entity_type_id)
+        REFERENCES entity_types(id),
+
+    CONSTRAINT uq_recurring_occurrence
+        UNIQUE (parent_scope_item_id, occurrence_period)
 );
 
 CREATE TABLE deliverables (
@@ -882,8 +926,43 @@ CREATE TABLE `tracker_items` (
   `risk_source` enum('OBSERVED','DERIVED','MANUAL','SYSTEM') COLLATE utf8mb4_unicode_ci DEFAULT 'OBSERVED',
   `previous_highest_score` int DEFAULT '0',
   `recommended_action` text COLLATE utf8mb4_unicode_ci,
+  `execution_priority_score` int DEFAULT NULL,
+  `execution_status` varchar(60) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT 'Operational status from document: WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, IN_PROGRESS',
+  `risk_status` varchar(30) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN' COMMENT 'Risk lifecycle: OPEN, RESOLVED, NO_ACTIVE_RISK',
+  `graph_role` varchar(40) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT 'Graph-derived role: ROOT_CAUSE, EXECUTION_BLOCKER, DOWNSTREAM_ACTIVITY, etc.',
+  `canonical_id` varchar(40) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT 'Canonical entity ID from EntityResolver registry',
+  `risk_severity_score` int DEFAULT NULL COMMENT 'Risk severity score independent of execution_priority_score',
   PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=558 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE `drive_accounts` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `label` varchar(255) NOT NULL,
+  `service_email` varchar(255) NOT NULL,
+  `folder_id` varchar(512) NOT NULL,
+  `credentials_enc` text NOT NULL,
+  `added_by` int NOT NULL,
+  `is_active` tinyint(1) DEFAULT '1',
+  `last_synced_at` datetime DEFAULT NULL,
+  `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `drive_inbox` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `drive_account_id` int NOT NULL,
+  `drive_file_id` varchar(512) NOT NULL,
+  `filename` varchar(512) NOT NULL,
+  `mime_type` varchar(255) DEFAULT NULL,
+  `matched_project_id` int DEFAULT NULL,
+  `doc_type` varchar(50) DEFAULT 'MOM',
+  `status` enum('PENDING','ASSIGNED','PROCESSING','DONE','SKIPPED') DEFAULT 'PENDING',
+  `fetched_at` datetime DEFAULT CURRENT_TIMESTAMP,
+  `processed_at` datetime DEFAULT NULL,
+  `file_path` varchar(1024) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_drive_file` (`drive_file_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
 DELIMITER //
 
@@ -898,6 +977,7 @@ BEGIN
     TRUNCATE TABLE deliverables;
     TRUNCATE TABLE document_types;
     TRUNCATE TABLE documents;
+    TRUNCATE TABLE drive_inbox;
     TRUNCATE TABLE episodic_memory;
     TRUNCATE TABLE finding_evidence;
     TRUNCATE TABLE new_requests;
@@ -915,3 +995,5 @@ BEGIN
 END //
 
 DELIMITER ;
+
+SET FOREIGN_KEY_CHECKS = 1;

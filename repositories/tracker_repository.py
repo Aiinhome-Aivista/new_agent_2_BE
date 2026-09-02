@@ -20,7 +20,7 @@ class TrackerRepository:
                     "ALTER TABLE tracker_items ADD COLUMN execution_priority_score INT NULL",
                     # New decoupled status and graph metadata columns
                     "ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(60) NULL COMMENT 'Operational status from document: WAITING_ON_CUSTOMER, NOT_STARTED, DELAYED, IN_PROGRESS'",
-                    "ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(30) NULL DEFAULT 'OPEN' COMMENT 'Risk lifecycle: OPEN, RESOLVED, NO_ACTIVE_RISK'",
+                    "ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(30) NULL DEFAULT 'OPEN' COMMENT 'Risk lifecycle: OPEN, RESOLVED, PENDING_CONFIRMATION, NO_ACTIVE_RISK'",
                     "ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(40) NULL COMMENT 'Graph-derived role: ROOT_CAUSE, EXECUTION_BLOCKER, DOWNSTREAM_ACTIVITY, etc.'",
                     "ALTER TABLE tracker_items ADD COLUMN canonical_id VARCHAR(40) NULL COMMENT 'Canonical entity ID from EntityResolver registry'",
                     "ALTER TABLE tracker_items ADD COLUMN risk_severity_score INT NULL COMMENT 'Risk severity score, independent of execution_priority_score'",
@@ -106,7 +106,7 @@ class TrackerRepository:
         items = cursor.fetchall() or []
         cursor.close()
         
-        # FIX 1 & BUG 2: Populate owner and dependency_owner from embedded reasoning JSON if present
+        # FIX 1 & BUG 2: Populate owner, deliverable and dependency_owner from embedded reasoning JSON if present
         for it in items:
             owner = None
             if it.get("reasoning"):
@@ -122,6 +122,10 @@ class TrackerRepository:
             it["owner"] = owner
             if not it.get("dependency_owner"):
                 it["dependency_owner"] = owner
+            if not it.get("deliverable"):
+                it["deliverable"] = it.get("title") or it.get("name")
+            if not it.get("title"):
+                it["title"] = it.get("name")
         
         TrackerRepository._fetch_and_attach_audit_trails(db, items, project_id)
         
@@ -149,6 +153,10 @@ class TrackerRepository:
             item["owner"] = owner
             if not item.get("dependency_owner"):
                 item["dependency_owner"] = owner
+            if not item.get("deliverable"):
+                item["deliverable"] = item.get("title") or item.get("name")
+            if not item.get("title"):
+                item["title"] = item.get("name")
             TrackerRepository._fetch_and_attach_audit_trails(db, [item], project_id)
             
         return item
