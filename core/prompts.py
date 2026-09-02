@@ -220,13 +220,15 @@ CRITICAL RULES:
 7. Preserve the exact original sentence as `source_sentence`.
 8. Ignore greetings, attendance lists, signatures, and agenda headings.
 9. RESOLUTION & FULFILLMENT EXTRACTION (CRITICAL):
-   Extract EVERY item, deliverable, prerequisite, access, credential, dependency, or blocker that the document explicitly states is now completed, resolved, received, provided, signed off, or fulfilled into the `resolved_items` array.
-   - When a sentence states that an activity/deliverable was completed upon or after receiving prerequisites/dependencies (e.g. "CRM Integration completed after receiving production credentials and VPN access"):
-     You MUST extract separate entries in `resolved_items` for:
-     a) The completed activity/deliverable (e.g. "CRM Integration"), AND
-     b) EACH individual prerequisite, credential, access, approval, or dependency that was received/fulfilled (e.g. "Production CRM API credentials", "Production VPN access").
-   - If an extracted resolved item conceptually matches any deliverable in the baseline or one of the CURRENT ACTIVE PROJECT RISKS listed above, use the normalized/standard title.
-   - Include a confidence score (0.0 to 1.0) and the exact evidence sentence in `resolution_evidence`.
+    Extract EVERY item, deliverable, prerequisite, access, credential, dependency, or blocker that the document explicitly states is now completed, resolved, received, provided, signed off, or fulfilled into the `resolved_items` array.
+    - When a sentence states that an activity/deliverable was completed upon or after receiving prerequisites/dependencies (e.g. "CRM Integration completed after receiving production credentials and VPN access"):
+      You MUST extract separate entries in `resolved_items` for:
+      a) The completed activity/deliverable (e.g. "CRM Integration"), AND
+      b) EACH individual prerequisite, credential, access, approval, or dependency that was received/fulfilled (e.g. "Production CRM API credentials", "Production VPN access").
+    - If an extracted resolved item conceptually matches any deliverable in the baseline or one of the CURRENT ACTIVE PROJECT RISKS listed above, use the normalized/standard title.
+    - Include a confidence score (0.0 to 1.0) and the exact evidence sentence in `resolution_evidence`.
+10. ACTION ITEMS & TABLES EXTRACTION (CRITICAL):
+    Every row in Action Items, Decisions, Dependencies, or Customer Responsibility tables (e.g. 'Provide Production API Credentials', 'Provide Production VPN access') MUST be extracted as an individual entry in `extractions`. Do not omit them or bury them only inside another item's `blocked_by` list.
 
 Output MUST be valid JSON conforming to the following structure:
 {{
@@ -237,6 +239,7 @@ Output MUST be valid JSON conforming to the following structure:
       "owner": "CUSTOMER",
       "due_date": "2026-09-09",
       "blocks": ["CRM Integration"],
+      "blocked_by": [],
       "confidence": 0.98,
       "source_sentence": "Customer must provide Production VPN Access by Sept 9, which is delaying the CRM Integration."
     }}
