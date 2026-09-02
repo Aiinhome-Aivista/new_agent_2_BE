@@ -4,9 +4,17 @@ import json
 # This is set once on INSERT and never changed — preserving historical context.
 _ORIGIN_MAP = {
     'ROOT_CAUSE': 'Root Cause Blocker',
+    # FIX 5: Added missing categories from category_assignment_engine & pipeline
+    'ROOT_CAUSE_BLOCKER': 'Root Cause Blocker',
     'EXECUTION_BLOCKER': 'Execution Blocker',
+    'DIRECT_EXECUTION_BLOCKER': 'Direct Execution Blocker',
+    'TRANSITIVE_EXECUTION_BLOCKER': 'Transitive Execution Blocker',
+    'CRITICAL_PATH_RISK': 'Critical Path Risk',
     'CUSTOMER_DEPENDENCY': 'Customer Dependency',
     'TECHNICAL_DEPENDENCY': 'Technical Dependency',
+    'INTERNAL_DEPENDENCY': 'Internal Dependency',
+    'WAITING_DEPENDENCY': 'Waiting on Dependency',
+    'IN_PROGRESS_RISK': 'Execution Risk',
     'SCOPE_CREEP': 'Scope Creep',
     'DELAY': 'Delay Risk',
     'MISSING_DELIVERABLE': 'Missing Deliverable',
@@ -17,7 +25,129 @@ _ORIGIN_MAP = {
     'BLOCKED': 'Execution Blocker',
 }
 
+def _embed_owner_in_reasoning(reasoning: str, owner: str) -> str:
+    # FIX 1: Owner embedded in reasoning JSON
+    # because tracker_items has no top-level owner column.
+    # Frontend reads: JSON.parse(reasoning).owner
+    if not owner:
+        return reasoning
+    try:
+        import json
+        parsed = json.loads(reasoning) if reasoning else {}
+        if isinstance(parsed, dict):
+            parsed["owner"] = owner
+            return json.dumps(parsed)
+        else:
+            return json.dumps({"text": str(reasoning), "owner": owner})
+    except Exception:
+        return json.dumps({"text": str(reasoning or ""), "owner": owner})
+
+def suggest_resolution(db_cursor, project_id: int, document_id: int,
+                       title: str, reason: str, evidence: str,
+                       suggestion_source: str) -> None:
+    """
+    Marks an existing OPEN tracker item as PENDING_CONFIRMATION instead of
+    resolving it outright. The PM sees it as a suggestion and can Confirm or Dismiss.
+
+    - Does NOT change status (item stays OPEN so it appears in execution queue)
+    - Sets risk_status = 'PENDING_CONFIRMATION'
+    - Stores the suggestion reason and evidence in a new JSON field in reasoning
+    - Writes an audit log entry with action='SUGGESTED_RESOLUTION'
+    - Generic: works for any tracker item type
+
+    suggestion_source: label for what generated the suggestion
+                       (e.g. 'RiskReconciliation', 'LLMConfidence', 'ProjectClosure')
+    """
+    import re, json
+    try:
+        norm_title = re.sub(r'[^\w\s]', '', (title or '').lower().strip())
+
+        # Find the existing OPEN tracker item
+        db_cursor.execute(
+            "SELECT id, title, reasoning FROM tracker_items WHERE project_id = %s AND status = 'OPEN' ORDER BY id DESC",
+            (project_id,)
+        )
+        rows = db_cursor.fetchall() or []
+        matched_id = None
+        matched_reasoning = None
+
+        for row in rows:
+            existing_title = row.get('title', '') if isinstance(row, dict) else (row[1] if len(row) > 1 else '')
+            existing_id = row.get('id') if isinstance(row, dict) else row[0]
+            existing_reasoning = row.get('reasoning') if isinstance(row, dict) else (row[2] if len(row) > 2 else '')
+            norm_existing = re.sub(r'[^\w\s]', '', (existing_title or '').lower().strip())
+            if norm_title and norm_existing == norm_title:
+                matched_id = existing_id
+                matched_reasoning = existing_reasoning
+                break
+            # Fuzzy fallback
+            try:
+                from api.routes.baseline import _is_title_match
+                if _is_title_match(title, existing_title):
+                    matched_id = existing_id
+                    matched_reasoning = existing_reasoning
+                    break
+            except Exception:
+                pass
+
+        if not matched_id:
+            # Item doesn't exist yet — nothing to suggest on
+            print(f"  [SuggestResolution] No OPEN item found for '{title}' — skipping suggestion")
+            return
+
+        # Append suggestion metadata to reasoning JSON
+        try:
+            r_parsed = json.loads(matched_reasoning) if matched_reasoning else {}
+            if not isinstance(r_parsed, dict):
+                r_parsed = {"text": str(matched_reasoning)}
+        except Exception:
+            r_parsed = {"text": str(matched_reasoning or "")}
+
+        r_parsed["pending_suggestion"] = {
+            "reason": reason,
+            "evidence": (evidence or "")[:500],
+            "source": suggestion_source,
+            "document_id": document_id
+        }
+        new_reasoning = json.dumps(r_parsed)
+
+        db_cursor.execute("""
+            UPDATE tracker_items
+            SET risk_status = 'PENDING_CONFIRMATION',
+                reasoning = %s,
+                source_document_id = %s
+            WHERE id = %s
+        """, (new_reasoning, document_id, matched_id))
+
+        # Audit log
+        audit_details = json.dumps({
+            "suggestion_source": suggestion_source,
+            "reason": reason,
+            "evidence": (evidence or "")[:200],
+            "source_document_id": document_id
+        })
+        try:
+            db_cursor.execute("""
+                INSERT INTO audit_logs
+                (project_id, agent_name, action, entity_type, entity_id, details_json)
+                VALUES (%s, 'SuggestionAgent', 'SUGGESTED_RESOLUTION', 'TRACKER_ITEM', %s, %s)
+            """, (project_id, matched_id, audit_details))
+        except Exception as e:
+            print(f"  [SuggestResolution] Warning: audit log failed: {e}")
+
+        print(f"  [SuggestResolution] Suggested resolution for '{title}' "
+              f"(source: {suggestion_source}). PM confirmation required.")
+    except Exception as e:
+        print(f"  [SuggestResolution] Error suggesting resolution for '{title}': {e}")
+
+
 class TrackerAuditAgent:
+    @classmethod
+    def suggest_resolution(cls, db_cursor, project_id: int, document_id: int,
+                           title: str, reason: str, evidence: str,
+                           suggestion_source: str) -> None:
+        return suggest_resolution(db_cursor, project_id, document_id, title, reason, evidence, suggestion_source)
+
     @classmethod
     def persist_tracker_item(cls, db_cursor, project_id: int, document_id: int, item_type: str,
                              is_out_of_scope: bool, risk_score: int, risk_level: str,
@@ -29,7 +159,8 @@ class TrackerAuditAgent:
                              # New decoupled fields
                              execution_status: str = None, risk_status: str = None,
                              graph_role: str = None, canonical_id: str = None,
-                             risk_severity_score: int = None) -> int:
+                             risk_severity_score: int = None,
+                             owner: str = None) -> int:
         """
         Acts as the Tracker & Audit Agent. Deterministically persists state with evidence lineage
         into the `tracker_items` table and logs the action in the `audit_logs` table.
@@ -50,8 +181,8 @@ class TrackerAuditAgent:
 
         matched_row = None
         for row in (all_items or []):
-            existing_title = row['title'] if isinstance(row, dict) else (row[3] if len(row) > 3 else "")
-            existing_ref   = row['reference_id'] if isinstance(row, dict) else (row[4] if len(row) > 4 else None)
+            existing_title = row.get('title', '') if isinstance(row, dict) else (row[3] if len(row) > 3 else "")
+            existing_ref   = row.get('reference_id') if isinstance(row, dict) else (row[4] if len(row) > 4 else None)
             norm_existing  = re.sub(r'[^\w\s]', '', (existing_title or "").lower().strip())
 
             if norm_title and norm_existing == norm_title:
@@ -60,15 +191,23 @@ class TrackerAuditAgent:
             elif reference_id and existing_ref == reference_id:
                 matched_row = row
                 break
+            elif title and existing_title:
+                try:
+                    from api.routes.baseline import _is_title_match
+                    if _is_title_match(title, existing_title):
+                        matched_row = row
+                        break
+                except Exception:
+                    pass
 
         if matched_row:
-            existing_id       = matched_row['id']            if isinstance(matched_row, dict) else matched_row[0]
-            existing_score    = matched_row['risk_score']    if isinstance(matched_row, dict) else matched_row[1]
-            existing_reasoning= matched_row['reasoning']     if isinstance(matched_row, dict) else matched_row[2]
-            existing_level    = matched_row['risk_level']    if isinstance(matched_row, dict) else matched_row[5]
-            existing_priority = matched_row['priority_order']if isinstance(matched_row, dict) else matched_row[6]
-            existing_origin   = matched_row['risk_origin']   if isinstance(matched_row, dict) else matched_row[7]
-            existing_peak     = matched_row['previous_highest_score'] if isinstance(matched_row, dict) else matched_row[8]
+            existing_id       = matched_row.get('id') if isinstance(matched_row, dict) else matched_row[0]
+            existing_score    = matched_row.get('risk_score') if isinstance(matched_row, dict) else (matched_row[1] if len(matched_row) > 1 else None)
+            existing_reasoning= matched_row.get('reasoning') if isinstance(matched_row, dict) else (matched_row[2] if len(matched_row) > 2 else None)
+            existing_level    = matched_row.get('risk_level', 'LOW') if isinstance(matched_row, dict) else (matched_row[5] if len(matched_row) > 5 else 'LOW')
+            existing_priority = matched_row.get('priority_order') if isinstance(matched_row, dict) else (matched_row[6] if len(matched_row) > 6 else None)
+            existing_origin   = matched_row.get('risk_origin') if isinstance(matched_row, dict) else (matched_row[7] if len(matched_row) > 7 else None)
+            existing_peak     = matched_row.get('previous_highest_score') if isinstance(matched_row, dict) else (matched_row[8] if len(matched_row) > 8 else None)
 
             risk_origin_value = existing_origin
             candidate_scores = [s for s in [existing_peak, existing_score, risk_score] if s is not None]
@@ -84,21 +223,46 @@ class TrackerAuditAgent:
                 final_exec_score = 0
                 final_risk_level = existing_level
                 final_priority   = None
-                final_reasoning  = None
+                
+                # BUG 2 FIX: Preserve original owner from existing reasoning JSON on resolution
+                preserved_owner = owner
+                if not preserved_owner and existing_reasoning:
+                    try:
+                        p_ex = json.loads(existing_reasoning)
+                        if isinstance(p_ex, dict) and p_ex.get("owner"):
+                            preserved_owner = p_ex["owner"]
+                    except Exception:
+                        pass
+                
+                # Maintain reasoning JSON with preserved owner
+                final_reasoning = _embed_owner_in_reasoning(existing_reasoning or reasoning or "Resolved", preserved_owner)
             else:
                 final_risk_score = risk_score
                 final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
                 final_risk_level = risk_level
                 final_priority   = priority_order if priority_order is not None else existing_priority
                 if reasoning and (reasoning[:50] not in (existing_reasoning or "")):
-                    final_reasoning = (existing_reasoning or "") + "\nUpdate: " + reasoning
+                    base_text = existing_reasoning or ""
+                    try:
+                        ex_parsed = json.loads(existing_reasoning)
+                        if isinstance(ex_parsed, dict) and "text" in ex_parsed and isinstance(ex_parsed["text"], str):
+                            base_text = ex_parsed["text"]
+                    except Exception:
+                        pass
+                    final_reasoning = (base_text + "\nUpdate: " + reasoning).strip()
                 else:
                     final_reasoning = existing_reasoning
+                final_reasoning = _embed_owner_in_reasoning(final_reasoning, owner)
 
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
             if final_exec_status in ('UNKNOWN', ''):
                 final_exec_status = 'NOT_STARTED'
-            final_risk_status = risk_status or 'OPEN'
+            # BUG C FIX: When status is RESOLVED, always set risk_status to RESOLVED.
+            # Callers using resolve_only=True often don't pass risk_status explicitly.
+            if status == 'RESOLVED':
+                final_risk_status = 'RESOLVED'
+            else:
+                final_risk_status = risk_status or 'OPEN'
             final_risk_sev = risk_severity_score if risk_severity_score is not None else risk_score
 
             db_cursor.execute("""
@@ -124,7 +288,42 @@ class TrackerAuditAgent:
                 action_type = 'UPDATED'
         else:
             if resolve_only:
-                return None
+                fallback_label = 'Resolved'
+                risk_origin_value = 'Resolved'
+                final_exec_status = 'RESOLVED'
+                final_risk_status = 'RESOLVED'
+                final_risk_score = 0
+                final_exec_score = 0
+                final_risk_sev = 0
+                new_peak = 0
+                risk_level = 'LOW'
+                
+                resolved_reasoning = _embed_owner_in_reasoning(reasoning or 'Auto-resolved (Condition cleared)', owner)
+                
+                tracker_sql = """
+                    INSERT INTO tracker_items
+                    (project_id, source_document_id, item_type, reference_id, title, is_out_of_scope,
+                     risk_score, execution_priority_score, risk_severity_score, previous_highest_score,
+                     risk_level, risk_category, risk_origin,
+                     confidence, reasoning, requires_escalation, risk_source,
+                     status, execution_status, risk_status, graph_role, canonical_id, recommended_action,
+                     resolution, resolved_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                """
+                db_cursor.execute(tracker_sql, (
+                    project_id, document_id, item_type or 'ACTIVITY', reference_id, title, int(is_out_of_scope),
+                    0, 0, 0, 0,
+                    'LOW', risk_category or 'RESOLVED', risk_origin_value,
+                    confidence, resolved_reasoning, int(requires_escalation), risk_source,
+                    'RESOLVED', 'RESOLVED', 'RESOLVED',
+                    graph_role or 'DOWNSTREAM_ACTIVITY',
+                    canonical_id or '',
+                    recommended_action,
+                    reasoning or 'Auto-resolved (Condition cleared)'
+                ))
+                tracker_id = db_cursor.lastrowid
+                action_type = 'RESOLVED'
+                return tracker_id
 
             fallback_label = risk_category.replace('_', ' ').title() if risk_category else 'Execution Risk'
             risk_origin_value = _ORIGIN_MAP.get(risk_category, fallback_label)
@@ -133,6 +332,9 @@ class TrackerAuditAgent:
             has_priority = priority_order is not None
             final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
             final_risk_sev = risk_severity_score if risk_severity_score is not None else risk_score
+
+            # FIX 1: Embed owner in reasoning JSON before INSERT
+            reasoning = _embed_owner_in_reasoning(reasoning, owner)
 
             # Resolve execution_status default
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
@@ -175,6 +377,7 @@ class TrackerAuditAgent:
             "peak_score": new_peak,
             "risk_level": risk_level,
             "risk_origin": risk_origin_value,
+            "owner": owner,
             "reasoning_snippet": (reasoning or "")[:200] + ("..." if len(reasoning or "") > 200 else "")
         }
 

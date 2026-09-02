@@ -30,6 +30,7 @@ from services.entity_resolver import (
     build_registry_from_baseline,
     enrich_registry_with_candidates,
     normalize_entity_name,
+    _strip_parentheticals,
     _is_non_entity,
 )
 from services.readiness_engine import ReadinessEngine
@@ -161,8 +162,81 @@ def _derive_graph_role(node_id: str, fwd: dict, bwd: dict) -> str:
         return "ISOLATED"
 
 
+def _is_semantically_valid_direction(
+    source_name: str,
+    target_name: str,
+    source_activity: dict,
+    direction: str,  # "blocks" or "blocked_by"
+    target_id: Optional[str] = None,
+    resolved_blocked_by_ids: Optional[List[str]] = None,
+) -> bool:
+    """
+    Validates that the edge direction makes semantic sense.
+    Returns False if the edge would reverse a known
+    relationship that already exists in the activity's own lists.
+
+    Rules:
+    - If drawing edge A -> B from A.blocks,
+      check: does A.blocked_by also contain B?
+      If yes: contradiction — the LLM extracted both
+      A blocks B AND A is blocked by B simultaneously.
+      This is a contradiction. Reject the blocks direction,
+      keep blocked_by direction (A is blocked by B).
+
+    - If drawing edge A -> B from A.blocked_by (reversed),
+      check: does A.blocks also contain B?
+      If yes: same contradiction. Reject.
+
+    Generic: uses only the source activity dict / resolved IDs.
+    No hardcoded names.
+    """
+    if direction == "blocks":
+        blocked_by_list = [
+            str(b).lower().strip()
+            for b in source_activity.get("blocked_by", [])
+            if b
+        ]
+        if target_name and str(target_name).lower().strip() in blocked_by_list:
+            print(
+                f"  [GraphBuilder] Contradiction rejected: "
+                f"'{source_name}' both blocks AND is "
+                f"blocked_by '{target_name}' -- "
+                f"keeping blocked_by direction only"
+            )
+            return False
+        if target_id and resolved_blocked_by_ids and target_id in resolved_blocked_by_ids:
+            print(
+                f"  [GraphBuilder] Contradiction rejected: "
+                f"'{source_name}' ({target_id}) both blocks AND is "
+                f"blocked_by '{target_name}' -- "
+                f"keeping blocked_by direction only"
+            )
+            return False
+    return True
+
+
+def _is_genuine_cycle(source_id: str, target_id: str, adjacency: dict) -> bool:
+    """
+    Returns True only if adding edge source->target creates a genuine cycle
+    (target can reach source through existing edges). Returns False if they are simply parallel/duplicate.
+
+    Generic: uses only graph topology, no item names.
+    """
+    # BFS from target — can we reach source?
+    visited = set()
+    queue = [target_id]
+    while queue:
+        node = queue.pop(0)
+        if node == source_id:
+            return True  # genuine cycle
+        if node not in visited:
+            visited.add(node)
+            queue.extend(adjacency.get(node, []))
+    return False  # no path from target back to source
+
+
 def _detect_and_break_cycles(fwd: dict, bwd: dict, edges: List[DependencyEdge]) -> List[DependencyEdge]:
-    """DFS cycle detection — breaks earliest back-edge found."""
+    """DFS cycle detection — breaks earliest back-edge found only if genuine cycle."""
     visited: Set[str] = set()
     rec_stack: Set[str] = set()
     removed: Set[tuple] = set()
@@ -174,10 +248,14 @@ def _detect_and_break_cycles(fwd: dict, bwd: dict, edges: List[DependencyEdge]) 
             if nb not in visited:
                 dfs(nb)
             elif nb in rec_stack:
-                fwd[node].discard(nb)
-                bwd[nb].discard(node)
-                removed.add((node, nb))
-                print(f"  [GraphValidator] CYCLE BROKEN: {node} → {nb}")
+                # CYCLE FIX: Verify genuine cycle before breaking
+                if _is_genuine_cycle(node, nb, fwd):
+                    fwd[node].discard(nb)
+                    bwd[nb].discard(node)
+                    removed.add((node, nb))
+                    print(f"  [GraphValidator] GENUINE CYCLE BROKEN: {node} -> {nb}")
+                else:
+                    print(f"  [GraphValidator] False cycle (duplicate edge) skipped: {node} -> {nb}")
         rec_stack.discard(node)
 
     all_nodes = set(fwd.keys()) | set(bwd.keys())
@@ -354,6 +432,8 @@ class DependencyGraphBuilder:
         unresolved_by_source: Dict[str, List[dict]] = collections.defaultdict(list)
         # Validation counters (use list so closures can mutate)
         self_deps_counter = [0]
+        # UAT-CYCLE FIX: Track dynamic adjacency incrementally to check cycles on dynamic edges only (Part A)
+        dynamic_adjacency: Dict[str, List[str]] = collections.defaultdict(list)
 
         # Map baseline IDs to the execution candidates that represent them
         baseline_to_cands = collections.defaultdict(list)
@@ -408,7 +488,7 @@ class DependencyGraphBuilder:
                                 unresolved_by_source[src_id].append(unres_dict)
                                 print(f"  [GraphValidator] EXTERNAL BASELINE dependency "
                                       f"'{raw_str}' for '{cand.get('activity')}' "
-                                      f"→ logged as UNRESOLVED")
+                                      f"-> logged as UNRESOLVED")
                         else:
                             # It's already a candidate ID (cand_X)
                             if cid == src_id:
@@ -433,7 +513,7 @@ class DependencyGraphBuilder:
                             unresolved_by_source[src_id].append(unres_dict)
                             print(f"  [GraphValidator] EXTERNAL dependency "
                                   f"'{raw_str}' for '{cand.get('activity')}' "
-                                  f"→ logged as UNRESOLVED")
+                                  f"-> logged as UNRESOLVED")
                         else:
                             print(f"  [GraphValidator] REJECTED '{raw_str}' "
                                   f"({direction_label} of '{cand.get('activity')}') "
@@ -452,6 +532,11 @@ class DependencyGraphBuilder:
             for blocker_id in resolved_blocked_by:
                 if blocker_id == source_id:
                     continue
+                # UAT-CYCLE FIX: Check cycle against dynamic_adjacency only before adding edge (Part A)
+                if _is_genuine_cycle(blocker_id, source_id, dynamic_adjacency):
+                    print(f"  [GraphValidator] False cycle / reverse edge rejected: {blocker_id} -> {source_id}")
+                    continue
+
                 key = (blocker_id, source_id)
                 if key in edge_map:
                     edge_map[key].merge_evidence(evidence, 1.0)
@@ -459,10 +544,27 @@ class DependencyGraphBuilder:
                     edge_map[key] = DependencyEdge(blocker_id, source_id,
                                                    "BLOCKS", evidence, 1.0,
                                                    condition="AND")
+                    dynamic_adjacency[blocker_id].append(source_id)
 
             for blocked_id in resolved_blocks:
                 if blocked_id == source_id:
                     continue
+
+                # UAT-CYCLE FIX: Validate direction semantically (prevent contradiction with blocked_by) (Part B)
+                cand_name = cand.get("activity") or cand.get("canonical_title") or source_id
+                target_cand = id_to_cand.get(blocked_id, {})
+                target_name = target_cand.get("activity") or target_cand.get("canonical_title") or blocked_id
+                if not _is_semantically_valid_direction(
+                    cand_name, target_name, cand, "blocks",
+                    target_id=blocked_id, resolved_blocked_by_ids=resolved_blocked_by
+                ):
+                    continue
+
+                # UAT-CYCLE FIX: Check cycle against dynamic_adjacency only before adding edge (Part A)
+                if _is_genuine_cycle(source_id, blocked_id, dynamic_adjacency):
+                    print(f"  [GraphValidator] False cycle / reverse edge rejected: {source_id} -> {blocked_id}")
+                    continue
+
                 key = (source_id, blocked_id)
                 if key in edge_map:
                     edge_map[key].merge_evidence(evidence, 1.0)
@@ -470,6 +572,7 @@ class DependencyGraphBuilder:
                     edge_map[key] = DependencyEdge(source_id, blocked_id,
                                                    "BLOCKS", evidence, 1.0,
                                                    condition="AND")
+                    dynamic_adjacency[source_id].append(blocked_id)
 
         edges = list(edge_map.values())
         duplicate_edges_removed = sum(
@@ -744,7 +847,7 @@ class DependencyGraphBuilder:
             ready = cand.get("readiness_status", "UNKNOWN")
             unlocks = cand.get("immediate_unlock_count", 0)
             cascade = cand.get("cascade_count", 0)
-            crit = "✓" if cand.get("critical_path") else ""
+            crit = "YES" if cand.get("critical_path") else ""
             print(f"{name:<50} | {role:<22} | {ready:<22} | {unlocks:>7} | {cascade:>7} | {crit}")
         print()
         print(f"  Validation: {validation_contract['total_confirmed_edges']} edges confirmed, "
