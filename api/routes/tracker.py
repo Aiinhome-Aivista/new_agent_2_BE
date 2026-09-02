@@ -50,13 +50,13 @@ def resolve_tracker_item(project_id: int, item_id: int, update: ResolutionUpdate
     
     # Also synchronize any matching scope_items by title
     try:
-        from api.routes.baseline import _is_title_match
+        from api.routes.baseline import _is_title_match, _is_scope_item_match_for_resolution
         cursor_sync = db.cursor(dictionary=True)
-        cursor_sync.execute("SELECT id, name, scope_item_normalized FROM scope_items WHERE project_id = %s AND (completion_status = 'ACTIVE' OR completion_status IS NULL)", (project_id,))
+        cursor_sync.execute("SELECT id, name, scope_item_normalized, is_recurring, parent_scope_item_id, deadline FROM scope_items WHERE project_id = %s AND (completion_status = 'ACTIVE' OR completion_status IS NULL)", (project_id,))
         active_scopes = cursor_sync.fetchall() or []
         for sc in active_scopes:
             sc_name = sc.get("scope_item_normalized") or sc["name"]
-            if _is_title_match(item.get("title", ""), sc_name):
+            if _is_scope_item_match_for_resolution({"name": item.get("title", ""), "resolution_evidence": ""}, sc):
                 cursor_sync.execute("UPDATE scope_items SET completion_status = 'COMPLETED' WHERE id = %s", (sc["id"],))
                 print(f"[TRACKER RESOLVE] Synchronized deliverable #{sc['id']} '{sc_name}' to COMPLETED")
     except Exception as e:
@@ -92,13 +92,13 @@ def reactivate_tracker_item(project_id: int, item_id: int, current_user: dict = 
         
     # Also synchronize any matching scope_items by title back to ACTIVE
     try:
-        from api.routes.baseline import _is_title_match
+        from api.routes.baseline import _is_title_match, _is_scope_item_match_for_resolution
         cursor_sync = db.cursor(dictionary=True)
-        cursor_sync.execute("SELECT id, name, scope_item_normalized FROM scope_items WHERE project_id = %s AND completion_status = 'COMPLETED'", (project_id,))
+        cursor_sync.execute("SELECT id, name, scope_item_normalized, is_recurring, parent_scope_item_id, deadline FROM scope_items WHERE project_id = %s AND completion_status = 'COMPLETED'", (project_id,))
         completed_scopes = cursor_sync.fetchall() or []
         for sc in completed_scopes:
             sc_name = sc.get("scope_item_normalized") or sc["name"]
-            if _is_title_match(item.get("title", ""), sc_name):
+            if _is_scope_item_match_for_resolution({"name": item.get("title", ""), "resolution_evidence": ""}, sc):
                 cursor_sync.execute("UPDATE scope_items SET completion_status = 'ACTIVE' WHERE id = %s", (sc["id"],))
                 print(f"[TRACKER REACTIVATE] Synchronized deliverable #{sc['id']} '{sc_name}' back to ACTIVE")
     except Exception as e:
