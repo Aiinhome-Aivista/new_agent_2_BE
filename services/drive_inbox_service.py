@@ -313,15 +313,26 @@ def process_inbox_item(inbox_id: int, project_id: int, doc_type: str, user_id: i
         if not file_bytes:
             raise RuntimeError("Failed to download file from Drive")
 
-        # Save to local storage (same pattern as manual upload)
-        storage_dir = os.path.join(settings.UPLOAD_PATH, str(project_id))
-        os.makedirs(storage_dir, exist_ok=True)
-        ext = ".docx"  # we always export as docx
-        unique_filename = f"drive_{uuid.uuid4()}{ext}"
-        storage_key = os.path.join(storage_dir, unique_filename)
+        import io
+        import re
+        import tempfile
+        from services.s3_service import S3Service
+        
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT project_name FROM projects WHERE id = %s", (project_id,))
+        project = cursor.fetchone()
+        cursor.close()
+        project_name = project.get("project_name", f"Project_{project_id}") if project else f"Project_{project_id}"
 
-        with open(storage_key, "wb") as fh:
-            fh.write(file_bytes)
+        # Determine extension based on row["filename"] or fallback to .docx if none
+        filename = row["filename"]
+        ext = os.path.splitext(filename)[1].lower() or ".docx"
+        base_name = os.path.splitext(filename)[0]
+        safe_base_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)
+        unique_filename = f"drive_{safe_base_name}_{uuid.uuid4().hex[:8]}{ext}"
+        
+        file_obj = io.BytesIO(file_bytes)
+        storage_key = S3Service.upload_fileobj(file_obj, project_id, project_name, unique_filename)
 
         # Register document record (uploaded_by = 0 = "SYSTEM/Drive Sync")
         document_id = DocumentRepository.create_document(
@@ -356,7 +367,14 @@ def process_inbox_item(inbox_id: int, project_id: int, doc_type: str, user_id: i
         
         # Index in RAG (store in ChromaDB)
         doc_cursor = conn.cursor(dictionary=True)
-        chunks = DocumentService.parse_document(storage_key, ext)
+        temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+        try:
+            with open(temp_path, "wb") as fh:
+                fh.write(file_bytes)
+            chunks = DocumentService.parse_document(temp_path, ext)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
         RAGService.index_document(project_id, document_id, row["filename"], doc_type, chunks)
         doc_cursor.close()
 
