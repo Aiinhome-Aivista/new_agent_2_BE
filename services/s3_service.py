@@ -3,6 +3,8 @@ import boto3
 from botocore.exceptions import ClientError
 from core.config import settings
 
+import re
+
 class S3Service:
     @classmethod
     def _get_client(cls):
@@ -14,19 +16,23 @@ class S3Service:
         )
         
     @classmethod
-    def get_s3_key(cls, project_id: int, filename: str) -> str:
-        # Expected structure: Agents_Doc/Agent_12/{project_id}/{filename}
+    def get_s3_key(cls, project_id: int, project_name: str, filename: str) -> str:
+        # Expected structure: Agents_Doc/Agent_12/{project_id}_{project_name}/{filename}
         base_folder = settings.AWS_S3_BASE_FOLDER.strip("/")
         agent_folder = settings.AWS_S3_AGENT_FOLDER.strip("/")
         
+        # Sanitize project name
+        safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name) if project_name else "Project"
+        project_folder = f"{project_id}_{safe_name}"
+        
         # Combine parts, filtering out empty strings in case some are not set
-        parts = [p for p in [base_folder, agent_folder, str(project_id), filename] if p]
+        parts = [p for p in [base_folder, agent_folder, project_folder, filename] if p]
         return "/".join(parts)
 
     @classmethod
-    def upload_fileobj(cls, fileobj, project_id: int, filename: str) -> str:
+    def upload_fileobj(cls, fileobj, project_id: int, project_name: str, filename: str) -> str:
         s3 = cls._get_client()
-        s3_key = cls.get_s3_key(project_id, filename)
+        s3_key = cls.get_s3_key(project_id, project_name, filename)
         
         try:
             s3.upload_fileobj(fileobj, settings.AWS_S3_BUCKET_NAME, s3_key)
