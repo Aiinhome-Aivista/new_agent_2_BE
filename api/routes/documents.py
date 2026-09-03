@@ -14,6 +14,8 @@ from services.document_service import DocumentService
 from services.relevance_service import RelevanceService
 from services.rag_service import RAGService
 from repositories.document_repository import DocumentRepository
+from services.s3_service import S3Service
+import tempfile
 import mysql.connector
 
 router = APIRouter()
@@ -48,17 +50,12 @@ def confirm_upload_document(
     if ext not in [".pdf", ".docx", ".txt"]:
         raise HTTPException(status_code=400, detail="Unsupported file format")
 
-    # Move file to permanent project folder
-    storage_dir = os.path.join(settings.UPLOAD_PATH, str(project_id))
-    os.makedirs(storage_dir, exist_ok=True)
     unique_filename = f"{uuid.uuid4()}{ext}"
-    storage_key = os.path.join(storage_dir, unique_filename)
     
     try:
-        with open(storage_key, "wb") as f:
-            f.write(file.file.read())
+        storage_key = S3Service.upload_fileobj(file.file, project_id, unique_filename)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to finalize file storage: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to finalize file storage to S3: {e}")
         
     document_id = DocumentRepository.create_document(
         db=db,
@@ -137,7 +134,14 @@ def process_document(
         db.commit()
         
         ext = os.path.splitext(doc["storage_key"])[1].lower()
-        chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+        
+        try:
+            S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+            chunks = DocumentService.parse_document(temp_path, ext)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
         
         # Index document in ChromaDB and BM25
         RAGService.index_document(project_id, document_id, doc["document_name"], doc["document_type"], chunks)
@@ -191,9 +195,11 @@ def delete_document(
         DocumentRepository.delete_document(db, document_id)
         db.commit()
         
-        # 5. Remove physical file
-        if os.path.exists(doc["storage_key"]):
-            os.remove(doc["storage_key"])
+        # 5. Remove physical file from S3
+        try:
+            S3Service.delete_file(doc["storage_key"])
+        except Exception as e:
+            print(f"Warning: Failed to delete file from S3: {e}")
             
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to delete document: {e}")
@@ -213,12 +219,9 @@ def download_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
         
-    file_path = doc["storage_key"]
-    if not os.path.exists(file_path):
-        raise HTTPException(status_code=404, detail="Physical file not found on disk")
-        
-    return FileResponse(
-        path=file_path,
-        filename=doc["document_name"],
-        media_type="application/octet-stream"
-    )
+    try:
+        presigned_url = S3Service.generate_presigned_url(doc["storage_key"])
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=presigned_url)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate download link: {e}")

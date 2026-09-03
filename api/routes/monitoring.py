@@ -14,8 +14,10 @@ from services.document_service import DocumentService
 from agents.status_ingestion_agent import StatusIngestionAgent
 from agents.orchestrator_agent import OrchestratorAgent
 from repositories.document_repository import DocumentRepository
-# pyrefly: ignore [missing-import]
 import mysql.connector
+import uuid
+import tempfile
+from services.s3_service import S3Service
 
 router = APIRouter()
 
@@ -115,29 +117,18 @@ def stream_monitoring(
             yield f'data: {json.dumps({"step": "Loading Project Baseline", "progress": 5, "status": "running"})}\n\n'
 
             # Parse the document
+            ext = os.path.splitext(doc["storage_key"])[1].lower()
+            temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+            
             try:
-                ext = os.path.splitext(doc["storage_key"])[1].lower()
-                chunks = DocumentService.parse_document(doc["storage_key"], ext)
-                text = "\n".join([chunk["text"] for chunk in chunks[:8]])
-                if len(text) > 8000:
-                    text = text[:8000]
-            except Exception as parse_err:
-                print(f"!!! Document parse error: {parse_err} !!!")
-                try:
-                    err_conn = get_db_connection()
-                    if err_conn:
-                        err_cursor = err_conn.cursor()
-                        err_cursor.execute(
-                            "UPDATE documents SET processing_status = 'FAILED', processing_error = %s, processing_progress = 0, processing_step = 'Failed' WHERE id = %s",
-                            (f"Document parsing failed: {str(parse_err)[:400]}", document_id)
-                        )
-                        err_conn.commit()
-                        err_cursor.close()
-                        err_conn.close()
-                except Exception:
-                    pass
-                yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": f"Failed to parse document: {str(parse_err)}"})}\n\n'
-                return
+                S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+                chunks = DocumentService.parse_document(temp_path, ext)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            text = "\n".join([chunk["text"] for chunk in chunks[:8]])
+            if len(text) > 8000:
+                text = text[:8000]
 
             yield f'data: {json.dumps({"step": "Reading Uploaded Document", "progress": 12, "status": "running"})}\n\n'
 
@@ -342,8 +333,18 @@ def ingest_status_document(
         
     cursor = db.cursor(dictionary=True)
     try:
-        ext = os.path.splitext(doc['storage_key'])[1].lower()
-        chunks = DocumentService.parse_document(doc['storage_key'], ext)
+        DocumentRepository.update_processing_status(db, document_id, 'PROCESSING')
+        db.commit()
+
+        ext = os.path.splitext(doc["storage_key"])[1].lower()
+        temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+        
+        try:
+            S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+            chunks = DocumentService.parse_document(temp_path, ext)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
         text = "\n".join([chunk["text"] for chunk in chunks[:8]])
         if len(text) > 8000:
             text = text[:8000]

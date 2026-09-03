@@ -33,6 +33,14 @@ class Settings(BaseSettings):
     CHROMA_PATH: str = "data/chroma_db"
     UPLOAD_PATH: str = "data/uploads"
     
+    # ── AWS S3 Integration ────────────────────────────────────────────────────
+    AWS_ACCESS_KEY_ID: str = ""
+    AWS_SECRET_ACCESS_KEY: str = ""
+    AWS_DEFAULT_REGION: str = "us-east-1"
+    AWS_S3_BUCKET_NAME: str = ""
+    AWS_S3_BASE_FOLDER: str = ""
+    AWS_S3_AGENT_FOLDER: str = ""
+    
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200
     
