@@ -115,11 +115,29 @@ def stream_monitoring(
             yield f'data: {json.dumps({"step": "Loading Project Baseline", "progress": 5, "status": "running"})}\n\n'
 
             # Parse the document
-            ext = os.path.splitext(doc["storage_key"])[1].lower()
-            chunks = DocumentService.parse_document(doc["storage_key"], ext)
-            text = "\n".join([chunk["text"] for chunk in chunks[:8]])
-            if len(text) > 8000:
-                text = text[:8000]
+            try:
+                ext = os.path.splitext(doc["storage_key"])[1].lower()
+                chunks = DocumentService.parse_document(doc["storage_key"], ext)
+                text = "\n".join([chunk["text"] for chunk in chunks[:8]])
+                if len(text) > 8000:
+                    text = text[:8000]
+            except Exception as parse_err:
+                print(f"!!! Document parse error: {parse_err} !!!")
+                try:
+                    err_conn = get_db_connection()
+                    if err_conn:
+                        err_cursor = err_conn.cursor()
+                        err_cursor.execute(
+                            "UPDATE documents SET processing_status = 'FAILED', processing_error = %s, processing_progress = 0, processing_step = 'Failed' WHERE id = %s",
+                            (f"Document parsing failed: {str(parse_err)[:400]}", document_id)
+                        )
+                        err_conn.commit()
+                        err_cursor.close()
+                        err_conn.close()
+                except Exception:
+                    pass
+                yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": f"Failed to parse document: {str(parse_err)}"})}\n\n'
+                return
 
             yield f'data: {json.dumps({"step": "Reading Uploaded Document", "progress": 12, "status": "running"})}\n\n'
 
@@ -216,6 +234,19 @@ def stream_monitoring(
                 yield f'data: {json.dumps({"step": "Completed", "progress": 100, "status": "completed"})}\n\n'
 
         except Exception as e:
+            try:
+                fail_conn = get_db_connection()
+                if fail_conn:
+                    fail_cursor = fail_conn.cursor()
+                    fail_cursor.execute(
+                        "UPDATE documents SET processing_status = 'FAILED', processing_error = %s, processing_progress = 0, processing_step = 'Failed' WHERE id = %s",
+                        (str(e)[:500], document_id)
+                    )
+                    fail_conn.commit()
+                    fail_cursor.close()
+                    fail_conn.close()
+            except Exception:
+                pass
             yield f'data: {json.dumps({"step": "FAILED", "progress": 0, "status": "failed", "error": str(e)})}\n\n'
         finally:
             try:
@@ -228,43 +259,107 @@ def stream_monitoring(
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",   # Disable nginx buffering
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
         }
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# LEGACY ENDPOINTS (kept for backward compatibility)
-# ─────────────────────────────────────────────────────────────────────────────
-
-@router.post("/process")
-def process_monitoring(project_id: int, document_id: int, current_user: dict = Depends(require_roles(["ADMIN", "PROJECT_LEAD", "ENGAGEMENT_MANAGER"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+@router.post("/cancel")
+def cancel_monitoring_process(
+    project_id: int, 
+    payload: Optional[dict] = None,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), 
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Cancel an ongoing document processing or baseline extraction task,
+    mark the document status as FAILED/CANCELLED, and clean up any partial DB records.
+    """
     verify_project_access(project_id, current_user, db)
+    doc_id = payload.get("document_id") if payload else None
     
-    doc = DocumentRepository.get_document(db, document_id, project_id)
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found")
+    cursor = db.cursor(dictionary=True)
+    try:
+        # If no specific doc_id provided, find any currently processing or stuck document
+        if not doc_id:
+            cursor.execute(
+                "SELECT id, document_name FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' ORDER BY id DESC LIMIT 1",
+                (project_id,)
+            )
+            doc = cursor.fetchone()
+            if doc:
+                doc_id = doc["id"]
         
-    if doc["document_type"] not in ["STATUS_REPORT", "MOM"]:
-        raise HTTPException(status_code=400, detail="Only STATUS_REPORT and MOM can be used for monitoring")
+        if doc_id:
+            # 1. Update document status to FAILED
+            cursor.execute(
+                "UPDATE documents SET processing_status = 'FAILED', processing_error = 'Process stopped by user', processing_progress = 0, processing_step = 'Cancelled' WHERE id = %s AND project_id = %s",
+                (doc_id, project_id)
+            )
+            
+            # 2. Clean up any draft scope items if baseline extraction was running
+            cursor.execute(
+                "DELETE FROM scope_items WHERE project_id = %s AND source_document_id = %s AND is_draft = 1",
+                (project_id, doc_id)
+            )
+            
+            # 3. Clean up any unfinalized tracker items created for this document in the last hour
+            cursor.execute(
+                "DELETE FROM tracker_items WHERE project_id = %s AND source_document_id = %s AND (status = 'DRAFT' OR created_at >= NOW() - INTERVAL 1 HOUR)",
+                (project_id, doc_id)
+            )
+            
+            db.commit()
+            return {
+                "success": True,
+                "message": "Process stopped and temporary data cleaned up successfully.",
+                "document_id": doc_id
+            }
+        else:
+            return {"success": True, "message": "No active process found to cancel."}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to cancel process: {e}")
+    finally:
+        cursor.close()
+
+
+@router.post("/ingest-status")
+def ingest_status_document(
+    project_id: int, 
+    document_id: int, 
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), 
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    doc = DocumentRepository.get_document_by_id(db, document_id)
+    if not doc or doc['project_id'] != project_id:
+        raise HTTPException(status_code=404, detail="Document not found for this project")
+        
+    if doc['document_type'] not in ['STATUS_REPORT', 'MOM']:
+        raise HTTPException(status_code=400, detail="Only STATUS_REPORT or MOM documents can be processed for monitoring")
         
     cursor = db.cursor(dictionary=True)
     try:
-        DocumentRepository.update_processing_status(db, document_id, 'PROCESSING')
-        db.commit()
-
-        ext = os.path.splitext(doc["storage_key"])[1].lower()
-        chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        ext = os.path.splitext(doc['storage_key'])[1].lower()
+        chunks = DocumentService.parse_document(doc['storage_key'], ext)
         text = "\n".join([chunk["text"] for chunk in chunks[:8]])
         if len(text) > 8000:
             text = text[:8000]
             
-        OrchestratorAgent.run_workflow(project_id, document_id, text, cursor)
+        DocumentRepository.update_processing_status(db, document_id, 'PROCESSING')
+        db.commit()
+        
+        OrchestratorAgent.run_workflow(
+            project_id=project_id,
+            document_id=document_id,
+            text=text,
+            db_cursor=cursor
+        )
         
         DocumentRepository.update_processing_status(db, document_id, 'COMPLETED')
         db.commit()
-        
     except Exception as e:
         db.rollback()
         DocumentRepository.update_processing_status(db, document_id, 'FAILED', str(e))
@@ -279,6 +374,20 @@ def process_monitoring(project_id: int, document_id: int, current_user: dict = D
 @router.get("/progress")
 def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
+    
+    # Auto-fail any document that has been in PROCESSING for more than 10 minutes (stuck/interrupted)
+    try:
+        cleanup_cursor = db.cursor()
+        cleanup_cursor.execute(
+            """UPDATE documents 
+               SET processing_status = 'FAILED', processing_error = 'Process timed out or server restarted', processing_progress = 0, processing_step = 'Failed'
+               WHERE project_id = %s AND processing_status = 'PROCESSING' AND processing_started_at < NOW() - INTERVAL 10 MINUTE""",
+            (project_id,)
+        )
+        db.commit()
+        cleanup_cursor.close()
+    except Exception as e:
+        print(f"Warning: Auto-timeout cleanup query failed: {e}")
     
     if document_id:
         # Get document and compute elapsed seconds since processing started
