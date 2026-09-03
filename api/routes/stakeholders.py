@@ -1,5 +1,9 @@
 # pyrefly: ignore [missing-import]
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File
+from fastapi.responses import StreamingResponse
+import csv
+import io
+import codecs
 from pydantic import BaseModel
 from typing import List, Optional
 from core.database import get_db
@@ -123,3 +127,98 @@ def delete_stakeholder(
     StakeholderRepository.delete_stakeholder(db, stakeholder_id, project_id)
     db.commit()
     return {"success": True, "message": "Project member removed successfully"}
+
+@router.get("/template")
+def download_bulk_upload_template(
+    project_id: int,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["Full Name", "Email Address", "Role", "Responsibilities and Scope Notes"])
+    
+    output.seek(0)
+    return StreamingResponse(
+        iter([output.getvalue()]),
+        media_type="text/csv",
+        headers={"Content-Disposition": "attachment; filename=project_members_template.csv"}
+    )
+
+@router.post("/bulk-upload")
+def bulk_upload_stakeholders(
+    project_id: int,
+    file: UploadFile = File(...),
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    if not file.filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
+        
+    try:
+        content = file.file.read()
+        # Decode the bytes into string and parse as CSV
+        text = codecs.decode(content, 'utf-8-sig') # utf-8-sig handles BOM
+        reader = csv.DictReader(io.StringIO(text))
+        
+        success_count = 0
+        errors = []
+        
+        for row_idx, row in enumerate(reader, start=2): # Start at 2 to account for header
+            # Clean keys in case of unexpected spaces in CSV headers
+            cleaned_row = {k.strip(): v.strip() for k, v in row.items() if k and v}
+            
+            # Map columns
+            name = cleaned_row.get("Full Name")
+            email = cleaned_row.get("Email Address")
+            role = cleaned_row.get("Role", "Stakeholder")
+            responsibility = cleaned_row.get("Responsibilities and Scope Notes")
+            
+            if not name:
+                errors.append(f"Row {row_idx}: Missing 'Full Name'")
+                continue
+                
+            target_user_id = None
+            if email:
+                target_user_id = StakeholderRepository.get_user_id_by_email(db, email)
+                
+            try:
+                stakeholder_id = StakeholderRepository.create_stakeholder(
+                    db=db,
+                    project_id=project_id,
+                    name=name,
+                    email=email if email else None,
+                    role=role,
+                    responsibility=responsibility if responsibility else None,
+                    user_id=target_user_id
+                )
+                
+                # Auto-assign to project_users if linked to a system user
+                if target_user_id:
+                    try:
+                        StakeholderRepository.assign_user_to_project(db, project_id, target_user_id)
+                    except mysql.connector.IntegrityError:
+                        pass # Already assigned
+                        
+                success_count += 1
+            except Exception as e:
+                errors.append(f"Row {row_idx}: Error saving to database ({str(e)})")
+                
+        db.commit()
+        
+        return {
+            "success": True, 
+            "message": f"Successfully imported {success_count} members.",
+            "data": {
+                "success_count": success_count,
+                "errors": errors
+            }
+        }
+        
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to process file: {str(e)}")

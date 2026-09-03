@@ -64,6 +64,10 @@ class Settings(BaseSettings):
     # Generate once with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
     DRIVE_CREDENTIAL_ENCRYPTION_KEY: str = ""
 
+    # ── Microsoft OneDrive Integration ────────────────────────────────────────
+    ONEDRIVE_SYNC_INTERVAL_HOURS: int = 24
+    ONEDRIVE_SYNC_INTERVAL_MINUTES: int = 0
+
     class Config:
         env_file = ".env"
         extra = "ignore"

@@ -325,14 +325,28 @@ def run_drive_sync_job() -> None:
         logger.error("Drive sync job crashed: %s", exc)
 
 
+def run_onedrive_sync_job() -> None:
+    """
+    Wrapper called by APScheduler for the Microsoft OneDrive sync.
+    """
+    try:
+        from services.onedrive_inbox_service import run_onedrive_sync
+        result = run_onedrive_sync()
+        logger.info(
+            "OneDrive sync completed: %d new file(s) staged, %d error(s).",
+            result.get("new_files_staged", 0),
+            len(result.get("errors", [])),
+        )
+    except Exception as exc:
+        logger.error("OneDrive sync job crashed: %s", exc)
+
+
 def start_scheduler():
     """
     Starts the APScheduler background thread.
     Job 1: Daily follow-up reminders at 9:00 AM.
-    Job 2: Google Drive sync — interval controlled by settings:
-           DRIVE_SYNC_INTERVAL_HOURS (default 24)
-           DRIVE_SYNC_INTERVAL_MINUTES (default 0)
-    If both are 0, defaults to every 24 hours.
+    Job 2: Google Drive sync — interval controlled by settings
+    Job 3: Microsoft OneDrive sync — interval controlled by settings
     """
     from core.config import settings
 
@@ -362,12 +376,26 @@ def start_scheduler():
             replace_existing=True,
         )
 
+        # ── Job 3: OneDrive sync — interval-based ────────────────────────
+        od_hours = settings.ONEDRIVE_SYNC_INTERVAL_HOURS
+        od_minutes = settings.ONEDRIVE_SYNC_INTERVAL_MINUTES
+        od_total_minutes = od_hours * 60 + od_minutes
+        if od_total_minutes <= 0:
+            od_total_minutes = 24 * 60
+
+        scheduler.add_job(
+            run_onedrive_sync_job,
+            trigger='interval',
+            minutes=od_total_minutes,
+            id='onedrive_sync',
+            replace_existing=True,
+        )
+
         scheduler.start()
         logger.info(
             "APScheduler started. Follow-up: 09:00 daily. "
-            "Drive sync: every %d minute(s) (%dh %dm).",
+            "Drive sync: every %dm. OneDrive sync: every %dm.",
             total_minutes,
-            total_minutes // 60,
-            total_minutes % 60,
+            od_total_minutes,
         )
 

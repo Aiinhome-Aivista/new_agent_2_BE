@@ -4,7 +4,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
-from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers, drive
+from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers, drive, onedrive
 import sys
 import os
 
@@ -89,6 +89,7 @@ app.include_router(rag.router, prefix=f"{settings.API_PREFIX}/projects/{{project
 app.include_router(dashboard.router, prefix=f"{settings.API_PREFIX}/dashboard", tags=["dashboard"])
 app.include_router(project_registers.router, prefix=f"{settings.API_PREFIX}")
 app.include_router(drive.router, prefix=f"{settings.API_PREFIX}/drive", tags=["drive"])
+app.include_router(onedrive.router, prefix=f"{settings.API_PREFIX}/onedrive", tags=["onedrive"])
 @app.on_event("startup")
 def startup_event():
     try:
@@ -110,6 +111,13 @@ def startup_event():
         print("Drive tables ensured on startup.")
     except Exception as e:
         print(f"Failed to ensure drive tables: {e}")
+
+    try:
+        from services.onedrive_inbox_service import ensure_onedrive_tables
+        ensure_onedrive_tables()
+        print("OneDrive tables ensured on startup.")
+    except Exception as e:
+        print(f"Failed to ensure onedrive tables: {e}")
 
 @app.get("/")
 def root():
