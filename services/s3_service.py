@@ -48,6 +48,12 @@ class S3Service:
 
     @classmethod
     def delete_file(cls, s3_key: str):
+        if os.path.exists(s3_key):
+            try:
+                os.remove(s3_key)
+                return
+            except Exception:
+                pass
         s3 = cls._get_client()
         try:
             s3.delete_object(Bucket=settings.AWS_S3_BUCKET_NAME, Key=s3_key)
@@ -56,9 +62,14 @@ class S3Service:
 
     @classmethod
     def download_to_temp_file(cls, s3_key: str, temp_path: str):
+        if os.path.exists(s3_key):
+            import shutil
+            shutil.copyfile(s3_key, temp_path)
+            return temp_path
         s3 = cls._get_client()
         try:
             s3.download_file(settings.AWS_S3_BUCKET_NAME, s3_key, temp_path)
             return temp_path
         except ClientError as e:
             raise Exception(f"Failed to download from S3: {e}")
+
