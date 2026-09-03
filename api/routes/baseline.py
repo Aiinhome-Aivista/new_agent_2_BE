@@ -30,6 +30,9 @@ import json
 # pyrefly: ignore [missing-import]
 from fastapi import Query
 import threading
+import uuid
+import tempfile
+from services.s3_service import S3Service
 
 router = APIRouter()
 
@@ -112,7 +115,14 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         _supersede_previous_vector_versions(thread_conn, project_id, document_id)
 
         ext = os.path.splitext(doc["storage_key"])[1].lower()
-        chunks = DocumentService.parse_document(doc["storage_key"], ext)
+        temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+        
+        try:
+            S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+            chunks = DocumentService.parse_document(temp_path, ext)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
         
         # Pipeline Step 1: Detect Sections
         emit("Detecting Scope Sections", 15)
