@@ -1,4 +1,4 @@
-﻿"""
+"""
 RecurringDeliverableService
 """
 
@@ -16,6 +16,31 @@ RECURRENCE_CONFIDENCE_THRESHOLD = 0.75
 PARTIAL_PERIOD_MIN_DAYS = 15
 BATCH_SIZE = 8
 
+# Generic recurrence keyword patterns — no project-specific terms.
+# Maps regex pattern -> canonical cadence string stored in DB.
+RECURRENCE_CADENCE_PATTERNS = [
+    (r'\bmonthly\b|\bper\s+month\b|\bevery\s+month\b|\beach\s+month\b',   'monthly'),
+    (r'\bweekly\b|\bper\s+week\b|\bevery\s+week\b|\beach\s+week\b',       'weekly'),
+    (r'\bfortnightly\b|\bbi-?weekly\b|\bevery\s+two\s+weeks\b',           'biweekly'),
+    (r'\bquarterly\b|\bper\s+quarter\b|\bevery\s+quarter\b',              'quarterly'),
+    (r'\bannually\b|\byearly\b|\bper\s+year\b|\bevery\s+year\b',          'annually'),
+    (r'\bdaily\b|\bper\s+day\b|\bevery\s+day\b',                          'daily'),
+]
+
+
+def _detect_recurrence_cadence(text: str) -> 'str | None':
+    """
+    Deterministically detect recurrence cadence from a scope item name.
+    Returns cadence string ('monthly', 'weekly', etc.) or None.
+    Generic: pattern-based only, no project-specific keywords.
+    """
+    import re
+    text_lower = (text or '').lower()
+    for pattern, cadence in RECURRENCE_CADENCE_PATTERNS:
+        if re.search(pattern, text_lower):
+            return cadence
+    return None
+
 
 class RecurringDeliverableService:
 
@@ -23,9 +48,40 @@ class RecurringDeliverableService:
     def process_recurring_commitments(cls, db, baseline_id, project_id, scope_items, project):
         project_start = cls._parse_date(project.get("start_date"))
         project_end = cls._parse_date(project.get("end_date"))
-        if not project_start or not project_end:
-            print("[Recurring] Project has no start/end date.")
-            return
+
+        # In case project dates are missing or inverted, infer bounds from scope item deadlines
+        item_dates = []
+        for i in scope_items:
+            for k in ("deadline", "deadline_normalized", "planned_date"):
+                d = cls._parse_date(i.get(k))
+                if d:
+                    item_dates.append(d)
+        earliest_item_date = min(item_dates) if item_dates else None
+        latest_item_date = max(item_dates) if item_dates else None
+
+        if not project_start or (earliest_item_date and project_start > earliest_item_date):
+            project_start = earliest_item_date or project_start
+
+        if not project_end or (latest_item_date and project_end < latest_item_date):
+            project_end = latest_item_date or project_end
+
+        if not project_start:
+            project_start = date.today()
+        if not project_end:
+            project_end = date(project_start.year + 1, project_start.month, project_start.day)
+        if project_start > project_end:
+            project_start, project_end = project_end, project_start
+
+        # Sync inferred project dates to DB if missing
+        try:
+            cursor = db.cursor()
+            cursor.execute(
+                "UPDATE projects SET start_date = COALESCE(start_date, %s), end_date = COALESCE(end_date, %s) WHERE id = %s",
+                (project_start, project_end, project_id)
+            )
+            cursor.close()
+        except Exception:
+            pass
 
         candidates = [i for i in scope_items if i.get("scope_type") == "IN_SCOPE" and i.get("_db_id")]
         if not candidates:
@@ -38,6 +94,27 @@ class RecurringDeliverableService:
         recurring_count = 0
         occurrence_count = 0
         for item, result in zip(candidates, recurrence_results):
+            # GAP 1 FIX: Deterministic override — if item name contains a
+            # recurrence keyword, force is_recurring=True and set cadence.
+            # This runs before LLM-based detection to catch what LLM misses.
+            try:
+                detected_cadence = _detect_recurrence_cadence(
+                    item.get('name', '') + ' ' + item.get('description', '')
+                )
+                if detected_cadence and not item.get('is_recurring'):
+                    item['is_recurring'] = True
+                    item['recurrence_cadence'] = detected_cadence
+                    # Align result so the rest of the loop proceeds correctly
+                    if not result.get('is_recurring'):
+                        result = dict(result)
+                        result['is_recurring'] = True
+                        result['frequency'] = detected_cadence.upper()
+                        result['confidence'] = 1.0
+                    print(f"  [RecurringService] Deterministic recurrence detected: "
+                          f"'{item.get('name')}' -> cadence='{detected_cadence}'")
+            except Exception as _det_e:
+                print(f"  [RecurringService] Warning: deterministic recurrence detection failed: {_det_e}")
+            # ... rest of existing loop continues unchanged
             if not result.get("is_recurring"):
                 continue
             frequency = result.get("frequency", "").upper()
@@ -53,6 +130,9 @@ class RecurringDeliverableService:
             eff_end = cls._parse_date(result.get("end_date")) or project_end
             eff_start = max(eff_start, project_start)
             eff_end = min(eff_end, project_end)
+            if eff_start > eff_end:
+                eff_start = project_start
+                eff_end = project_end
             occurrences = cls._generate_occurrences(frequency, eff_start, eff_end, item)
             for occ in occurrences:
                 cls._upsert_occurrence(db, baseline_id, project_id, parent_id, item, occ, item.get("source_document_id"))
