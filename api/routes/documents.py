@@ -36,7 +36,7 @@ def confirm_upload_document(
     verify_project_access(project_id, current_user, db)
     
     cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT monitoring_status FROM projects WHERE id = %s", (project_id,))
+    cursor.execute("SELECT project_name, monitoring_status FROM projects WHERE id = %s", (project_id,))
     project = cursor.fetchone()
     cursor.close()
     
@@ -46,14 +46,18 @@ def confirm_upload_document(
     if document_type in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
         raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to upload EL or IFA documents.")
         
+    import re
     ext = os.path.splitext(file.filename)[1].lower()
     if ext not in [".pdf", ".docx", ".txt"]:
         raise HTTPException(status_code=400, detail="Unsupported file format")
 
-    unique_filename = f"{uuid.uuid4()}{ext}"
+    base_name = os.path.splitext(file.filename)[0]
+    safe_base_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)
+    unique_filename = f"{safe_base_name}_{uuid.uuid4().hex[:8]}{ext}"
+    project_name = project.get("project_name", f"Project_{project_id}") if project else f"Project_{project_id}"
     
     try:
-        storage_key = S3Service.upload_fileobj(file.file, project_id, unique_filename)
+        storage_key = S3Service.upload_fileobj(file.file, project_id, project_name, unique_filename)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to finalize file storage to S3: {e}")
         

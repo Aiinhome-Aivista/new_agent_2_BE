@@ -41,6 +41,12 @@ class DashboardRepository:
                 ORDER BY al.created_at DESC LIMIT 5
             """)
             recent_activities = cursor.fetchall()
+
+            cursor.execute("SELECT COUNT(*) as count, MAX(created_at) as last_event_at FROM audit_logs")
+            audit_activity = cursor.fetchone()
+
+            cursor.execute("SELECT COUNT(*) as count FROM tracker_items WHERE status = 'OPEN'")
+            open_risks = cursor.fetchone()["count"]
             
         else:
             # 1. Active Projects
@@ -77,6 +83,21 @@ class DashboardRepository:
                 ORDER BY al.created_at DESC LIMIT 5
             """, (user_id,))
             recent_activities = cursor.fetchall()
+
+            cursor.execute("""
+                SELECT COUNT(*) as count, MAX(created_at) as last_event_at
+                FROM audit_logs
+                WHERE project_id IN (SELECT project_id FROM project_users WHERE user_id = %s)
+            """, (user_id,))
+            audit_activity = cursor.fetchone()
+
+            cursor.execute("""
+                SELECT COUNT(*) as count
+                FROM tracker_items
+                WHERE project_id IN (SELECT project_id FROM project_users WHERE user_id = %s)
+                AND status = 'OPEN'
+            """, (user_id,))
+            open_risks = cursor.fetchone()["count"]
             
         cursor.close()
         
@@ -92,5 +113,11 @@ class DashboardRepository:
                 "high_severity": high_severity_creep
             },
             "system_alerts": total_alerts,
-            "recent_activities": recent_activities
+            "recent_activities": recent_activities,
+            "audit_status": {
+                "audit_events": audit_activity["count"],
+                "last_audit_at": audit_activity["last_event_at"],
+                "open_risks": open_risks,
+                "baseline_approval_percent": round((approved_baselines / total_baselines) * 100) if total_baselines else 0
+            }
         }
