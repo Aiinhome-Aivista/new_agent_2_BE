@@ -223,8 +223,22 @@ def download_document(
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
         
+    storage_key = doc["storage_key"]
+    
+    # 1. If stored locally and file exists on disk, serve directly via FileResponse
+    if os.path.exists(storage_key):
+        # pyrefly: ignore [missing-import]
+        from fastapi.responses import FileResponse
+        return FileResponse(
+            path=storage_key,
+            filename=doc.get("document_name", os.path.basename(storage_key)),
+            media_type="application/octet-stream"
+        )
+
+    # 2. Otherwise in AWS S3 mode, generate presigned URL and redirect
     try:
-        presigned_url = S3Service.generate_presigned_url(doc["storage_key"])
+        presigned_url = S3Service.generate_presigned_url(storage_key)
+        # pyrefly: ignore [missing-import]
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url=presigned_url)
     except Exception as e:

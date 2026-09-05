@@ -21,17 +21,40 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRY_MINUTES: int = 480
     
-    LLM_API_URL: str
-    LLM_MODEL: str
-    LLM_TIMEOUT: int = 3600
+    # ── LLM Configuration ─────────────────────────────────────────────────────
+    LLM_PROVIDER: str = "gemini"  # Options: "gemini", "openai", "claude", "azure_openai", "custom"
     
-    USE_GEMINI: bool = False
+    # 1. Google Gemini Settings
     GEMINI_API_KEY: str = ""
-    GEMINI_MODEL: str = "gemini-3.5-flash"
+    GEMINI_MODEL: str = "gemini-3.1-flash-lite"
+    
+    # 2. OpenAI Settings (ChatGPT)
+    OPENAI_API_KEY: str = ""
+    OPENAI_MODEL: str = "gpt-4o-mini"
+    OPENAI_BASE_URL: str = ""  # Optional custom OpenAI-compatible endpoint
+    
+    # 3. Anthropic Claude Settings
+    ANTHROPIC_API_KEY: str = ""
+    ANTHROPIC_MODEL: str = "claude-3-5-sonnet-20241022"
+    
+    # 4. Azure OpenAI Settings
+    AZURE_OPENAI_API_KEY: str = ""
+    AZURE_OPENAI_ENDPOINT: str = ""
+    AZURE_OPENAI_DEPLOYMENT: str = "gpt-4o"
+    AZURE_OPENAI_API_VERSION: str = "2024-02-01"
+    
+    # 5. Local / Custom LLM (Ollama, vLLM, FastChat)
+    LLM_API_URL: str = ""
+    LLM_MODEL: str = "mistral-small:24b"
+    LLM_TIMEOUT: int = 300
+    
     EMBEDDING_MODEL: str = "sentence-transformers/all-MiniLM-L6-v2"
     
     CHROMA_PATH: str = "data/chroma_db"
     UPLOAD_PATH: str = "data/uploads"
+    
+    # ── Storage Configuration (local vs aws_s3) ──────────────────────────────
+    STORAGE_MODE: str = "local"  # "local" for development/testing, "aws_s3" for AWS S3 bucket
     
     # ── AWS S3 Integration ────────────────────────────────────────────────────
     AWS_ACCESS_KEY_ID: str = ""
