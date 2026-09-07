@@ -78,8 +78,48 @@ def get_project(project_id: int, current_user: dict = Depends(get_current_user),
         import json
         try:
             results = json.loads(project["latest_sub_agent_results"])
-            project["highestActionPriority"] = results.get("highestActionPriority")
-        except:
+            hap = results.get("highestActionPriority")
+
+            # Verify if hap is still active or if it got resolved
+            if hap and hap.get("activity"):
+                cursor = db.cursor(dictionary=True)
+                cursor.execute("""
+                    SELECT id, deliverable, name, status, risk_score, execution_priority_score, recommended_action, reasoning 
+                    FROM risk_tracker_items 
+                    WHERE project_id = %s AND (deliverable = %s OR name = %s)
+                    ORDER BY id DESC LIMIT 1
+                """, (project_id, hap.get("activity"), hap.get("activity")))
+                item_row = cursor.fetchone()
+                if item_row and item_row.get("status") == "RESOLVED":
+                    # Fallback to top active execution queue item
+                    cursor.execute("""
+                        SELECT id, deliverable, name, status, risk_score, execution_priority_score, recommended_action, reasoning 
+                        FROM risk_tracker_items 
+                        WHERE project_id = %s AND status != 'RESOLVED'
+                        ORDER BY execution_priority_score DESC, priority_order ASC, risk_score DESC LIMIT 1
+                    """, (project_id,))
+                    top_active = cursor.fetchone()
+                    if top_active:
+                        reason_text = ""
+                        try:
+                            r_json = json.loads(top_active.get("reasoning") or "{}")
+                            reason_text = r_json.get("executive_summary") or r_json.get("business_impact", {}).get("immediate") or r_json.get("why_important") or ""
+                        except:
+                            reason_text = top_active.get("reasoning") or ""
+                        if not reason_text:
+                            reason_text = top_active.get("recommended_action") or "Prerequisites satisfied. Unblocked and ready for execution."
+                        
+                        hap = {
+                            "id": top_active.get("id"),
+                            "activity": top_active.get("name") or top_active.get("deliverable"),
+                            "reason": reason_text,
+                            "recommendedAction": top_active.get("recommended_action")
+                        }
+                    else:
+                        hap = None
+                cursor.close()
+            project["highestActionPriority"] = hap
+        except Exception:
             pass
         del project["latest_sub_agent_results"]
         
