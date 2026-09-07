@@ -44,6 +44,53 @@ def _detect_recurrence_cadence(text: str) -> 'str | None':
 
 class RecurringDeliverableService:
 
+    MONTH_NAME_MAP = {
+        'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
+        'july': 7, 'august': 8, 'september': 9, 'october': 10, 'november': 11, 'december': 12,
+        'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6, 'jul': 7, 'aug': 8, 'sep': 9,
+        'oct': 10, 'nov': 11, 'dec': 12
+    }
+
+    @classmethod
+    def _extract_date_range_from_text(cls, text: str, default_year: int = 2026) -> tuple[date | None, date | None]:
+        """
+        Extracts explicit month/date ranges from text such as:
+        - "from March 2026 through December 2026"
+        - "from March 2026 to December 2026"
+        - "March 2026 - December 2026"
+        - "from March through December 2026"
+        """
+        import re
+        if not text:
+            return None, None
+            
+        text_lower = text.lower()
+        # Pattern 1: e.g. "from March 2026 through December 2026" or "March 2026 to December 2026"
+        m = re.search(r'\b(?:from\s+)?([a-z]+)\s+([0-9]{4})\s+(?:through|to|until|-)\s+([a-z]+)\s+([0-9]{4})\b', text_lower)
+        if m:
+            m1_name, y1_str, m2_name, y2_str = m.groups()
+            m1 = cls.MONTH_NAME_MAP.get(m1_name)
+            m2 = cls.MONTH_NAME_MAP.get(m2_name)
+            if m1 and m2:
+                y1, y2 = int(y1_str), int(y2_str)
+                start_d = date(y1, m1, 1)
+                end_d = date(y2, m2, monthrange(y2, m2)[1])
+                return start_d, end_d
+
+        # Pattern 2: e.g. "from March through December 2026"
+        m = re.search(r'\b(?:from\s+)?([a-z]+)\s+(?:through|to|until|-)\s+([a-z]+)\s+([0-9]{4})\b', text_lower)
+        if m:
+            m1_name, m2_name, y_str = m.groups()
+            m1 = cls.MONTH_NAME_MAP.get(m1_name)
+            m2 = cls.MONTH_NAME_MAP.get(m2_name)
+            if m1 and m2:
+                y = int(y_str)
+                start_d = date(y, m1, 1)
+                end_d = date(y, m2, monthrange(y, m2)[1])
+                return start_d, end_d
+
+        return None, None
+
     @classmethod
     def process_recurring_commitments(cls, db, baseline_id, project_id, scope_items, project):
         project_start = cls._parse_date(project.get("start_date"))
@@ -122,23 +169,34 @@ class RecurringDeliverableService:
                 continue
             confidence = float(result.get("confidence", 0.0))
             parent_id = item["_db_id"]
-            cls._update_parent_recurrence_fields(db, parent_id, frequency, confidence, result.get("start_date"), result.get("end_date"))
-            if confidence < RECURRENCE_CONFIDENCE_THRESHOLD:
-                print(f"[Recurring] '{item.get('name')}' confidence {confidence:.2f} < threshold — tagged only.")
-                continue
-            eff_start = cls._parse_date(result.get("start_date")) or project_start
-            eff_end = cls._parse_date(result.get("end_date")) or project_end
-            eff_start = max(eff_start, project_start)
-            eff_end = min(eff_end, project_end)
+            
+            # Check text for explicit month range (e.g. March 2026 through December 2026)
+            combined_item_text = f"{item.get('name', '')} {item.get('description', '')} {item.get('evidence_text', '')}"
+            explicit_start, explicit_end = cls._extract_date_range_from_text(combined_item_text, default_year=project_start.year)
+
+            eff_start = explicit_start or cls._parse_date(result.get("start_date")) or project_start
+            eff_end = explicit_end or cls._parse_date(result.get("end_date")) or project_end
+            
+            if not explicit_start:
+                eff_start = max(eff_start, project_start)
+            if not explicit_end:
+                eff_end = min(eff_end, project_end)
+                
             if eff_start > eff_end:
                 eff_start = project_start
                 eff_end = project_end
+
+            cls._update_parent_recurrence_fields(db, parent_id, frequency, confidence, eff_start.isoformat(), eff_end.isoformat())
+            if confidence < RECURRENCE_CONFIDENCE_THRESHOLD:
+                print(f"[Recurring] '{item.get('name')}' confidence {confidence:.2f} < threshold — tagged only.")
+                continue
+            
             occurrences = cls._generate_occurrences(frequency, eff_start, eff_end, item)
             for occ in occurrences:
                 cls._upsert_occurrence(db, baseline_id, project_id, parent_id, item, occ, item.get("source_document_id"))
                 occurrence_count += 1
             recurring_count += 1
-            print(f"[Recurring] '{item.get('name')}' -> {frequency}, {len(occurrences)} occurrences")
+            print(f"[Recurring] '{item.get('name')}' -> {frequency} ({eff_start} to {eff_end}), {len(occurrences)} occurrences")
 
         db.commit()
         print(f"[Recurring] Done — {recurring_count} recurring, {occurrence_count} occurrences.")

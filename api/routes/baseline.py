@@ -5,6 +5,7 @@ from typing import List, Optional
 import os
 import difflib
 import re
+import time
 from core.database import get_db, get_db_connection
 from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 from services.document_service import DocumentService
@@ -94,6 +95,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         except Exception as ex:
             print(f"Failed to update baseline progress in DB for {step}: {ex}")
 
+    t_start = time.time()
     try:
         # Mark as PROCESSING and set start time
         upd = thread_conn.cursor()
@@ -107,6 +109,13 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         doc = BaselineRepository.get_document(thread_conn, document_id, project_id)
         if not doc:
             raise RuntimeError("Document not found")
+
+        print("\n" + "="*70)
+        print(f"🚀 [BASELINE EXTRACTION PIPELINE] Starting Scope Extraction")
+        print(f"   Project ID: {project_id} | Document ID: {document_id}")
+        print(f"   Document: {doc.get('document_name', doc.get('storage_key', 'Unknown'))} ({doc.get('document_type', 'EL')})")
+        print(f"   Extraction Mode: {mode}")
+        print("="*70)
 
         # Automatic VectorDB version control: remove vector chunks of any
         # previous, superseded EL/IFA documents for this project. This keeps RAG
@@ -125,13 +134,27 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 os.remove(temp_path)
         
         # Pipeline Step 1: Detect Sections
+        t_step1 = time.time()
         emit("Detecting Scope Sections", 15)
         chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
-        
+        step1_time = time.time() - t_step1
+
+        sec_counts = {}
+        for c in chunks_with_sections:
+            sec = c.get("section", "General")
+            sec_counts[sec] = sec_counts.get(sec, 0) + 1
+
+        print("\n" + "-"*70)
+        print(f"🟢 STEP 1: Document Parsing & Scope Section Detection (took {step1_time:.2f}s)")
+        print(f"   Total Chunks Parsed: {len(chunks)} | Scope Sections Identified: {len(sec_counts)}")
+        for sec, cnt in sorted(sec_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"   - {sec}: {cnt} chunk(s)")
+
         # Pipeline Step 2: Extract Candidates
         # Branch on the selected extraction mode. Both branches MUST return
         # candidates in the same dictionary shape so the rest of the pipeline
         # (classification -> dedup -> milestones -> saving) is mode-agnostic.
+        t_step2 = time.time()
         emit("Extracting Scope Candidates", 30)
         if mode == DEEP_SCAN:
             print("[Baseline] Using DEEP_SCAN (Map-Reduce + Heatmap) extraction mode.")
@@ -146,20 +169,70 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         else:
             print("[Baseline] Using QUICK extraction mode.")
             raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
+        step2_time = time.time() - t_step2
+
+        print("\n" + "-"*70)
+        print(f"🔵 STEP 2: Candidate Scope Extraction (took {step2_time:.2f}s)")
+        print(f"   Extraction Mode: {mode} | Total Candidates Extracted: {len(raw_candidates)}")
+        for idx, cand in enumerate(raw_candidates[:8], 1):
+            print(f"   [{idx:02d}] {cand.get('name', '')} (Section: {cand.get('section', 'General')})")
+        if len(raw_candidates) > 8:
+            print(f"   ... and {len(raw_candidates) - 8} more candidates")
         
         # Pipeline Step 3: Classification
+        t_step3 = time.time()
         emit("Classifying Scope Items", 50)
         classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
+        step3_time = time.time() - t_step3
+
+        class_counts = {}
+        for c in classified_candidates:
+            st = c.get("scope_type", "UNCERTAIN")
+            class_counts[st] = class_counts.get(st, 0) + 1
+
+        print("\n" + "-"*70)
+        print(f"🟡 STEP 3: Candidate Scope Classification (took {step3_time:.2f}s)")
+        print(f"   Total Classified: {len(classified_candidates)} | Breakdown: {class_counts}")
+        for stype in ["IN_SCOPE", "OUT_OF_SCOPE", "ASSUMPTION", "UNCERTAIN"]:
+            items_of_type = [c for c in classified_candidates if c.get("scope_type") == stype]
+            if items_of_type:
+                print(f"   ▶ {stype} ({len(items_of_type)} items):")
+                for c in items_of_type[:5]:
+                    conf_pct = int((c.get("confidence") or 0.5) * 100)
+                    print(f"     • {c.get('name', '')} (Conf: {conf_pct}%)")
+                if len(items_of_type) > 5:
+                    print(f"     ... and {len(items_of_type)-5} more")
             
         # Pipeline Step 4: Fuzzy Deduplication
+        t_step4 = time.time()
         emit("Deduplicating Candidates", 70)
         deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
+        step4_time = time.time() - t_step4
+
+        merged_count = len(classified_candidates) - len(deduped_candidates)
+        print("\n" + "-"*70)
+        print(f"🟣 STEP 4: Fuzzy Deduplication & Scope Consolidation (took {step4_time:.2f}s)")
+        print(f"   Before: {len(classified_candidates)} items -> After: {len(deduped_candidates)} items (Merged/Consolidated: {merged_count})")
         
         # Pipeline Step 5: Milestone & Deadline Extraction
+        t_step5 = time.time()
         emit("Extracting Milestones & Deadlines", 85)
         enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
+        step5_time = time.time() - t_step5
+
+        timeline_items = [c for c in enriched_candidates if c.get("milestone") or c.get("deadline_text") or c.get("deadline")]
+        print("\n" + "-"*70)
+        print(f"🟠 STEP 5: Milestone & Deadline Extraction (took {step5_time:.2f}s)")
+        print(f"   Total Candidates Enriched: {len(enriched_candidates)} | Items with Timeline/Date: {len(timeline_items)}")
+        for c in timeline_items[:6]:
+            d_val = c.get("deadline_text") or c.get("deadline") or "N/A"
+            m_val = c.get("milestone") or c.get("name")
+            print(f"   • {m_val} -> Deadline: {d_val} (via {c.get('extraction_method', 'N/A')})")
+        if len(timeline_items) > 6:
+            print(f"   ... and {len(timeline_items)-6} more with timeline info")
         
         # Pipeline Step 6: Normalization and Diffing/Saving
+        t_step6 = time.time()
         emit("Saving Baseline Draft", 95)
         for item in enriched_candidates:
             item["scope_item_normalized"] = NormalizationService.normalize_scope_item(item.get("name"))
@@ -310,8 +383,6 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         # Process Milestones & Dependencies
         emit("Building Milestone Dependencies", 97)
         # Clear existing draft milestones/mappings/dependencies (if any)
-        # We will clear project_milestones for the draft baseline. But actually, project_milestones are tied to project_id.
-        # Let's delete project_milestones for this project_id and baseline_id.
         cursor = thread_conn.cursor()
         cursor.execute("DELETE FROM project_milestones WHERE project_id = %s AND baseline_id = %s", (project_id, baseline_id))
         
@@ -455,6 +526,31 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         )
         thread_conn.commit()
         upd2.close()
+
+        step6_time = time.time() - t_step6
+        total_time = time.time() - t_start
+
+        in_scope_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "IN_SCOPE" or item.get("is_pure_milestone"))
+        out_of_scope_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "OUT_OF_SCOPE")
+        assumptions_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "ASSUMPTION")
+
+        print("\n" + "="*70)
+        print(f"🏁 [BASELINE EXTRACTION COMPLETE] Project {project_id} | Baseline Draft #{baseline_id}")
+        print(f"   Total Processing Time: {total_time:.2f}s")
+        print(f"   ⏱️ Step Timings Breakdown:")
+        print(f"      - Step 1 (Parse & Section Detection): {step1_time:.2f}s")
+        print(f"      - Step 2 (Candidate Scope Extraction): {step2_time:.2f}s")
+        print(f"      - Step 3 (Candidate Classification): {step3_time:.2f}s")
+        print(f"      - Step 4 (Fuzzy Deduplication): {step4_time:.2f}s")
+        print(f"      - Step 5 (Milestones & Deadlines): {step5_time:.2f}s")
+        print(f"      - Step 6 (Normalization, DAG & Recurrence): {step6_time:.2f}s")
+        print(f"   📊 Final Scope Baseline Summary:")
+        print(f"      - In-Scope Deliverables: {in_scope_saved}")
+        print(f"      - Out-of-Scope Items: {out_of_scope_saved}")
+        print(f"      - Assumptions: {assumptions_saved}")
+        print(f"      - Project Milestones Created: {len(milestone_dict)}")
+        print(f"      - Dependency Edges (DAG): {len(edges)}")
+        print("="*70 + "\n")
         
     except Exception as e:
         import traceback
@@ -573,6 +669,12 @@ class ScopeItemCreate(BaseModel):
     deadline_text: Optional[str] = None
     deadline: Optional[str] = None
 
+class ScopeItemScheduleUpdate(BaseModel):
+    milestone: Optional[str] = None
+    deadline: Optional[str] = None
+    deadline_text: Optional[str] = None
+    dependencies: Optional[List[str]] = None
+
 @router.post("/items")
 def add_scope_item(
     project_id: int,
@@ -591,6 +693,11 @@ def add_scope_item(
         baseline_id = baseline["id"]
         source_document_id = baseline.get("source_document_id")
         
+    scope_item_norm = NormalizationService.normalize_scope_item(item.name)
+    milestone_norm = NormalizationService.normalize_milestone(item.milestone, scope_item_norm) if item.milestone else None
+    deadline_norm = item.deadline if (item.deadline and re.match(r'^\d{4}-\d{2}-\d{2}', str(item.deadline))) else None
+    deadline_txt = item.deadline_text or item.deadline or item.milestone
+    
     item_id = BaselineRepository.create_scope_item(
         db=db,
         baseline_id=baseline_id,
@@ -601,10 +708,51 @@ def add_scope_item(
         evidence_text=item.evidence_text or "Manually added item",
         confidence=item.confidence if item.confidence is not None else 1.0,
         source_document_id=source_document_id,
-        deadline=item.deadline,
+        deadline=deadline_norm,
         milestone=item.milestone,
-        deadline_text=item.deadline_text
+        deadline_text=deadline_txt,
+        scope_item_normalized=scope_item_norm,
+        milestone_normalized=milestone_norm,
+        deadline_original=deadline_txt,
+        deadline_normalized=deadline_norm
     )
+    
+    # If milestone or deadline was specified for IN_SCOPE, register/link project_milestones
+    if (item.milestone or deadline_norm) and item.scope_type == "IN_SCOPE":
+        try:
+            m_title = (item.milestone or item.name).strip()
+            cursor = db.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT id FROM project_milestones 
+                WHERE project_id = %s AND baseline_id = %s AND LOWER(TRIM(name)) = LOWER(TRIM(%s))
+            """, (project_id, baseline_id, m_title.lower()))
+            existing_m = cursor.fetchone()
+            if not existing_m:
+                cursor.execute("""
+                    SELECT COALESCE(MAX(sequence), 0) + 1 as next_seq FROM project_milestones
+                    WHERE project_id = %s AND baseline_id = %s
+                """, (project_id, baseline_id))
+                seq_row = cursor.fetchone()
+                next_seq = seq_row["next_seq"] if seq_row else 1
+                cursor.execute("""
+                    INSERT INTO project_milestones (project_id, baseline_id, name, sequence, status, planned_date)
+                    VALUES (%s, %s, %s, %s, 'Planned', %s)
+                """, (project_id, baseline_id, m_title, next_seq, deadline_norm))
+                m_id = cursor.lastrowid
+            else:
+                m_id = existing_m["id"]
+                if deadline_norm:
+                    cursor.execute("UPDATE project_milestones SET planned_date = COALESCE(planned_date, %s) WHERE id = %s", (deadline_norm, m_id))
+            
+            cursor.execute("""
+                INSERT INTO scope_milestone_mapping (scope_item_id, milestone_id, weight)
+                VALUES (%s, %s, 1.0)
+                ON DUPLICATE KEY UPDATE weight = VALUES(weight)
+            """, (item_id, m_id))
+            cursor.close()
+        except Exception as e:
+            print(f"Warning: Failed to create/link project milestone for manual scope item: {e}")
+            
     db.commit()
     
     try:
@@ -617,14 +765,14 @@ def add_scope_item(
         version = version_rec["version"] if version_rec and "version" in version_rec else 0
 
         chunk = {
-            "chunk_index": item_id, # Use item_id to make it unique
+            "chunk_index": item_id,
             "text": text_to_embed,
             "page_number": 0,
-            "scope_item_normalized": NormalizationService.normalize_scope_item(item.name),
+            "scope_item_normalized": scope_item_norm,
             "scope_type": item.scope_type,
-            "milestone_normalized": NormalizationService.normalize_milestone(item.milestone, NormalizationService.normalize_scope_item(item.name)) if item.milestone else "NULL",
-            "deadline_original": item.deadline_text or "NULL",
-            "deadline_normalized": item.deadline or "NULL",
+            "milestone_normalized": milestone_norm or "NULL",
+            "deadline_original": deadline_txt or "NULL",
+            "deadline_normalized": deadline_norm or "NULL",
             "baseline_version": version,
             "status": "APPROVED" if version > 0 else "DRAFT"
         }
@@ -641,6 +789,96 @@ def add_scope_item(
     
     created_item = BaselineRepository.get_scope_item(db, item_id)
     return {"success": True, "message": "Scope item added successfully", "data": created_item}
+
+@router.patch("/items/{item_id}/schedule")
+def schedule_scope_item(
+    project_id: int,
+    item_id: int,
+    data: ScopeItemScheduleUpdate,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    
+    cursor = db.cursor(dictionary=True)
+    cursor.execute("SELECT * FROM scope_items WHERE id = %s AND project_id = %s", (item_id, project_id))
+    scope_item = cursor.fetchone()
+    if not scope_item:
+        cursor.close()
+        raise HTTPException(status_code=404, detail="Scope item not found")
+        
+    baseline_id = scope_item["baseline_id"]
+    deadline_norm = data.deadline if (data.deadline and re.match(r'^\d{4}-\d{2}-\d{2}', str(data.deadline))) else None
+    milestone_val = data.milestone.strip() if data.milestone else (scope_item.get("milestone") or scope_item["name"])
+    scope_item_norm = scope_item.get("scope_item_normalized") or NormalizationService.normalize_scope_item(scope_item["name"])
+    milestone_norm = NormalizationService.normalize_milestone(milestone_val, scope_item_norm)
+    deadline_text_val = data.deadline_text or data.deadline or milestone_val
+    
+    cursor.execute("""
+        UPDATE scope_items 
+        SET milestone = %s,
+            milestone_normalized = %s,
+            deadline = %s,
+            deadline_normalized = %s,
+            deadline_text = %s,
+            deadline_original = %s
+        WHERE id = %s AND project_id = %s
+    """, (milestone_val, milestone_norm, deadline_norm, deadline_norm, deadline_text_val, deadline_text_val, item_id, project_id))
+    
+    # Sync or create corresponding project_milestones
+    if milestone_val and scope_item["scope_type"] == "IN_SCOPE":
+        cursor.execute("""
+            SELECT id FROM project_milestones 
+            WHERE project_id = %s AND baseline_id = %s AND LOWER(TRIM(name)) = LOWER(TRIM(%s))
+        """, (project_id, baseline_id, milestone_val.lower()))
+        existing_m = cursor.fetchone()
+        if existing_m:
+            if deadline_norm:
+                cursor.execute("""
+                    UPDATE project_milestones 
+                    SET planned_date = %s
+                    WHERE id = %s
+                """, (deadline_norm, existing_m["id"]))
+            m_id = existing_m["id"]
+        else:
+            cursor.execute("""
+                SELECT COALESCE(MAX(sequence), 0) + 1 as next_seq FROM project_milestones
+                WHERE project_id = %s AND baseline_id = %s
+            """, (project_id, baseline_id))
+            seq_row = cursor.fetchone()
+            next_seq = seq_row["next_seq"] if seq_row else 1
+            cursor.execute("""
+                INSERT INTO project_milestones (project_id, baseline_id, name, sequence, status, planned_date)
+                VALUES (%s, %s, %s, %s, 'Planned', %s)
+            """, (project_id, baseline_id, milestone_val, next_seq, deadline_norm))
+            m_id = cursor.lastrowid
+            
+        cursor.execute("""
+            INSERT INTO scope_milestone_mapping (scope_item_id, milestone_id, weight)
+            VALUES (%s, %s, 1.0)
+            ON DUPLICATE KEY UPDATE weight = VALUES(weight)
+        """, (item_id, m_id))
+
+    # If dependencies were provided, store them in deliverable_progress
+    if data.dependencies is not None:
+        deps_json = json.dumps(data.dependencies)
+        cursor.execute("""
+            SELECT id FROM deliverable_progress WHERE scope_item_id = %s ORDER BY id DESC LIMIT 1
+        """, (item_id,))
+        prog_row = cursor.fetchone()
+        if prog_row:
+            cursor.execute("UPDATE deliverable_progress SET dependencies = %s WHERE id = %s", (deps_json, prog_row["id"]))
+        else:
+            cursor.execute("""
+                INSERT INTO deliverable_progress (scope_item_id, project_id, status_code, dependencies, progress_percentage)
+                VALUES (%s, %s, 'ACTIVE', %s, 0)
+            """, (item_id, project_id, deps_json))
+
+    db.commit()
+    cursor.close()
+    
+    updated_item = BaselineRepository.get_scope_item(db, item_id)
+    return {"success": True, "message": "Deliverable scheduled on timeline successfully", "data": updated_item}
 
 @router.delete("/items/{item_id}")
 def delete_scope_item(

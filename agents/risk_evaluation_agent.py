@@ -1547,30 +1547,16 @@ class RiskEvaluationAgent:
             pass
         print("="*70 + "\n")
         
-        # 4a. Deterministic Graph Completion for Prerequisites
-        # If an extracted activity is semantically matched to a milestone, but isn't that exact milestone,
-        # we treat it as a prerequisite blocking that milestone.
+        # 4a. Milestone State Synchronization
+        # Synchronize LLM-evaluated statuses for baseline scope items and milestones into state_snapshot
         for i, result in enumerate(llm_risk_results):
             canonical_title = result.get("_canonical_title", "")
             activity_name = result.get("activity", "")
             m_id = get_milestone_id(canonical_title)
             
             if m_id and canonical_title:
-                matched_name = state_snapshot.milestone_id_to_name.get(m_id)
-                # Compare canonical_title vs matched_name to see if it's a prerequisite rather than the milestone itself
-                if matched_name and canonical_title.strip().lower() != matched_name.strip().lower():
-                    # It's a prerequisite blocking m_id!
-                    v_node = f"VIRTUAL_{canonical_title}"
-                    
-                    if m_id not in forward_graph.get(v_node, []):
-                        forward_graph.setdefault(v_node, []).append(m_id)
-                    if v_node not in backward_graph.get(m_id, []):
-                        backward_graph.setdefault(m_id, []).append(v_node)
-                        
-                    # Also record its status in snapshot
-                    v_status = result.get("status", "UNKNOWN").upper().replace(" ", "_")
-                    state_snapshot.milestone_statuses[v_node] = v_status
-                    state_snapshot.milestone_id_to_name[v_node] = canonical_title
+                m_status = result.get("status", "UNKNOWN").upper().replace(" ", "_")
+                state_snapshot.milestone_statuses[m_id] = m_status
                     
         # Re-run static analysis to include virtual nodes
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)

@@ -19,6 +19,14 @@ class MilestoneDeadlineExtractor:
         """
         llm_batch = []
         for candidate in candidates:
+            # 0. Preserve existing timeline metadata if already extracted from table or prior step
+            if candidate.get("deadline_text"):
+                candidate["deadline"] = candidate.get("deadline") or cls._normalize_date(candidate["deadline_text"])
+                candidate["milestone"] = candidate.get("milestone") or candidate.get("name")
+                candidate["extraction_method"] = candidate.get("extraction_method") or "Deterministic"
+                candidate["extraction_confidence"] = candidate.get("extraction_confidence") or 0.95
+                continue
+
             evidence = candidate.get("evidence_text", "")
             desc = candidate.get("description", "")
             combined_text = f"{desc} {evidence}"
