@@ -11,11 +11,26 @@ class Settings(BaseSettings):
     
     FRONTEND_ORIGIN: str = "*"
     
+    # ── Database Provider Configuration ─────────────────────────────────────────
+    DB_PROVIDER: str = "DEFAULT"
+    
     DB_HOST: str = "localhost"
     DB_PORT: int = 3306
     DB_USER: str = "root"
     DB_PASSWORD: str = ""
     DB_NAME: str = "acse_db"
+
+    AWS_RDS_HOST: str = ""
+    AWS_RDS_PORT: int = 3306
+    AWS_RDS_DATABASE: str = "acse_db"
+    AWS_RDS_USER: str = ""
+    AWS_RDS_PASSWORD: str = ""
+
+    AZURE_DB_HOST: str = ""
+    AZURE_DB_PORT: int = 3306
+    AZURE_DB_DATABASE: str = "acse_db"
+    AZURE_DB_USER: str = ""
+    AZURE_DB_PASSWORD: str = ""
     
     JWT_SECRET_KEY: str = "replace_with_secure_secret"
     JWT_ALGORITHM: str = "HS256"
@@ -53,8 +68,9 @@ class Settings(BaseSettings):
     CHROMA_PATH: str = "data/chroma_db"
     UPLOAD_PATH: str = "data/uploads"
     
-    # ── Storage Configuration (local vs aws_s3) ──────────────────────────────
-    STORAGE_MODE: str = "local"  # "local" for development/testing, "aws_s3" for AWS S3 bucket
+    # ── Storage Configuration ──────────────────────────────────────────────────
+    CLOUD_PROVIDER: str = "DEFAULT"
+    STORAGE_MODE: str = "local"  # Deprecated in favor of CLOUD_PROVIDER, keeping for fallback
     
     # ── AWS S3 Integration ────────────────────────────────────────────────────
     AWS_ACCESS_KEY_ID: str = ""
@@ -63,6 +79,10 @@ class Settings(BaseSettings):
     AWS_S3_BUCKET_NAME: str = ""
     AWS_S3_BASE_FOLDER: str = ""
     AWS_S3_AGENT_FOLDER: str = ""
+    
+    # ── Azure Blob Integration ────────────────────────────────────────────────
+    AZURE_STORAGE_CONNECTION_STRING: str = ""
+    AZURE_CONTAINER_NAME: str = ""
     
     CHUNK_SIZE: int = 1000
     CHUNK_OVERLAP: int = 200

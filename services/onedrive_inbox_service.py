@@ -273,7 +273,7 @@ def process_onedrive_inbox_item(inbox_id: int, project_id: int, doc_type: str, u
         import io
         import re
         import tempfile
-        from services.s3_service import S3Service
+        from services.storage_service import StorageService
         
         cursor = conn.cursor(dictionary=True)
         cursor.execute("SELECT project_name FROM projects WHERE id = %s", (project_id,))
@@ -288,7 +288,7 @@ def process_onedrive_inbox_item(inbox_id: int, project_id: int, doc_type: str, u
         unique_filename = f"onedrive_{safe_base_name}_{uuid.uuid4().hex[:8]}{ext}"
         
         file_obj = io.BytesIO(file_bytes)
-        storage_key = S3Service.upload_fileobj(file_obj, project_id, project_name, unique_filename)
+        storage_key = StorageService.upload_fileobj(file_obj, project_id, project_name, unique_filename)
 
         # Register document in repository
         document_id = DocumentRepository.create_document(

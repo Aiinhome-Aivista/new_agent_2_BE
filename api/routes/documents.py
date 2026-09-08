@@ -14,7 +14,7 @@ from services.document_service import DocumentService
 from services.relevance_service import RelevanceService
 from services.rag_service import RAGService
 from repositories.document_repository import DocumentRepository
-from services.s3_service import S3Service
+from services.storage_service import StorageService
 import tempfile
 import mysql.connector
 
@@ -57,7 +57,7 @@ def confirm_upload_document(
     project_name = project.get("project_name", f"Project_{project_id}") if project else f"Project_{project_id}"
     
     try:
-        storage_key = S3Service.upload_fileobj(file.file, project_id, project_name, unique_filename)
+        storage_key = StorageService.upload_fileobj(file.file, project_id, project_name, unique_filename)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to finalize file storage to S3: {e}")
         
@@ -141,7 +141,7 @@ def process_document(
         temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
         
         try:
-            S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+            StorageService.download_to_temp_file(doc["storage_key"], temp_path)
             chunks = DocumentService.parse_document(temp_path, ext)
         finally:
             if os.path.exists(temp_path):
@@ -201,7 +201,7 @@ def delete_document(
         
         # 5. Remove physical file from S3
         try:
-            S3Service.delete_file(doc["storage_key"])
+            StorageService.delete_file(doc["storage_key"])
         except Exception as e:
             print(f"Warning: Failed to delete file from S3: {e}")
             
@@ -237,7 +237,7 @@ def download_document(
 
     # 2. Otherwise in AWS S3 mode, generate presigned URL and redirect
     try:
-        presigned_url = S3Service.generate_presigned_url(storage_key)
+        presigned_url = StorageService.generate_presigned_url(storage_key)
         # pyrefly: ignore [missing-import]
         from fastapi.responses import RedirectResponse
         return RedirectResponse(url=presigned_url)
