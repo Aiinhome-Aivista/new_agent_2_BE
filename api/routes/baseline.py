@@ -33,7 +33,7 @@ from fastapi import Query
 import threading
 import uuid
 import tempfile
-from services.s3_service import S3Service
+from services.storage_service import StorageService
 
 router = APIRouter()
 
@@ -127,7 +127,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
         
         try:
-            S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+            StorageService.download_to_temp_file(doc["storage_key"], temp_path)
             chunks = DocumentService.parse_document(temp_path, ext)
         finally:
             if os.path.exists(temp_path):

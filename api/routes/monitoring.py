@@ -17,7 +17,7 @@ from repositories.document_repository import DocumentRepository
 import mysql.connector
 import uuid
 import tempfile
-from services.s3_service import S3Service
+from services.storage_service import StorageService
 
 router = APIRouter()
 
@@ -121,7 +121,7 @@ def stream_monitoring(
             temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
             
             try:
-                S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+                StorageService.download_to_temp_file(doc["storage_key"], temp_path)
                 chunks = DocumentService.parse_document(temp_path, ext)
             finally:
                 if os.path.exists(temp_path):
@@ -340,7 +340,7 @@ def ingest_status_document(
         temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
         
         try:
-            S3Service.download_to_temp_file(doc["storage_key"], temp_path)
+            StorageService.download_to_temp_file(doc["storage_key"], temp_path)
             chunks = DocumentService.parse_document(temp_path, ext)
         finally:
             if os.path.exists(temp_path):

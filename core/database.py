@@ -5,21 +5,8 @@ from fastapi import HTTPException
 from .config import settings
 
 def get_db_connection():
-    try:
-        connection = mysql.connector.connect(
-            host=settings.DB_HOST,
-            port=settings.DB_PORT,
-            database=settings.DB_NAME,
-            user=settings.DB_USER,
-            password=settings.DB_PASSWORD,
-            charset='utf8mb4',
-            collation='utf8mb4_unicode_ci'
-        )
-        if connection.is_connected():
-            return connection
-    except Error as e:
-        print(f"Error connecting to MySQL: {e}")
-        return None
+    from services.db.factory import DBFactory
+    return DBFactory.get_provider().get_connection()
 
 def get_db():
     conn = get_db_connection()
