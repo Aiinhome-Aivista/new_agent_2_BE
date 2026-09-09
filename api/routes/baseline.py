@@ -1122,15 +1122,8 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
     """
     try:
         from services.risk_scoring_engine import RiskScoringEngine, _parse_due_date
-    except Exception as e:
-        print(f"[GRAPH RECALC WARNING] Could not import RiskScoringEngine: {e}")
+    except Exception:
         return
-
-    print("\n" + "="*70)
-    print(f"🚀 [GRAPH RECALC PIPELINE] Starting PMO Evaluation for Project {project_id}")
-    if completed_title:
-        print(f"   Triggered by Deliverable Completion: '{completed_title}'")
-    print("="*70)
 
     # ──────────────────────────────────────────────────────────────────────────
     # 🟢 STEP 2A: Fact Extraction & Completed Scope Verification
@@ -1151,10 +1144,6 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
     if completed_title:
         completed_scope_names.add(completed_title)
 
-    print("\n" + "-"*70)
-    print("🟢 STEP 2A: Fact Extraction & Completed Deliverables Verification")
-    print(f"   Completed Scope Items ({len(completed_scope_names)}): {list(completed_scope_names)}")
-
     # 1. Ensure any open tracker item whose scope deliverable is COMPLETED is marked RESOLVED
     cursor.execute("""
         SELECT id, title FROM tracker_items 
@@ -1171,7 +1160,6 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
                     resolution = 'Deliverable completed.', resolved_at = NOW()
                 WHERE id = %s
             """, (it["id"],))
-            print(f"   ✓ Auto-resolved tracker item #{it['id']} '{title}' (matching completed deliverable)")
 
     # 2. Ensure any tracker item previously auto-resolved by deliverable completion whose deliverable was REOPENED to ACTIVE is restored to OPEN
     cursor.execute("""
@@ -1192,7 +1180,6 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
                         resolution = NULL, resolved_by = NULL, resolved_at = NULL
                     WHERE id = %s
                 """, (it["id"],))
-                print(f"   ✓ Restored active tracker item #{it['id']} '{title}' (matching active deliverable)")
 
     # ──────────────────────────────────────────────────────────────────────────
     # 🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
@@ -1209,15 +1196,8 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
     """, (project_id,))
     resolved_rows = cursor.fetchall() or []
     resolved_titles = {r["title"] for r in resolved_rows if r.get("title")} | completed_scope_names
-
-    print("\n" + "-"*70)
-    print("🔵 STEP 2B: Context & Active Dependency Graph Reconstruction")
-    print(f"   Remaining Active Items ({len(open_items)})")
-    print(f"   Resolved Ancestor Nodes ({len(resolved_titles)})")
         
     if not open_items:
-        print("   ℹ️ No active items remaining to recalculate.")
-        print("="*70 + "\n")
         return
 
     # Rebuild raw dependency graph from ALL project tracker items (open + resolved)
@@ -1316,12 +1296,8 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
                             graph[upstream_title] = []
                         if not any(_is_title_match(downstream_name, existing_t) for existing_t in graph[upstream_title]):
                             graph[upstream_title].append(downstream_name)
-                            print(f"  [MilestoneEdgeSupp] Added milestone edge: "
-                                  f"'{upstream_title}' → '{downstream_name}' (m_id={upstream_mid})")
-    except Exception as e:
-        print(f"  [MilestoneEdgeSupp] Warning: {e}")
-
-    print(f"   Active Runtime Graph Edges: {graph if graph else 'None (All isolated/independent)'}")
+    except Exception:
+        pass
 
     def _bfs_cascade(start_node: str) -> int:
         visited = set()
@@ -1343,10 +1319,6 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
     # ──────────────────────────────────────────────────────────────────────────
     # 🟡 STEP 2C & 🟣 STEP 2D: Graph Roles & RiskScoringEngine Evaluation
     # ──────────────────────────────────────────────────────────────────────────
-    print("\n" + "-"*70)
-    print("🟡 STEP 2C: Topological Cascade & Graph Role Classification")
-    print("🟣 STEP 2D: RiskScoringEngine 7-Band Mathematical Evaluation")
-    
     recalculated = []
     for item in open_items:
         title = item["title"]
@@ -1431,8 +1403,7 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
                 criticality_score=float(risk_severity),
             )
             new_exec_score = score_res["execution_priority"]
-        except Exception as err:
-            print(f"[GRAPH RECALC WARNING] Scoring error on {title}: {err}")
+        except Exception:
             new_exec_score = item.get("execution_priority_score") or 20
 
         # Step 6: Determine new execution_status & recommended action
@@ -1499,14 +1470,9 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
             "cascade": cascade
         })
 
-        print(f"   • '{title}': Role={new_graph_role:<20} | Cascade={cascade} | Score={new_exec_score:<3} | Status={new_exec_status}")
-
     # ──────────────────────────────────────────────────────────────────────────
     # ⚖️ STEP 2E: Parent > Child Constraint Enforcement
     # ──────────────────────────────────────────────────────────────────────────
-    print("\n" + "-"*70)
-    print("⚖️ STEP 2E: Parent > Child Constraint Enforcement")
-    constraint_applied = False
     for src, targets in graph.items():
         src_items = [r for r in recalculated if _is_title_match(r["title"], src)]
         if not src_items:
@@ -1520,21 +1486,7 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
             if src_rec["new_score"] <= tgt_rec["new_score"]:
                 forced_score = min(100, tgt_rec["new_score"] + 1)
                 cursor.execute("UPDATE tracker_items SET execution_priority_score = %s WHERE id = %s", (forced_score, src_rec["id"]))
-                print(f"   ⚠️ CONSTRAINT: Bumped Parent '{src_rec['title']}' ({src_rec['new_score']} → {forced_score}) to exceed Child '{tgt_rec['title']}' ({tgt_rec['new_score']})")
                 src_rec["new_score"] = forced_score
-                constraint_applied = True
-    if not constraint_applied:
-        print("   ✓ All hierarchical DAG score constraints satisfied.")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 📊 STEP 2G: Final Risk Tracker Output & Aggregation
-    # ──────────────────────────────────────────────────────────────────────────
-    print("\n" + "-"*70)
-    print("📊 STEP 2G: Final Risk Tracker State & Recalculation Summary")
-    recalculated_sorted = sorted(recalculated, key=lambda x: x["new_score"], reverse=True)
-    for rank, it in enumerate(recalculated_sorted, start=1):
-        print(f"   #{rank:<2} {it['title']:<50} | Score: {it['new_score']:<3} | Role: {it['graph_role']:<20} | Status: {it['execution_status']}")
-    print("="*70 + "\n")
 
 class ScopeItemCompletionUpdate(BaseModel):
     completion_status: Optional[str] = None

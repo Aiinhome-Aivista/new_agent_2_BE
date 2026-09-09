@@ -19,14 +19,14 @@ BATCH_SIZE = 8
 # Generic recurrence keyword patterns — no project-specific terms.
 # Maps regex pattern -> canonical cadence string stored in DB.
 RECURRENCE_CADENCE_PATTERNS = [
-    (r'\bmonthly\b|\bper\s+month\b|\bevery\s+month\b|\beach\s+month\b|\bevery\s+1\s+month\b',   'monthly'),
-    (r'\bevery\s+(?:2|two)\s+months\b|\bbimonthly\b|\bbi-monthly\b',                           'bimonthly'),
-    (r'\bevery\s+(?:3|three)\s+months\b|\bquarterly\b|\bper\s+quarter\b|\bevery\s+quarter\b',   'quarterly'),
-    (r'\bevery\s+(?:4|four)\s+months\b|\btriannual\b',                                         'every_4_months'),
-    (r'\bevery\s+(?:6|six|sixth)\s+months\b|\bsemi-?annually\b|\bhalf-?yearly\b|\bbiannually\b', 'semiannual'),
-    (r'\bfortnightly\b|\bbi-?weekly\b|\bevery\s+(?:2|two)\s+weeks\b|\bevery\s+15\s*days\b',    'biweekly'),
-    (r'\bweekly\b|\bper\s+week\b|\bevery\s+week\b|\beach\s+week\b|\bevery\s+1\s+week\b',        'weekly'),
-    (r'\bannually\b|\byearly\b|\bper\s+year\b|\bevery\s+year\b',                               'annually'),
+    (r'\bevery\s+(?:6|six|sixth)\s+months?\b|\bsemi-?annually\b|\bsemi-?annual\b|\bhalf-?yearly\b|\bbiannually\b|\bbiannual\b', 'semiannual'),
+    (r'\bevery\s+(?:4|four)\s+months?\b|\btriannually\b|\btriannual\b',                         'every_4_months'),
+    (r'\bevery\s+(?:3|three)\s+months?\b|\bquarterly\b|\bper\s+quarter\b|\bevery\s+quarter\b',   'quarterly'),
+    (r'\bevery\s+(?:2|two)\s+months?\b|\bbimonthly\b|\bbi-monthly\b',                           'bimonthly'),
+    (r'\bmonthly\b|\bper\s+month\b|\bevery\s+month\b|\beach\s+month\b|\bevery\s+(?:1|one)\s+months?\b', 'monthly'),
+    (r'\bfortnightly\b|\bbi-?weekly\b|\bevery\s+(?:2|two)\s+weeks?\b|\bevery\s+15\s*days?\b',    'biweekly'),
+    (r'\bweekly\b|\bper\s+week\b|\bevery\s+week\b|\beach\s+week\b|\bevery\s+(?:1|one)\s+weeks?\b', 'weekly'),
+    (r'\bannually\b|\bannual\b|\byearly\b|\bper\s+year\b|\bevery\s+year\b|\bevery\s+(?:1|one)\s+years?\b',  'annually'),
     (r'\bdaily\b|\bper\s+day\b|\bevery\s+day\b',                                               'daily'),
 ]
 

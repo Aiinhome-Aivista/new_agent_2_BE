@@ -10,45 +10,6 @@ import os
 
 import threading
 
-class TeeLogger(object):
-    def __init__(self, filename):
-        self.terminal = sys.stdout if not isinstance(sys.stdout, TeeLogger) else sys.stdout.terminal
-        self.filename = filename
-        self.lock = threading.Lock()
-        # Open in append mode 'a' so file writes always go to the end without creating sparse NULL byte gaps on Windows
-        self.log = open(filename, "a", encoding="utf-8", errors="replace")
-
-    def write(self, message):
-        try:
-            self.terminal.write(message)
-        except Exception:
-            pass
-        if message:
-            # Strip any accidental NULL bytes to prevent file corruption
-            cleaned = message.replace("\x00", "")
-            if cleaned:
-                with self.lock:
-                    try:
-                        self.log.write(cleaned)
-                        self.log.flush()
-                    except Exception:
-                        pass
-
-    def flush(self):
-        try:
-            self.terminal.flush()
-        except Exception:
-            pass
-        with self.lock:
-            try:
-                self.log.flush()
-            except Exception:
-                pass
-
-# Redirect all print statements to both the terminal AND a log file safely
-if not isinstance(sys.stdout, TeeLogger):
-    sys.stdout = TeeLogger(os.path.join(os.path.dirname(__file__), "pipeline_trace.log"))
-
 app = FastAPI(
     title=settings.APP_NAME,
     openapi_url=f"{settings.API_PREFIX}/openapi.json",
@@ -92,32 +53,55 @@ app.include_router(drive.router, prefix=f"{settings.API_PREFIX}/drive", tags=["d
 app.include_router(onedrive.router, prefix=f"{settings.API_PREFIX}/onedrive", tags=["onedrive"])
 @app.on_event("startup")
 def startup_event():
+    # 1. Database connection check
+    try:
+        from core.database import get_db_connection
+        conn = get_db_connection()
+        if conn and conn.is_connected():
+            cursor = conn.cursor()
+            cursor.execute("SELECT DATABASE()")
+            db_row = cursor.fetchone()
+            db_name = db_row[0] if db_row else settings.DB_NAME
+            cursor.close()
+            conn.close()
+            print(f"✓ Database connected successfully [{db_name}]")
+        else:
+            print("⚠ Database connection failed.")
+    except Exception as e:
+        print(f"✗ Database connection error: {e}")
+
+    # 2. Silent initialization tasks
     try:
         from services.followup_scheduler import start_scheduler
         start_scheduler()
-    except Exception as e:
-        print(f"Failed to start followup scheduler: {e}")
+    except Exception:
+        pass
         
     try:
         from init_db import run_tracker_migrations
         run_tracker_migrations()
-        print("Successfully ran tracker migrations on startup.")
-    except Exception as e:
-        print(f"Failed to run tracker migrations: {e}")
+    except Exception:
+        pass
 
     try:
         from services.drive_inbox_service import ensure_drive_tables
         ensure_drive_tables()
-        print("Drive tables ensured on startup.")
-    except Exception as e:
-        print(f"Failed to ensure drive tables: {e}")
+    except Exception:
+        pass
 
     try:
         from services.onedrive_inbox_service import ensure_onedrive_tables
         ensure_onedrive_tables()
-        print("OneDrive tables ensured on startup.")
-    except Exception as e:
-        print(f"Failed to ensure onedrive tables: {e}")
+    except Exception:
+        pass
+
+    # 3. Application Start & URL info
+    api_port = getattr(settings, 'API_PORT', 8080)
+    api_host = getattr(settings, 'API_HOST', '127.0.0.1')
+    display_host = '127.0.0.1' if api_host in ('0.0.0.0', '') else api_host
+    print(f"🚀 {settings.APP_NAME} started successfully.")
+    print(f"🔗 Backend API URL: http://{display_host}:{api_port}{settings.API_PREFIX}")
+    print(f"📖 Swagger Docs:    http://{display_host}:{api_port}{settings.API_PREFIX}/docs")
 
 @app.get("/")
 def root():
