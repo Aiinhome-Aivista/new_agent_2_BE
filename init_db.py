@@ -8,59 +8,46 @@ from core.database import get_db_connection
 from core.risk_config_tables import create_risk_config_tables
 
 def run_migrations_started_at():
-    print("Running database migration for started_at column...")
     conn = get_db_connection()
     if not conn:
-        print("Migration: Failed to connect.")
         return
     try:
         cursor = conn.cursor()
         cursor.execute("SHOW COLUMNS FROM documents LIKE 'processing_started_at'")
         col_exists = cursor.fetchone()
         if not col_exists:
-            print("Migration: Adding 'processing_started_at' column...")
             cursor.execute("ALTER TABLE documents ADD COLUMN processing_started_at TIMESTAMP NULL DEFAULT NULL")
             conn.commit()
-            print("Migration: Column added.")
-        else:
-            print("Migration: Column already exists.")
             
         # Clear stuck processing states
-        print("Migration: Resetting stuck PROCESSING documents...")
         cursor.execute("UPDATE documents SET processing_status = 'FAILED', processing_error = 'Server restarted or process crashed', processing_progress = 0, processing_step = 'Failed' WHERE processing_status = 'PROCESSING'")
         conn.commit()
-        print("Migration: Reset complete.")
         
         cursor.close()
-    except Exception as e:
-        print(f"Migration error: {e}")
+    except Exception:
+        pass
     finally:
         conn.close()
 
 def run_tracker_migrations():
-    print("Running database migration for tracker_items columns...")
     conn = get_db_connection()
     if not conn:
-        print("Migration: Failed to connect.")
         return
     try:
         cursor = conn.cursor()
         
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'risk_origin'")
         if not cursor.fetchone():
-            print("Migration: Adding 'risk_origin' column...")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_origin VARCHAR(255) NULL DEFAULT NULL")
             conn.commit()
             
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'previous_highest_score'")
         if not cursor.fetchone():
-            print("Migration: Adding 'previous_highest_score' column...")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN previous_highest_score INT NULL DEFAULT 0")
             conn.commit()
 
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'execution_status'")
         if not cursor.fetchone():
-            print("Migration: Adding decoupled status columns...")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(50) NULL DEFAULT 'NOT_STARTED'")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(50) NULL DEFAULT 'OPEN'")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(100) NULL DEFAULT 'DOWNSTREAM_ACTIVITY'")
@@ -68,13 +55,12 @@ def run_tracker_migrations():
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN recommended_action TEXT NULL")
             conn.commit()
             
-        print("Migration: Updating item_type ENUM...")
         cursor.execute("ALTER TABLE tracker_items MODIFY COLUMN item_type enum('ACTIVITY','NEW_REQUEST','CHANGE_REQUEST','BLOCKER','ACTION_ITEM','DECISION','RISK_MENTIONED','DEPENDENCY') NOT NULL")
         conn.commit()
             
         cursor.close()
-    except Exception as e:
-        print(f"Tracker Migration error: {e}")
+    except Exception:
+        pass
     finally:
         conn.close()
 

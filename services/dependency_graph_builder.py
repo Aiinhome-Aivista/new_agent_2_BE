@@ -616,19 +616,6 @@ class DependencyGraphBuilder:
             (e.source_id, e.target_id): e.condition for e in valid_edges
         }
 
-        # Print final graph
-        print(f"\n=== FINAL GRAPH ===")
-        print(f"{'Source (ID)':<15} | {'Source Name':<45} | {'Target (ID)':<15} | {'Target Name':<45} | {'Cond':<5} | Evidence")
-        print("-" * 150)
-        for e in sorted(valid_edges, key=lambda x: (x.source_id, x.target_id)):
-            src_name = registry.get_by_id(e.source_id)
-            tgt_name = registry.get_by_id(e.target_id)
-            sn = (src_name.display_name if src_name else e.source_id)[:45]
-            tn = (tgt_name.display_name if tgt_name else e.target_id)[:45]
-            ev = (e.evidence or "")[:60]
-            print(f"{e.source_id:<15} | {sn:<45} | {e.target_id:<15} | {tn:<45} | {e.condition:<5} | {ev}")
-        print(f"\n  Total: {len(all_nodes)} nodes, {len(valid_edges)} edges\n")
-
         # ── COMPUTE GRAPH METRICS ─────────────────────────────────────────────
         def _status_fn(nid):
             return (id_to_cand.get(nid) or {}).get("status", "UNKNOWN")
@@ -836,23 +823,5 @@ class DependencyGraphBuilder:
         }
         if candidates:
             candidates[0]["_graph_validation"] = validation_contract
-
-        # Final summary log
-        print(f"\n=== GRAPH ANALYSIS ===")
-        print(f"{'Entity':<50} | {'Role':<22} | {'Ready':<22} | {'Unlocks':>7} | {'Cascade':>7} | {'CritPath'}")
-        print("-" * 130)
-        for cand in sorted(candidates, key=lambda c: -c.get("cascade_count", 0)):
-            name = str(cand.get("canonical_title") or cand.get("activity") or "?")[:50]
-            role = cand.get("graph_role", "ISOLATED")
-            ready = cand.get("readiness_status", "UNKNOWN")
-            unlocks = cand.get("immediate_unlock_count", 0)
-            cascade = cand.get("cascade_count", 0)
-            crit = "YES" if cand.get("critical_path") else ""
-            print(f"{name:<50} | {role:<22} | {ready:<22} | {unlocks:>7} | {cascade:>7} | {crit}")
-        print()
-        print(f"  Validation: {validation_contract['total_confirmed_edges']} edges confirmed, "
-              f"{validation_contract['self_dependencies_rejected']} self-deps rejected, "
-              f"{validation_contract['cycle_edges_rejected']} cycles broken, "
-              f"{validation_contract['unresolved_dependencies']} unresolved deps\n")
 
         return candidates

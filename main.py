@@ -1,3 +1,30 @@
+import sys
+import os
+import builtins
+import threading
+
+# Silence non-essential internal debug prints across all backend modules
+_original_builtin_print = builtins.print
+
+def _clean_terminal_print(*args, **kwargs):
+    if not args:
+        return
+    text = " ".join(str(a) for a in args)
+    allowed_signatures = (
+        "Database connected successfully",
+        "Autonomous Contract Scope Evaluator started",
+        "Backend API URL:",
+        "Swagger Docs:",
+        "Database connection error",
+        "ERROR:",
+        "CRITICAL:",
+        "Traceback",
+    )
+    if any(sig in text for sig in allowed_signatures):
+        _original_builtin_print(*args, **kwargs)
+
+builtins.print = _clean_terminal_print
+
 # pyrefly: ignore [missing-import]
 from fastapi import FastAPI
 # pyrefly: ignore [missing-import]
@@ -5,10 +32,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from core.config import settings
 from core.response import APIStandardResponseMiddleware
 from api.routes import auth, users, projects, stakeholders, documents, baseline, monitoring, tracker, dashboard, rag, project_registers, drive, onedrive
-import sys
-import os
-
-import threading
 
 app = FastAPI(
     title=settings.APP_NAME,

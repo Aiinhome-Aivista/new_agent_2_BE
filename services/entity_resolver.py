@@ -223,13 +223,7 @@ class CanonicalEntityRegistry:
         return list(self._by_id.values())
 
     def print_registry(self):
-        print("\n=== CANONICAL ENTITY REGISTRY ===")
-        print(f"{'ID':<12} | {'Canonical Name':<55} | {'Type':<20} | Aliases")
-        print("-" * 120)
-        for e in sorted(self._by_id.values(), key=lambda x: x.canonical_id):
-            aliases = ", ".join(e.aliases[:4]) if e.aliases else "-"
-            print(f"{e.canonical_id:<12} | {e.display_name:<55} | {e.entity_type:<20} | {aliases}")
-        print()
+        pass
 
 
 # ---------------------------------------------------------------------------
