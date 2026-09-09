@@ -19,12 +19,15 @@ BATCH_SIZE = 8
 # Generic recurrence keyword patterns — no project-specific terms.
 # Maps regex pattern -> canonical cadence string stored in DB.
 RECURRENCE_CADENCE_PATTERNS = [
-    (r'\bmonthly\b|\bper\s+month\b|\bevery\s+month\b|\beach\s+month\b',   'monthly'),
-    (r'\bweekly\b|\bper\s+week\b|\bevery\s+week\b|\beach\s+week\b',       'weekly'),
-    (r'\bfortnightly\b|\bbi-?weekly\b|\bevery\s+two\s+weeks\b',           'biweekly'),
-    (r'\bquarterly\b|\bper\s+quarter\b|\bevery\s+quarter\b',              'quarterly'),
-    (r'\bannually\b|\byearly\b|\bper\s+year\b|\bevery\s+year\b',          'annually'),
-    (r'\bdaily\b|\bper\s+day\b|\bevery\s+day\b',                          'daily'),
+    (r'\bmonthly\b|\bper\s+month\b|\bevery\s+month\b|\beach\s+month\b|\bevery\s+1\s+month\b',   'monthly'),
+    (r'\bevery\s+(?:2|two)\s+months\b|\bbimonthly\b|\bbi-monthly\b',                           'bimonthly'),
+    (r'\bevery\s+(?:3|three)\s+months\b|\bquarterly\b|\bper\s+quarter\b|\bevery\s+quarter\b',   'quarterly'),
+    (r'\bevery\s+(?:4|four)\s+months\b|\btriannual\b',                                         'every_4_months'),
+    (r'\bevery\s+(?:6|six|sixth)\s+months\b|\bsemi-?annually\b|\bhalf-?yearly\b|\bbiannually\b', 'semiannual'),
+    (r'\bfortnightly\b|\bbi-?weekly\b|\bevery\s+(?:2|two)\s+weeks\b|\bevery\s+15\s*days\b',    'biweekly'),
+    (r'\bweekly\b|\bper\s+week\b|\bevery\s+week\b|\beach\s+week\b|\bevery\s+1\s+week\b',        'weekly'),
+    (r'\bannually\b|\byearly\b|\bper\s+year\b|\bevery\s+year\b',                               'annually'),
+    (r'\bdaily\b|\bper\s+day\b|\bevery\s+day\b',                                               'daily'),
 ]
 
 
@@ -88,6 +91,28 @@ class RecurringDeliverableService:
                 start_d = date(y, m1, 1)
                 end_d = date(y, m2, monthrange(y, m2)[1])
                 return start_d, end_d
+
+        # Pattern 3: Single start date (e.g. "starting from July 2026", "effective July 2026", "from July 2026 onwards", "beginning May 2026")
+        m = re.search(r'\b(?:starting|starts|effective|commencing|beginning)\s+(?:from\s+|in\s+|on\s+)?([a-z]+)\s+([0-9]{4})\b|\bfrom\s+([a-z]+)\s+([0-9]{4})\s+onwards\b', text_lower)
+        if m:
+            groups = m.groups()
+            m_name = groups[0] or groups[2]
+            y_str = groups[1] or groups[3]
+            m_val = cls.MONTH_NAME_MAP.get(m_name)
+            if m_val:
+                y = int(y_str)
+                start_d = date(y, m_val, 1)
+                return start_d, None
+
+        # Pattern 4: Single end date (e.g. "until December 2026", "through March 2027", "ending Dec 2026")
+        m = re.search(r'\b(?:until|through|up\s+to|ending)\s+([a-z]+)\s+([0-9]{4})\b', text_lower)
+        if m:
+            m_name, y_str = m.groups()
+            m_val = cls.MONTH_NAME_MAP.get(m_name)
+            if m_val:
+                y = int(y_str)
+                end_d = date(y, m_val, monthrange(y, m_val)[1])
+                return None, end_d
 
         return None, None
 
@@ -165,7 +190,8 @@ class RecurringDeliverableService:
             if not result.get("is_recurring"):
                 continue
             frequency = result.get("frequency", "").upper()
-            if frequency not in ("WEEKLY", "MONTHLY", "QUARTERLY", "YEARLY"):
+            ALLOWED_FREQUENCIES = {"WEEKLY", "BIWEEKLY", "FORTNIGHTLY", "MONTHLY", "BIMONTHLY", "QUARTERLY", "EVERY_4_MONTHS", "TRIANNUAL", "SEMIANNUAL", "HALF_YEARLY", "BIANNUAL", "YEARLY", "ANNUALLY", "DAILY"}
+            if frequency not in ALLOWED_FREQUENCIES:
                 continue
             confidence = float(result.get("confidence", 0.0))
             parent_id = item["_db_id"]
@@ -221,18 +247,28 @@ class RecurringDeliverableService:
 
     @classmethod
     def _generate_occurrences(cls, frequency, eff_start, eff_end, parent_item):
-        if frequency == "MONTHLY":
-            return cls._monthly_occurrences(eff_start, eff_end, parent_item)
-        if frequency == "QUARTERLY":
+        if frequency in ("MONTHLY", "EVERY_1_MONTH"):
+            return cls._step_month_occurrences(eff_start, eff_end, parent_item, step=1)
+        if frequency in ("BIMONTHLY", "EVERY_2_MONTHS"):
+            return cls._step_month_occurrences(eff_start, eff_end, parent_item, step=2)
+        if frequency in ("QUARTERLY", "EVERY_3_MONTHS"):
             return cls._quarterly_occurrences(eff_start, eff_end, parent_item)
+        if frequency in ("EVERY_4_MONTHS", "TRIANNUAL"):
+            return cls._step_month_occurrences(eff_start, eff_end, parent_item, step=4)
+        if frequency in ("SEMIANNUAL", "HALF_YEARLY", "EVERY_6_MONTHS", "BIANNUAL"):
+            return cls._step_month_occurrences(eff_start, eff_end, parent_item, step=6)
         if frequency == "WEEKLY":
             return cls._weekly_occurrences(eff_start, eff_end, parent_item)
-        if frequency == "YEARLY":
+        if frequency in ("BIWEEKLY", "FORTNIGHTLY", "EVERY_2_WEEKS", "EVERY_15_DAYS"):
+            return cls._biweekly_occurrences(eff_start, eff_end, parent_item)
+        if frequency in ("YEARLY", "ANNUALLY"):
             return cls._yearly_occurrences(eff_start, eff_end, parent_item)
+        if frequency == "DAILY":
+            return cls._daily_occurrences(eff_start, eff_end, parent_item)
         return []
 
     @classmethod
-    def _monthly_occurrences(cls, eff_start, eff_end, parent):
+    def _step_month_occurrences(cls, eff_start, eff_end, parent, step=1):
         results = []
         year, month = eff_start.year, eff_start.month
         while True:
@@ -246,9 +282,9 @@ class RecurringDeliverableService:
                 period_key = f"{year}-{month:02d}"
                 label = period_end.strftime("%b %Y")
                 results.append(cls._occ(parent, period_key, label, period_end))
-            month += 1
-            if month > 12:
-                month = 1
+            month += step
+            while month > 12:
+                month -= 12
                 year += 1
         return results
 
@@ -284,6 +320,32 @@ class RecurringDeliverableService:
             label = f"Wk {iso[1]} {iso[0]}"
             results.append(cls._occ(parent, period_key, label, current_sunday))
             current_sunday += timedelta(weeks=1)
+        return results
+
+    @classmethod
+    def _biweekly_occurrences(cls, eff_start, eff_end, parent):
+        results = []
+        current_date = eff_start + timedelta(days=14)
+        occ_num = 1
+        while current_date <= eff_end:
+            period_key = f"{current_date.year}-BW{occ_num:02d}"
+            label = current_date.strftime("%d %b %Y")
+            results.append(cls._occ(parent, period_key, label, current_date))
+            current_date += timedelta(days=14)
+            occ_num += 1
+        return results
+
+    @classmethod
+    def _daily_occurrences(cls, eff_start, eff_end, parent):
+        results = []
+        current_date = eff_start + timedelta(days=1)
+        count = 0
+        while current_date <= eff_end and count < 365:
+            period_key = current_date.strftime("%Y-%m-%d")
+            label = current_date.strftime("%d %b %Y")
+            results.append(cls._occ(parent, period_key, label, current_date))
+            current_date += timedelta(days=1)
+            count += 1
         return results
 
     @classmethod

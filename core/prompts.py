@@ -900,12 +900,16 @@ RULES:
    - Incidentally mentioned with a time period (e.g., "monthly steering committee discussed CRM progress").
 
 3. FREQUENCY — If recurring, identify the frequency as exactly one of:
-   "WEEKLY" | "MONTHLY" | "QUARTERLY" | "YEARLY"
+   "WEEKLY" | "BIWEEKLY" | "MONTHLY" | "BIMONTHLY" | "QUARTERLY" | "EVERY_4_MONTHS" | "SEMIANNUAL" | "YEARLY"
    Normalize semantic variants:
-   - "every month", "monthly", "each month", "per month" → MONTHLY
-   - "every week", "weekly", "each week" → WEEKLY
-   - "every quarter", "quarterly", "once per quarter" → QUARTERLY
-   - "every year", "annually", "annual", "yearly" → YEARLY
+   - "every week", "weekly", "each week", "per week" → WEEKLY
+   - "every two weeks", "every 2 weeks", "bi-weekly", "biweekly", "every 15 days", "fortnightly" → BIWEEKLY
+   - "every month", "monthly", "each month", "per month", "every 1 month" → MONTHLY
+   - "every two months", "every 2 months", "bimonthly", "bi-monthly" → BIMONTHLY
+   - "every three months", "every 3 months", "every quarter", "quarterly", "once per quarter" → QUARTERLY
+   - "every four months", "every 4 months", "triannual" → EVERY_4_MONTHS
+   - "every six months", "every 6 months", "every sixth month", "semi-annually", "half-yearly", "biannually" → SEMIANNUAL
+   - "every year", "annually", "annual", "yearly", "each year" → YEARLY
 
 4. DATE BOUNDS — Extract explicit start/end dates only if the EL text directly states them.
    DO NOT invent or infer dates. Return null if not explicitly stated.
@@ -944,7 +948,7 @@ Output strictly as a JSON ARRAY of objects, one per input item, matching the inp
 
 Rules for output:
 - "is_recurring" MUST be a boolean.
-- "frequency" MUST be one of "WEEKLY","MONTHLY","QUARTERLY","YEARLY" or null.
+- "frequency" MUST be one of "WEEKLY","BIWEEKLY","MONTHLY","BIMONTHLY","QUARTERLY","EVERY_4_MONTHS","SEMIANNUAL","YEARLY" or null.
 - "start_date" and "end_date" MUST be "YYYY-MM-DD" strings or null.
 - "confidence" MUST be a float between 0.0 and 1.0.
 - Output ONLY the JSON array. No markdown blocks, no explanations outside JSON.
