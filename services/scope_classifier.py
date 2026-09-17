@@ -19,15 +19,11 @@ class ScopeClassifier:
     @classmethod
     def _apply_section_failsafe(cls, candidate: dict, original_scope_type: str = "UNCERTAIN", original_conf: float = 0.0, original_evidence: str = ""):
         cand_section = candidate.get("section", "General")
-        if cand_section in {"Out of Scope", "Client Responsibilities", "Customer Responsibilities"}:
+        if cand_section in cls.BAD_SECTIONS:
             candidate["scope_type"] = "OUT_OF_SCOPE"
             candidate["confidence"] = 0.95
             candidate["evidence_text"] = f"Item explicitly specified under '{cand_section}' section of the contract."
-        elif cand_section == "Assumptions":
-            candidate["scope_type"] = "ASSUMPTION"
-            candidate["confidence"] = 0.95
-            candidate["evidence_text"] = "Item explicitly specified under 'Assumptions' section of the contract."
-        elif cand_section in {"Scope of Work", "Deliverables", "Responsibilities", "Milestones"}:
+        elif cand_section in {"Scope of Work", "Deliverables", "Responsibilities", "Milestones", "Recurring Commitments"}:
             candidate["scope_type"] = "IN_SCOPE"
             candidate["confidence"] = 0.90
             candidate["evidence_text"] = f"Item specified under '{cand_section}' section of the contract."
@@ -151,9 +147,13 @@ class ScopeClassifier:
                     confidence = res.get("confidence", 0.5)
                     evidence_text = res.get("evidence_text", "No reasoning provided.")
                     
-                    # If LLM gave UNCERTAIN on an item from Out of Scope or Assumptions, use robust section failsafe
+                    # Enforce section ground truth over LLM boundary hallucinations
                     cand_sec = candidate_ref.get("section", "General")
-                    if scope_type == "UNCERTAIN" and (cand_sec in cls.BAD_SECTIONS or cand_sec != "General"):
+                    if cand_sec in {"Scope of Work", "Deliverables", "Responsibilities", "Milestones", "Recurring Commitments"} and scope_type in {"OUT_OF_SCOPE", "UNCERTAIN"}:
+                        cls._apply_section_failsafe(candidate_ref, "IN_SCOPE", 0.95, f"Explicitly listed under '{cand_sec}' section of the contract.")
+                    elif cand_sec in cls.BAD_SECTIONS and scope_type != "OUT_OF_SCOPE":
+                        cls._apply_section_failsafe(candidate_ref, "OUT_OF_SCOPE", 0.95, f"Explicitly listed under '{cand_sec}' section of the contract.")
+                    elif scope_type == "UNCERTAIN" and cand_sec != "General":
                         cls._apply_section_failsafe(candidate_ref, scope_type, confidence, evidence_text)
                     else:
                         candidate_ref["scope_type"] = scope_type
@@ -252,8 +252,13 @@ class ScopeClassifier:
             confidence = result.get("confidence", 0.5)
             evidence_text = result.get("evidence_text", "No reasoning provided.")
             
+            # Enforce section ground truth over LLM boundary hallucinations
             cand_sec = candidate.get("section", "General")
-            if scope_type == "UNCERTAIN" and (cand_sec in cls.BAD_SECTIONS or cand_sec != "General"):
+            if cand_sec in {"Scope of Work", "Deliverables", "Responsibilities", "Milestones", "Recurring Commitments"} and scope_type in {"OUT_OF_SCOPE", "UNCERTAIN"}:
+                cls._apply_section_failsafe(candidate, "IN_SCOPE", 0.95, f"Explicitly listed under '{cand_sec}' section of the contract.")
+            elif cand_sec in cls.BAD_SECTIONS and scope_type != "OUT_OF_SCOPE":
+                cls._apply_section_failsafe(candidate, "OUT_OF_SCOPE", 0.95, f"Explicitly listed under '{cand_sec}' section of the contract.")
+            elif scope_type == "UNCERTAIN" and cand_sec != "General":
                 cls._apply_section_failsafe(candidate, scope_type, confidence, evidence_text)
             else:
                 candidate["scope_type"] = scope_type

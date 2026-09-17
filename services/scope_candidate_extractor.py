@@ -14,7 +14,8 @@ class ScopeCandidateExtractor:
         "Out of Scope",
         "Assumptions",
         "Dependencies",
-        "Milestones"
+        "Milestones",
+        "Recurring Commitments"
     }
 
     HEADING_BLACKLIST = {

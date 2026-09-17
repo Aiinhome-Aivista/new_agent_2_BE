@@ -1,4 +1,17 @@
 # pyrefly: ignore [missing-import]
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
+# pyrefly: ignore [missing-import]
 from fastapi import APIRouter, Depends, HTTPException, status, Body
 from pydantic import BaseModel
 from typing import List, Optional
@@ -111,7 +124,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             raise RuntimeError("Document not found")
 
         print("\n" + "="*70)
-        print(f"🚀 [BASELINE EXTRACTION PIPELINE] Starting Scope Extraction")
+        print(f">> [BASELINE EXTRACTION PIPELINE] Starting Scope Extraction")
         print(f"   Project ID: {project_id} | Document ID: {document_id}")
         print(f"   Document: {doc.get('document_name', doc.get('storage_key', 'Unknown'))} ({doc.get('document_type', 'EL')})")
         print(f"   Extraction Mode: {mode}")
@@ -145,7 +158,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             sec_counts[sec] = sec_counts.get(sec, 0) + 1
 
         print("\n" + "-"*70)
-        print(f"🟢 STEP 1: Document Parsing & Scope Section Detection (took {step1_time:.2f}s)")
+        print(f"[*] STEP 1: Document Parsing & Scope Section Detection (took {step1_time:.2f}s)")
         print(f"   Total Chunks Parsed: {len(chunks)} | Scope Sections Identified: {len(sec_counts)}")
         for sec, cnt in sorted(sec_counts.items(), key=lambda x: x[1], reverse=True):
             print(f"   - {sec}: {cnt} chunk(s)")
@@ -172,7 +185,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         step2_time = time.time() - t_step2
 
         print("\n" + "-"*70)
-        print(f"🔵 STEP 2: Candidate Scope Extraction (took {step2_time:.2f}s)")
+        print(f"[*] STEP 2: Candidate Scope Extraction (took {step2_time:.2f}s)")
         print(f"   Extraction Mode: {mode} | Total Candidates Extracted: {len(raw_candidates)}")
         for idx, cand in enumerate(raw_candidates[:8], 1):
             print(f"   [{idx:02d}] {cand.get('name', '')} (Section: {cand.get('section', 'General')})")
@@ -191,15 +204,15 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             class_counts[st] = class_counts.get(st, 0) + 1
 
         print("\n" + "-"*70)
-        print(f"🟡 STEP 3: Candidate Scope Classification (took {step3_time:.2f}s)")
+        print(f"[*] STEP 3: Candidate Scope Classification (took {step3_time:.2f}s)")
         print(f"   Total Classified: {len(classified_candidates)} | Breakdown: {class_counts}")
-        for stype in ["IN_SCOPE", "OUT_OF_SCOPE", "ASSUMPTION", "UNCERTAIN"]:
+        for stype in ["IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"]:
             items_of_type = [c for c in classified_candidates if c.get("scope_type") == stype]
             if items_of_type:
-                print(f"   ▶ {stype} ({len(items_of_type)} items):")
+                print(f"   > {stype} ({len(items_of_type)} items):")
                 for c in items_of_type[:5]:
                     conf_pct = int((c.get("confidence") or 0.5) * 100)
-                    print(f"     • {c.get('name', '')} (Conf: {conf_pct}%)")
+                    print(f"     * {c.get('name', '')} (Conf: {conf_pct}%)")
                 if len(items_of_type) > 5:
                     print(f"     ... and {len(items_of_type)-5} more")
             
@@ -211,7 +224,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 
         merged_count = len(classified_candidates) - len(deduped_candidates)
         print("\n" + "-"*70)
-        print(f"🟣 STEP 4: Fuzzy Deduplication & Scope Consolidation (took {step4_time:.2f}s)")
+        print(f"[*] STEP 4: Fuzzy Deduplication & Scope Consolidation (took {step4_time:.2f}s)")
         print(f"   Before: {len(classified_candidates)} items -> After: {len(deduped_candidates)} items (Merged/Consolidated: {merged_count})")
         
         # Pipeline Step 5: Milestone & Deadline Extraction
@@ -222,12 +235,12 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 
         timeline_items = [c for c in enriched_candidates if c.get("milestone") or c.get("deadline_text") or c.get("deadline")]
         print("\n" + "-"*70)
-        print(f"🟠 STEP 5: Milestone & Deadline Extraction (took {step5_time:.2f}s)")
+        print(f"[*] STEP 5: Milestone & Deadline Extraction (took {step5_time:.2f}s)")
         print(f"   Total Candidates Enriched: {len(enriched_candidates)} | Items with Timeline/Date: {len(timeline_items)}")
         for c in timeline_items[:6]:
             d_val = c.get("deadline_text") or c.get("deadline") or "N/A"
             m_val = c.get("milestone") or c.get("name")
-            print(f"   • {m_val} -> Deadline: {d_val} (via {c.get('extraction_method', 'N/A')})")
+            print(f"   * {m_val} -> Deadline: {d_val} (via {c.get('extraction_method', 'N/A')})")
         if len(timeline_items) > 6:
             print(f"   ... and {len(timeline_items)-6} more with timeline info")
         
@@ -532,19 +545,19 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 
         in_scope_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "IN_SCOPE" or item.get("is_pure_milestone"))
         out_of_scope_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "OUT_OF_SCOPE")
-        assumptions_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "ASSUMPTION")
+        assumptions_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("section") == "Assumptions" or item.get("source_section") == "Assumptions")
 
         print("\n" + "="*70)
-        print(f"🏁 [BASELINE EXTRACTION COMPLETE] Project {project_id} | Baseline Draft #{baseline_id}")
+        print(f">> [BASELINE EXTRACTION COMPLETE] Project {project_id} | Baseline Draft #{baseline_id}")
         print(f"   Total Processing Time: {total_time:.2f}s")
-        print(f"   ⏱️ Step Timings Breakdown:")
+        print(f"   Step Timings Breakdown:")
         print(f"      - Step 1 (Parse & Section Detection): {step1_time:.2f}s")
         print(f"      - Step 2 (Candidate Scope Extraction): {step2_time:.2f}s")
         print(f"      - Step 3 (Candidate Classification): {step3_time:.2f}s")
         print(f"      - Step 4 (Fuzzy Deduplication): {step4_time:.2f}s")
         print(f"      - Step 5 (Milestones & Deadlines): {step5_time:.2f}s")
         print(f"      - Step 6 (Normalization, DAG & Recurrence): {step6_time:.2f}s")
-        print(f"   📊 Final Scope Baseline Summary:")
+        print(f"   Final Scope Baseline Summary:")
         print(f"      - In-Scope Deliverables: {in_scope_saved}")
         print(f"      - Out-of-Scope Items: {out_of_scope_saved}")
         print(f"      - Assumptions: {assumptions_saved}")

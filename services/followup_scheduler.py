@@ -290,7 +290,6 @@ def run_followup_checks(target_date: Optional[str] = None) -> Dict[str, Any]:
                 logger.error(f"Failed processing item {item.get('id')}: {e}")
                 
         cursor.close()
-        conn.close()
         
         return {
             "success": True,
@@ -302,11 +301,12 @@ def run_followup_checks(target_date: Optional[str] = None) -> Dict[str, Any]:
         
     except Exception as e:
         logger.error(f"Exception during follow-up checks execution: {e}")
+        return {"success": False, "error": str(e)}
+    finally:
         try:
             conn.close()
         except Exception:
             pass
-        return {"success": False, "error": str(e)}
 
 def run_drive_sync_job() -> None:
     """

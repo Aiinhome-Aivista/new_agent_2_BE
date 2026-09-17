@@ -172,12 +172,11 @@ class RecurringDeliverableService:
             try:
                 detected_cadence = _detect_recurrence_cadence(
                     item.get('name', '') + ' ' + item.get('description', '')
-                )
-                if detected_cadence and not item.get('is_recurring'):
+                ) or item.get('recurrence_cadence')
+                if detected_cadence:
                     item['is_recurring'] = True
                     item['recurrence_cadence'] = detected_cadence
-                    # Align result so the rest of the loop proceeds correctly
-                    if not result.get('is_recurring'):
+                    if not result.get('is_recurring') or not result.get('frequency'):
                         result = dict(result)
                         result['is_recurring'] = True
                         result['frequency'] = detected_cadence.upper()

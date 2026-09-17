@@ -126,9 +126,12 @@ def stream_monitoring(
             finally:
                 if os.path.exists(temp_path):
                     os.remove(temp_path)
-            text = "\n".join([chunk["text"] for chunk in chunks[:8]])
-            if len(text) > 8000:
-                text = text[:8000]
+            # Use ALL chunks joined — cap at CONTEXT_MAX_CHARACTERS to stay within LLM limits
+            from core.config import settings as _settings
+            max_chars = getattr(_settings, 'CONTEXT_MAX_CHARACTERS', 20000)
+            text = "\n".join([chunk["text"] for chunk in chunks])
+            if len(text) > max_chars:
+                text = text[:max_chars]
 
             yield f'data: {json.dumps({"step": "Reading Uploaded Document", "progress": 12, "status": "running"})}\n\n'
 
@@ -345,9 +348,12 @@ def ingest_status_document(
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-        text = "\n".join([chunk["text"] for chunk in chunks[:8]])
-        if len(text) > 8000:
-            text = text[:8000]
+        # Use ALL chunks joined — cap at CONTEXT_MAX_CHARACTERS to stay within LLM limits
+        from core.config import settings as _settings
+        max_chars = getattr(_settings, 'CONTEXT_MAX_CHARACTERS', 20000)
+        text = "\n".join([chunk["text"] for chunk in chunks])
+        if len(text) > max_chars:
+            text = text[:max_chars]
             
         DocumentRepository.update_processing_status(db, document_id, 'PROCESSING')
         db.commit()

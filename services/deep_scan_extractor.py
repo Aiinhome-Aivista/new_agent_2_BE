@@ -53,6 +53,7 @@ class DeepScanExtractor:
         "Client Responsibilities",
         "Milestones and Timeline",
         "Dependencies",
+        "Recurring Commitments",
     ]
 
     # Sections the LLM is allowed to attribute an item to (matches
@@ -66,6 +67,7 @@ class DeepScanExtractor:
         "Assumptions",
         "Dependencies",
         "Milestones",
+        "Recurring Commitments",
         "General",
     }
 
