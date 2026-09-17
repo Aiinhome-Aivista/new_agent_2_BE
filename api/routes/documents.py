@@ -243,3 +243,110 @@ def download_document(
         return RedirectResponse(url=presigned_url)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate download link: {e}")
+
+@router.get("/{document_id}/markdown")
+def get_document_markdown(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Retrieves the converted Markdown content for a document.
+    Reads from the cached .md file if it exists, or dynamically converts via MarkItDown.
+    """
+    verify_project_access(project_id, current_user, db)
+    doc = DocumentRepository.get_document(db, document_id, project_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    storage_key = doc["storage_key"]
+    base_name = os.path.splitext(doc.get("document_name", os.path.basename(storage_key)))[0]
+    ext = os.path.splitext(storage_key)[1].lower()
+
+    # 1. Check if corresponding .md file already exists in storage or adjacent
+    md_storage_path = os.path.splitext(storage_key)[0] + ".md"
+    markdown_content = ""
+
+    if os.path.exists(md_storage_path):
+        try:
+            with open(md_storage_path, "r", encoding="utf-8", errors="ignore") as f:
+                markdown_content = f.read()
+        except Exception:
+            markdown_content = ""
+
+    # 2. If not yet converted, generate via DocumentService
+    if not markdown_content:
+        temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+        try:
+            StorageService.download_to_temp_file(storage_key, temp_path)
+            markdown_content = DocumentService.convert_to_markdown(temp_path, ext)
+            # Cache alongside storage_key if directory is writable
+            if os.path.exists(os.path.dirname(md_storage_path)):
+                try:
+                    with open(md_storage_path, "w", encoding="utf-8") as f:
+                        f.write(markdown_content)
+                except Exception:
+                    pass
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    return {
+        "success": True,
+        "data": {
+            "document_id": document_id,
+            "document_name": doc.get("document_name", os.path.basename(storage_key)),
+            "markdown_filename": f"{base_name}.md",
+            "markdown": markdown_content,
+            "char_count": len(markdown_content),
+            "line_count": len(markdown_content.splitlines()),
+        }
+    }
+
+@router.get("/{document_id}/download-markdown")
+def download_document_markdown(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Downloads the converted Markdown (.md) file directly.
+    """
+    verify_project_access(project_id, current_user, db)
+    doc = DocumentRepository.get_document(db, document_id, project_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    storage_key = doc["storage_key"]
+    base_name = os.path.splitext(doc.get("document_name", os.path.basename(storage_key)))[0]
+    md_filename = f"{base_name}.md"
+    ext = os.path.splitext(storage_key)[1].lower()
+
+    # Check if .md file exists directly
+    md_storage_path = os.path.splitext(storage_key)[0] + ".md"
+    if os.path.exists(md_storage_path):
+        return FileResponse(
+            path=md_storage_path,
+            filename=md_filename,
+            media_type="text/markdown; charset=utf-8"
+        )
+
+    # Otherwise generate on the fly
+    temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
+    md_temp_path = os.path.join(tempfile.gettempdir(), f"{base_name}_{uuid.uuid4().hex[:6]}.md")
+    try:
+        StorageService.download_to_temp_file(storage_key, temp_path)
+        markdown_content = DocumentService.convert_to_markdown(temp_path, ext)
+        with open(md_temp_path, "w", encoding="utf-8") as f:
+            f.write(markdown_content)
+        return FileResponse(
+            path=md_temp_path,
+            filename=md_filename,
+            media_type="text/markdown; charset=utf-8"
+        )
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
