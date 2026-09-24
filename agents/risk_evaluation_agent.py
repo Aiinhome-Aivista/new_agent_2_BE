@@ -2409,7 +2409,31 @@ class RiskEvaluationAgent:
             milestone_progress_pct=milestone_pct,
             resolved_in_this_run=resolved_count
         )
-        final_assessment = LLMService.generate_json(aggregation_prompt)
+        try:
+            from agents.llm_schemas import RiskAggregationOutput
+            structured_agg = LLMService.generate_structured(aggregation_prompt, RiskAggregationOutput)
+            if isinstance(structured_agg, RiskAggregationOutput):
+                final_assessment = structured_agg.model_dump(by_alias=True)
+            elif isinstance(structured_agg, dict):
+                final_assessment = structured_agg
+            else:
+                final_assessment = LLMService.generate_json(aggregation_prompt)
+        except Exception as agg_err:
+            print(f"Warning: Risk aggregation LLM call failed ({agg_err}). Using deterministic fallback assessment.")
+            max_score = max([it.get('risk_score', 0) for it in out_of_scope_activities + timeline_deliverables] or [0])
+            overall_risk_lvl = "HIGH" if max_score >= 70 else "MEDIUM" if max_score >= 40 else "LOW"
+            final_assessment = {
+                "overallRisk": overall_risk_lvl,
+                "riskScore": max_score,
+                "summary": f"Identified {len(out_of_scope_activities)} potential scope deviations and {len(timeline_deliverables)} timeline deliverable items.",
+                "recommendations": ["Review detected items against engagement baseline."],
+                "project_executive_summary": {
+                    "status": "At Risk" if max_score >= 40 else "On Track",
+                    "tracked_items": len(out_of_scope_activities) + len(timeline_deliverables),
+                    "progress_percent": milestone_pct,
+                    "resolved_items": resolved_count
+                }
+            }
 
         print("\n" + "="*70)
         print("📊 STEP 2G OUTPUT (Final Project Aggregation)")

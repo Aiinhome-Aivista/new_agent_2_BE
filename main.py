@@ -30,6 +30,7 @@ def _clean_terminal_print(*args, **kwargs):
         "ERROR:",
         "CRITICAL:",
         "Traceback",
+        "[LLM",
     )
     if any(sig in text for sig in allowed_signatures):
         _original_builtin_print(*args, **kwargs)

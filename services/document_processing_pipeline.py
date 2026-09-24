@@ -57,6 +57,13 @@ class DocumentProcessingPipeline:
         except Exception as e:
             print(f"Failed to apply PMOClassifier: {e}")
             
+        # ── Persist activities and requests for historical/audit view (single pass) ───
+        try:
+            from agents.orchestrator_agent import OrchestratorAgent
+            OrchestratorAgent._persist_ingested_data(project_id, document_id, extraction_result, db_cursor)
+        except Exception as e:
+            print(f"Warning: Failed to persist ingested activities: {e}")
+
         _emit("Enterprise Risk Engine Evaluation", 80)
         # ── Step 2-5: Risk Engine ─────────────────────────────────────────────
         try:
@@ -71,8 +78,9 @@ class DocumentProcessingPipeline:
             import traceback
             traceback.print_exc()
             print(f"Enterprise risk engine failed: {e}")
-            with open("error_log.txt", "a") as f:
+            with open("error_log.txt", "a", encoding="utf-8") as f:
                 f.write(f"Enterprise risk engine failed: {e}\n")
                 f.write(traceback.format_exc() + "\n")
+            raise e
             
         _emit("Pipeline Complete", 100)

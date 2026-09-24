@@ -32,23 +32,23 @@ class ActivityExtractorAgent:
           - extractions:    same list (legacy fallback key)
           - resolved_items: list of resolved/completed items
         """
-        from agents.llm_schemas import ExtractionOutput
+        from agents.llm_schemas import DocumentExtractionSchema
         from core.prompts import get_activity_extractor_prompt
 
         prompt = get_activity_extractor_prompt(document_text, active_tracker_block)
 
         try:
             result = LLMService.generate_structured(
-                prompt, ExtractionOutput, fallback_key='raw_activities'
+                prompt, DocumentExtractionSchema, fallback_key='extractions'
             )
 
             # Normalize to the dict shape the rest of the pipeline expects
-            if isinstance(result, ExtractionOutput):
-                raw_activities = [item.model_dump() for item in result.raw_activities]
+            if isinstance(result, DocumentExtractionSchema):
+                raw_activities = [item.model_dump() for item in result.extractions]
                 resolved_items = [item.model_dump() for item in result.resolved_items]
             elif isinstance(result, dict):
                 # Fallback path returned a dict
-                raw_activities = result.get('raw_activities') or result.get('activities') or result.get('extractions') or []
+                raw_activities = result.get('extractions') or result.get('activities') or result.get('raw_activities') or []
                 resolved_items = result.get('resolved_items', [])
             else:
                 raw_activities = []
@@ -71,6 +71,8 @@ class ActivityExtractorAgent:
                     item['activity'] = item['statement']
                 if not item.get('statement') and item.get('activity'):
                     item['statement'] = item['activity']
+                if not item.get('status'):
+                    item['status'] = 'IN_PROGRESS'
 
         return {
             'raw_activities': raw_activities,  # new canonical key
@@ -119,27 +121,42 @@ Baseline Context:
 {item.get('context', '')}
 """
 
-        from agents.llm_schemas import RiskEvaluationOutput
+        from agents.llm_schemas import BatchRiskScoringSchema
         from core.prompts import get_batch_activity_risk_prompt
 
         prompt = get_batch_activity_risk_prompt(milestone_progress_block, activities_block)
 
         try:
             result = LLMService.generate_structured(
-                prompt, RiskEvaluationOutput, fallback_key='items'
+                prompt, BatchRiskScoringSchema, fallback_key='items'
             )
 
-            if isinstance(result, RiskEvaluationOutput):
-                return [item.model_dump() for item in result.items]
+            if isinstance(result, BatchRiskScoringSchema):
+                items = [item.model_dump() for item in result.items]
+                for it in items:
+                    if 'status' in it and 'execution_status' not in it:
+                        it['execution_status'] = it['status']
+                return items
             elif isinstance(result, dict):
                 # Fallback path
+                items = []
                 for key in ['items', 'activities', 'results', 'evaluations', 'evaluated_activities']:
                     if key in result and isinstance(result[key], list):
-                        return result[key]
-                for val in result.values():
-                    if isinstance(val, list):
-                        return val
+                        items = result[key]
+                        break
+                if not items:
+                    for val in result.values():
+                        if isinstance(val, list):
+                            items = val
+                            break
+                for it in items:
+                    if isinstance(it, dict) and 'status' in it and 'execution_status' not in it:
+                        it['execution_status'] = it['status']
+                return items
             elif isinstance(result, list):
+                for it in result:
+                    if isinstance(it, dict) and 'status' in it and 'execution_status' not in it:
+                        it['execution_status'] = it['status']
                 return result
 
         except Exception as e:
@@ -147,16 +164,23 @@ Baseline Context:
 
         # Ultimate fallback: original generate_json() path
         raw = LLMService.generate_json(prompt)
+        items = []
         if isinstance(raw, list):
-            return raw
-        if isinstance(raw, dict):
+            items = raw
+        elif isinstance(raw, dict):
             for key in ['activities', 'results', 'evaluations', 'evaluated_activities', 'items']:
                 if key in raw and isinstance(raw[key], list):
-                    return raw[key]
-            for val in raw.values():
-                if isinstance(val, list):
-                    return val
-        return []
+                    items = raw[key]
+                    break
+            if not items:
+                for val in raw.values():
+                    if isinstance(val, list):
+                        items = val
+                        break
+        for it in items:
+            if isinstance(it, dict) and 'status' in it and 'execution_status' not in it:
+                it['execution_status'] = it['status']
+        return items
 
 
 class DeliverableTimelineEvaluationAgent:

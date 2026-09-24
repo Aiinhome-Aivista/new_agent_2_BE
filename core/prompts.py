@@ -230,33 +230,7 @@ CRITICAL RULES:
 10. ACTION ITEMS & TABLES EXTRACTION (CRITICAL):
     Every row in Action Items, Decisions, Dependencies, or Customer Responsibility tables (e.g. 'Provide Production API Credentials', 'Provide Production VPN access') MUST be extracted as an individual entry in `extractions`. Do not omit them or bury them only inside another item's `blocked_by` list.
 
-Output MUST be valid JSON conforming to the following structure:
-{{
-  "extractions": [
-    {{
-      "statement": "Production VPN Access",
-      "verb": "provide",
-      "owner": "CUSTOMER",
-      "due_date": "2026-09-09",
-      "blocks": ["CRM Integration"],
-      "blocked_by": [],
-      "confidence": 0.98,
-      "source_sentence": "Customer must provide Production VPN Access by Sept 9, which is delaying the CRM Integration."
-    }}
-  ],
-  "resolved_items": [
-    {{
-      "name": "Production CRM API credentials",
-      "resolution_evidence": "Production API credentials were received.",
-      "confidence": 0.96
-    }},
-    {{
-      "name": "Production VPN access",
-      "resolution_evidence": "VPN access was granted.",
-      "confidence": 0.96
-    }}
-  ]
-}}
+Return a JSON object. Fields: extractions (array of activity objects), resolved_items (array of resolved item objects).
 """
 
 # Phase 1b: Batch Activity Risk Agent
@@ -345,31 +319,7 @@ RULES:
    - `business_impact.future`: What will slip in the future?
    - `ai_interpretation`: Coherent story interpreting the evidence.
 
-Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
-[
-  {{
-    "activity": "Activity name as given",
-    "entity_type": "MILESTONE|DEPENDENCY|SCOPE_REQUEST|ACTION_ITEM|RISK",
-    "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
-    "owner": "INTERNAL|CUSTOMER|VENDOR|THIRD_PARTY",
-    "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|WAITING_ON_CUSTOMER",
-    "progress": 70,
-    "blocked_by": ["Item 1"],
-    "blocks": ["Downstream Item 1"],
-    "evidence_text": "Exact quote from document proving this status/blocker.",
-    "narratives": {{
-        "executive_summary": "1-2 sentence summary",
-        "gap_analysis": "Expected vs Actual",
-        "why_important": "Non-technical explanation",
-        "business_impact": {{
-           "immediate": "Immediate impact",
-           "future": "Future impact"
-        }},
-        "ai_interpretation": "AI interpretation of evidence"
-    }},
-    "recommended_action": "Specific actionable recommendation to resolve this item, if blocked or delayed, else null"
-  }}
-]
+Return a JSON array, one object per input activity in the SAME ORDER as provided.
 """
 
 # Phase 2: Deliverable Timeline Evaluation Agent
@@ -785,16 +735,7 @@ For EACH item, classify it as "IN_SCOPE", "OUT_OF_SCOPE", or "UNCERTAIN".
 - If the evidence states it's excluded, or it's the client's responsibility, or it's an assumption, choose OUT_OF_SCOPE.
 - If there is not enough evidence to be sure, choose UNCERTAIN.
 
-Output your result strictly as a JSON ARRAY of objects, matching the input "id".
-Schema Example:
-[
-  {{
-    "id": "0",
-    "scope_type": "IN_SCOPE", 
-    "confidence": 0.9, 
-    "evidence_text": "<Brief 1-sentence reasoning quoting the evidence>"
-  }}
-]
+Return a JSON array. One object per input item with keys: id, scope_type, confidence, evidence_text.
 """
 
 def get_single_scope_classifier_prompt(candidate: dict, combined_evidence: str) -> str:
@@ -922,36 +863,7 @@ RULES:
 
 6. DO NOT calculate individual occurrence dates. That is handled separately.
 
-Output strictly as a JSON ARRAY of objects, one per input item, matching the input "id":
-[
-  {{
-    "id": "0",
-    "is_recurring": true,
-    "frequency": "MONTHLY",
-    "commitment_title": "Application Improvement",
-    "start_date": null,
-    "end_date": null,
-    "confidence": 0.95,
-    "reasoning": "EL explicitly states 'Developer shall provide a monthly improvement' — clear recurring vendor obligation."
-  }},
-  {{
-    "id": "1",
-    "is_recurring": false,
-    "frequency": null,
-    "commitment_title": null,
-    "start_date": null,
-    "end_date": null,
-    "confidence": 0.0,
-    "reasoning": "One-time CRM integration deliverable with a specific deadline — not recurring."
-  }}
-]
-
-Rules for output:
-- "is_recurring" MUST be a boolean.
-- "frequency" MUST be one of "WEEKLY","BIWEEKLY","MONTHLY","BIMONTHLY","QUARTERLY","EVERY_4_MONTHS","SEMIANNUAL","YEARLY" or null.
-- "start_date" and "end_date" MUST be "YYYY-MM-DD" strings or null.
-- "confidence" MUST be a float between 0.0 and 1.0.
-- Output ONLY the JSON array. No markdown blocks, no explanations outside JSON.
+Return a JSON array. One object per input item with keys: id, is_recurring, frequency, commitment_title, start_date, end_date, confidence, reasoning.
 """
 
 # ==========================================

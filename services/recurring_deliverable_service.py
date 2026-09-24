@@ -228,15 +228,24 @@ class RecurringDeliverableService:
 
     @classmethod
     def _extract_recurrence_batch(cls, candidates):
+        from agents.llm_schemas import RecurrenceExtractionOutput
         results = [{"is_recurring": False}] * len(candidates)
         for batch_start in range(0, len(candidates), BATCH_SIZE):
             batch = candidates[batch_start:batch_start + BATCH_SIZE]
             items_for_prompt = [{"id": str(i), "name": c.get("name",""), "description": c.get("description",""), "evidence_text": c.get("evidence_text","")} for i, c in enumerate(batch)]
             prompt = get_recurrence_extraction_prompt(items_for_prompt)
             try:
-                batch_results = LLMService.generate_json(prompt)
-                if not isinstance(batch_results, list):
-                    batch_results = [batch_results]
+                structured_res = LLMService.generate_structured(
+                    prompt, RecurrenceExtractionOutput, fallback_key='items'
+                )
+                if isinstance(structured_res, RecurrenceExtractionOutput):
+                    batch_results = [it.model_dump() for it in structured_res.items]
+                elif isinstance(structured_res, dict):
+                    batch_results = structured_res.get('items', [])
+                elif isinstance(structured_res, list):
+                    batch_results = structured_res
+                else:
+                    batch_results = []
                 result_map = {str(r.get("id","")): r for r in batch_results}
                 for i in range(len(batch)):
                     results[batch_start + i] = result_map.get(str(i), {"is_recurring": False})
