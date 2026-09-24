@@ -110,17 +110,10 @@ class OrchestratorAgent:
             _emit("Stale Document Ignored", 100)
             return
 
-        # ── Step 1: Status Ingestion ────────────────────────────────────────────
-        _emit("Reading Uploaded Document", 15)
-        extracted_data = StatusIngestionAgent.extract_status(text)
-
-        # ── Step 2: Persist activities and requests ────────────────────────────
-        _emit("Extracting Activities", 30)
-        activity_map, request_map = cls._persist_ingested_data(
-            project_id, document_id, extracted_data, db_cursor
-        )
-
-        # ── Step 3: Multi-Agent Document Pipeline (Extraction, Classification, Registers)
+        # ── Unified Single-Pass Document Pipeline ──────────────────────────────
+        # Replaces the legacy duplicate StatusIngestionAgent pass. Fact extraction,
+        # activity persistence, deterministic classification, and risk evaluation
+        # are performed in a single optimized pass.
         try:
             DocumentProcessingPipeline.process_document(
                 project_id=project_id,
@@ -148,38 +141,59 @@ class OrchestratorAgent:
         db_cursor.execute("DELETE FROM new_requests WHERE document_id = %s", (document_id,))
         
         # --- 1. Process Activities ---
-        for item in extracted_data.get("activities", []):
-            name = item.get("activity_name", "Unknown")
+        activity_items = extracted_data.get("activities", []) or extracted_data.get("extractions", []) or extracted_data.get("raw_activities", [])
+        for item in activity_items:
+            name = str(item.get("activity_name") or item.get("activity") or item.get("statement") or "Unknown").strip()
+            if not name or name.lower() == "unknown":
+                continue
+            desc = str(item.get("description") or item.get("source_sentence") or item.get("evidence_text") or "").strip()
+            raw_deadline = item.get("mentioned_deadline") or item.get("due_date")
+            raw_status = item.get("activity_status") or item.get("status") or item.get("execution_status")
+            raw_owner = item.get("owner") or item.get("requested_by")
+            raw_evidence = str(item.get("evidence_text") or item.get("source_sentence") or "").strip()
+            raw_confidence = item.get("confidence")
+
+            cleaned_deadline = clean_date_value(raw_deadline)
+            cleaned_progress = clean_decimal_value(item.get("progress_percentage"))
+            cleaned_status = clean_status_value(raw_status)
+            cleaned_confidence = clean_confidence_value(raw_confidence)
+            
             sql = """INSERT INTO project_activities 
                      (project_id, document_id, activity_name, description, activity_status, progress_percentage, requested_by, owner, mentioned_deadline, source_page, source_section, evidence_text, confidence)
                      VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
-            
-            cleaned_deadline = clean_date_value(item.get("mentioned_deadline"))
-            cleaned_progress = clean_decimal_value(item.get("progress_percentage"))
-            cleaned_status = clean_status_value(item.get("activity_status"))
-            cleaned_confidence = clean_confidence_value(item.get("confidence"))
-            
             db_cursor.execute(sql, (
-                project_id, document_id, name, item.get("description", ""),
+                project_id, document_id, name, desc,
                 cleaned_status, cleaned_progress, item.get("requested_by"),
-                item.get("owner"), cleaned_deadline, item.get("source_page"),
-                item.get("source_section"), item.get("evidence_text", ""), cleaned_confidence
+                raw_owner, cleaned_deadline, item.get("source_page"),
+                item.get("source_section"), raw_evidence, cleaned_confidence
             ))
             activity_id = db_cursor.lastrowid
             activity_map[name.lower().strip()] = activity_id
 
-        # --- 2. Process New Requests ---
+            # If classification type indicates a new request / scope change, also persist in new_requests
+            if str(item.get("classification_type", "")).upper() in ("SCOPE_CHANGE", "NEW_REQUEST"):
+                req_sql = """INSERT INTO new_requests
+                             (project_id, document_id, request_name, requested_by, request_status, source_page, evidence_text)
+                             VALUES (%s, %s, %s, %s, 'DETECTED', %s, %s)"""
+                db_cursor.execute(req_sql, (
+                    project_id, document_id, name, raw_owner,
+                    item.get("source_page"), raw_evidence
+                ))
+                request_map[name.lower().strip()] = db_cursor.lastrowid
+
+        # --- 2. Process Dedicated New Requests (if present) ---
         for item in extracted_data.get("new_requests", []):
             name = item.get("request_name", "Unknown")
-            sql = """INSERT INTO new_requests
-                     (project_id, document_id, request_name, requested_by, request_status, source_page, evidence_text)
-                     VALUES (%s, %s, %s, %s, 'DETECTED', %s, %s)"""
-            db_cursor.execute(sql, (
-                project_id, document_id, name, item.get("requested_by"),
-                item.get("source_page"), item.get("evidence_text", "")
-            ))
-            request_id = db_cursor.lastrowid
-            request_map[name.lower().strip()] = request_id
+            if name.lower().strip() not in request_map:
+                sql = """INSERT INTO new_requests
+                         (project_id, document_id, request_name, requested_by, request_status, source_page, evidence_text)
+                         VALUES (%s, %s, %s, %s, 'DETECTED', %s, %s)"""
+                db_cursor.execute(sql, (
+                    project_id, document_id, name, item.get("requested_by"),
+                    item.get("source_page"), item.get("evidence_text", "")
+                ))
+                request_id = db_cursor.lastrowid
+                request_map[name.lower().strip()] = request_id
 
         return activity_map, request_map
 

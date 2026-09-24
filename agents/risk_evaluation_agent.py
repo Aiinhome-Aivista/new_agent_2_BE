@@ -1188,7 +1188,7 @@ class RiskEvaluationAgent:
 
         # --- NEW LOGGING FOR STEP 2A ---
         print("\n" + "="*70)
-        print("🟢 STEP 2A OUTPUT (Fact Extraction)")
+        print("[STEP 2A OUTPUT (Fact Extraction)]")
         print("="*70)
         import json
         try:
@@ -1229,7 +1229,7 @@ class RiskEvaluationAgent:
             # Dedup key is the canonical title
             dedup_key = _normalize(canonical_title)
             if dedup_key in seen_canonical:
-                print(f"  [Dedup] Merged '{name}' → already seen as '{canonical_title}'")
+                print(f"  [Dedup] Merged '{name}' -> already seen as '{canonical_title}'")
                 continue
             seen_canonical.add(dedup_key)
 
@@ -1350,7 +1350,7 @@ class RiskEvaluationAgent:
 
         # --- NEW LOGGING FOR STEP 2B ---
         print("\n" + "="*70)
-        print("🔵 STEP 2B OUTPUT (Context Builder)")
+        print("[STEP 2B OUTPUT (Context Builder)]")
         print("="*70)
         import json
         try:
@@ -1387,7 +1387,7 @@ class RiskEvaluationAgent:
 
             # --- NEW LOGGING FOR STEP 2C ---
             print("\n" + "="*70)
-            print("🟡 STEP 2C OUTPUT (LLM Draft)")
+            print("[STEP 2C OUTPUT (LLM Draft)]")
             print("="*70)
             import json
             try:
@@ -1539,7 +1539,7 @@ class RiskEvaluationAgent:
         dep_analysis_results = DependencyExecutionStateResolver.analyze_static_graph(state_snapshot, backward_graph)
         
         print("\n" + "="*70)
-        print("🔗 SUB-PROCESS: Dependency Static Graph Analysis")
+        print("[SUB-PROCESS: Dependency Static Graph Analysis]")
         print("="*70)
         try:
             print(json.dumps(dep_analysis_results, indent=2))
@@ -1566,7 +1566,7 @@ class RiskEvaluationAgent:
         execution_queue_order, node_metrics = ExecutionQueueBuilder.build_queue(state_snapshot, backward_graph, forward_graph)
 
         print("\n" + "="*70)
-        print("📈 SUB-PROCESS: PMO Execution Queue Builder")
+        print("[SUB-PROCESS: PMO Execution Queue Builder]")
         print("="*70)
         try:
             print(json.dumps(node_metrics, indent=2))
@@ -1594,7 +1594,7 @@ class RiskEvaluationAgent:
         derived_states = DerivedExecutionState.compute_derived_status(state_snapshot, backward_graph)
 
         print("\n" + "="*70)
-        print("🚦 SUB-PROCESS: Derived Execution State")
+        print("[SUB-PROCESS: Derived Execution State]")
         print("="*70)
         try:
             print(json.dumps(derived_states, indent=2))
@@ -1626,7 +1626,7 @@ class RiskEvaluationAgent:
         risks_to_resolve = RiskReconciliationEngine.reconcile_open_risks(open_tracker_items, current_state)
 
         print("\n" + "="*70)
-        print("🧹 SUB-PROCESS: Risk Reconciliation Engine (Auto-Resolve)")
+        print("[SUB-PROCESS: Risk Reconciliation Engine (Auto-Resolve)]")
         print("="*70)
         try:
             resolve_logs = [{"title": r[0].get("title"), "reason": r[1], "type": r[2]} for r in risks_to_resolve]
@@ -1922,9 +1922,9 @@ class RiskEvaluationAgent:
                 if llm_confidence >= 60:
                     should_create_risk = True
                 else:
-                    print(f"  [Gate] '{canonical_title}' skipped — low extraction confidence: {llm_confidence}%")
+                    print(f"  [Gate] '{canonical_title}' skipped -- low extraction confidence: {llm_confidence}%")
             else:
-                print(f"  [Gate] '{canonical_title}' skipped — status is '{status}' (completed/resolved)")
+                print(f"  [Gate] '{canonical_title}' skipped -- status is '{status}' (completed/resolved)")
 
             all_activities.append({
                 "activity": canonical_title,
@@ -2298,7 +2298,7 @@ class RiskEvaluationAgent:
                         ti["execution_priority"] = new_score
                         parent_score = new_score  # Update for subsequent checks
                         corrections_made += 1
-                        print(f"    [Correction] '{ti.get('deliverable')}' score: {old_score} → {new_score} "
+                        print(f"    [Correction] '{ti.get('deliverable')}' score: {old_score} -> {new_score} "
                               f"(must outscore child '{blocked_name}' at {child_score})")
         
         if corrections_made > 0:
@@ -2375,7 +2375,7 @@ class RiskEvaluationAgent:
 
         # --- NEW LOGGING FOR STEP 2D ---
         print("\n" + "="*70)
-        print("🟣 STEP 2D OUTPUT (Final Risk List with Math & Graph)")
+        print("[STEP 2D OUTPUT (Final Risk List with Math & Graph)]")
         print("="*70)
         import json
         try:
@@ -2408,10 +2408,27 @@ class RiskEvaluationAgent:
             milestone_progress_pct=milestone_pct,
             resolved_in_this_run=resolved_count
         )
-        final_assessment = LLMService.generate_json(aggregation_prompt)
+        try:
+            final_assessment = LLMService.generate_json(aggregation_prompt)
+        except Exception as agg_err:
+            print(f"Warning: Risk aggregation LLM call failed ({agg_err}). Using deterministic fallback assessment.")
+            max_score = max([it.get('risk_score', 0) for it in out_of_scope_activities + timeline_deliverables] or [0])
+            overall_risk_lvl = "HIGH" if max_score >= 70 else "MEDIUM" if max_score >= 40 else "LOW"
+            final_assessment = {
+                "overallRisk": overall_risk_lvl,
+                "riskScore": max_score,
+                "summary": f"Identified {len(out_of_scope_activities)} potential scope deviations and {len(timeline_deliverables)} timeline deliverable items.",
+                "recommendations": ["Review detected items against engagement baseline."],
+                "project_executive_summary": {
+                    "status": "⚠ At Risk" if max_score >= 40 else "✔ On Track",
+                    "tracked_items": len(out_of_scope_activities) + len(timeline_deliverables),
+                    "progress_percent": milestone_pct,
+                    "resolved_items": resolved_count
+                }
+            }
 
         print("\n" + "="*70)
-        print("📊 STEP 2G OUTPUT (Final Project Aggregation)")
+        print("[STEP 2G OUTPUT (Final Project Aggregation)]")
         print("="*70)
         try:
             print(json.dumps(final_assessment, indent=2))

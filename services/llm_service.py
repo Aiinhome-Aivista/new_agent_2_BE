@@ -3,6 +3,7 @@ import json
 import re
 import time
 import os
+import sys
 from core.config import settings
 
 try:
@@ -10,6 +11,15 @@ try:
     _gemini_available = True
 except ImportError:
     _gemini_available = False
+
+
+def _terminal_log(msg: str):
+    """Prints directly to terminal with immediate flush and ASCII-safe characters."""
+    try:
+        sys.stdout.write(msg + "\n")
+        sys.stdout.flush()
+    except Exception:
+        print(msg, flush=True)
 
 
 class LLMService:
@@ -27,23 +37,47 @@ class LLMService:
         if not client:
             raise RuntimeError("Gemini API key is not configured or google-genai library is missing.")
 
-        max_retries = 3
+        model = settings.GEMINI_MODEL or "gemini-flash-lite-latest"
+        max_retries = 2
+        last_error = None
+
         for attempt in range(max_retries):
             try:
+                _terminal_log("=" * 75)
+                _terminal_log(f"[LLM ACTIVE: GOOGLE GEMINI]")
+                _terminal_log(f"  Model:     {model}")
+                _terminal_log(f"  Status:    Sending request to Google Gemini API ({len(prompt)} chars)...")
+                _terminal_log("=" * 75)
+                t0 = time.time()
                 response = client.models.generate_content(
-                    model=settings.GEMINI_MODEL,
-                    contents=prompt
+                    model=model,
+                    contents=prompt,
+                    config={
+                        "automatic_function_calling": {"disable": True},
+                        "temperature": 0.0,
+                    }
                 )
+                elapsed = time.time() - t0
+                _terminal_log("-" * 75)
+                _terminal_log(f"[LLM SUCCESS: GOOGLE GEMINI]")
+                _terminal_log(f"  Model:     {model}")
+                _terminal_log(f"  Duration:  {elapsed:.2f}s")
+                _terminal_log("-" * 75)
                 return response.text or ""
             except Exception as e:
+                last_error = e
                 err_str = str(e)
-                is_quota = "429" in err_str or "RESOURCE_EXHAUSTED" in err_str
-                if is_quota and attempt < max_retries - 1:
-                    wait_time = 15 * (attempt + 1)
-                    print(f"[LLMService] Gemini rate limit encountered. Waiting {wait_time}s before retry ({attempt + 1}/{max_retries})...")
+                is_transient = any(k in err_str for k in ["503", "UNAVAILABLE", "high demand", "500", "INTERNAL"])
+                if is_transient and attempt < max_retries - 1:
+                    wait_time = 2 * (attempt + 1)
+                    _terminal_log(f"[LLM RETRY] Gemini ({model}) transient spike ({err_str[:50]}). Retrying in {wait_time}s ({attempt + 1}/{max_retries})...")
                     time.sleep(wait_time)
                 else:
-                    raise e
+                    break
+
+        if last_error:
+            raise last_error
+        raise RuntimeError(f"Gemini model '{model}' failed.")
 
     @classmethod
     def _call_openai(cls, prompt: str) -> str:
@@ -124,6 +158,13 @@ class LLMService:
         if not settings.LLM_API_URL:
             raise RuntimeError("LLM_API_URL is not configured for custom/local LLM provider.")
 
+        _terminal_log("=" * 75)
+        _terminal_log(f"[LLM ACTIVE: LOCAL LLM]")
+        _terminal_log(f"  Model:     {settings.LLM_MODEL}")
+        _terminal_log(f"  Endpoint:  {settings.LLM_API_URL}")
+        _terminal_log(f"  Status:    Local LLM inference in progress ({len(prompt)} chars)...")
+        _terminal_log("=" * 75)
+        t0 = time.time()
         payload = {
             "model": settings.LLM_MODEL,
             "prompt": prompt,
@@ -136,19 +177,32 @@ class LLMService:
         )
         response.raise_for_status()
         data = response.json()
+        elapsed = time.time() - t0
+        _terminal_log("-" * 75)
+        _terminal_log(f"[LLM SUCCESS: LOCAL LLM]")
+        _terminal_log(f"  Model:     {settings.LLM_MODEL}")
+        _terminal_log(f"  Duration:  {elapsed:.2f}s")
+        _terminal_log("-" * 75)
         return data.get("response", "")
 
     @classmethod
     def generate(cls, prompt: str) -> str:
         provider = str(getattr(settings, "LLM_PROVIDER", "gemini")).strip().lower()
 
-        if provider == "gemini":
+        # ── STRICT PRIORITY: Always execute configured Gemini model first if API key is present ──
+        if settings.GEMINI_API_KEY or provider == "gemini":
             try:
                 return cls._call_gemini(prompt)
             except Exception as e:
-                print(f"[LLMService] Gemini error: {e}. Checking fallback...")
+                configured_model = settings.GEMINI_MODEL or "gemini-flash-lite-latest"
+                _terminal_log("*" * 75)
+                _terminal_log("[LLM SHIFT: SWITCHING TO LOCAL LLM]")
+                _terminal_log(f"  Reason:    Configured Gemini model '{configured_model}' failed")
+                _terminal_log(f"  Details:   {str(e)[:100]}")
+                _terminal_log(f"  Fallback:  Local LLM ({settings.LLM_MODEL})")
+                _terminal_log(f"  Endpoint:  {settings.LLM_API_URL}")
+                _terminal_log("*" * 75)
                 if settings.LLM_API_URL:
-                    print(f"[LLMService] Falling back to custom LLM ({settings.LLM_MODEL})...")
                     return cls._call_custom(prompt)
                 raise e
 
