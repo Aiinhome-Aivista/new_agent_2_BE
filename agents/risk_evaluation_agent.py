@@ -935,9 +935,10 @@ class RiskEvaluationAgent:
             return "Track execution progress"
 
     @classmethod
-    def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
-                          activity_map: dict = None, request_map: dict = None,
-                          emit: Optional[Callable[[str, int], None]] = None) -> dict:
+    def _evaluate_document_legacy(cls, project_id: int, document_id: int, document_text: str, db_cursor,
+                                  activity_map: dict = None, request_map: dict = None,
+                                  emit: Optional[Callable[[str, int], None]] = None) -> dict:
+        """Original monolithic evaluate_document — preserved as legacy fallback."""
         activity_map = activity_map or {}
         request_map = request_map or {}
 
@@ -2879,3 +2880,84 @@ class RiskEvaluationAgent:
             "recommendations": recommendations,
             "subAgentResults": sub_agent_results
         }
+
+    # ── PUBLIC ENTRY POINT ─────────────────────────────────────────────────────
+    # Called by all API routes. Uses the LangGraph evaluation graph.
+    # Falls back to _evaluate_document_legacy on any graph error.
+    @classmethod
+    def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
+                          activity_map: dict = None, request_map: dict = None,
+                          emit: Optional[Callable[[str, int], None]] = None) -> dict:
+        """
+        Public entry point for document risk evaluation.
+
+        Runs via the LangGraph evaluation graph (evaluation_graph.py):
+          load_baseline → extract_activities → detect_closure
+            ├─ [closed]  → handle_closure → END
+            └─ [normal]  → run_pipeline   → END
+
+        The graph passes already-extracted activities to run_pipeline so that
+        LLM Call #1 (activity extraction) is NOT duplicated — it runs once in
+        node_extract_activities, then the result is forwarded via activity_map.
+
+        Falls back to _evaluate_document_legacy on any unexpected graph failure.
+        """
+        from agents.evaluation_graph import get_evaluation_graph, EvaluationState
+        from services.telemetry_service import telemetry
+        from core.structured_logger import agent_logger
+
+        exec_trace = telemetry.start_trace(project_id=project_id, document_id=document_id)
+        try:
+            graph = get_evaluation_graph()
+            initial_state: EvaluationState = {
+                'project_id':    project_id,
+                'document_id':   document_id,
+                'document_text': document_text,
+                'db_cursor':     db_cursor,
+                'activity_map':  activity_map or {},
+                'request_map':   request_map or {},
+                'emit':          emit,
+                # Intermediate results — all start as None/empty
+                'risk_params':             None,
+                'risk_thresholds':         None,
+                'scope_items':             None,
+                'all_baseline_items':      None,
+                'dependency_graph':        None,
+                'dependency_context_block': None,
+                'extraction_result':       None,
+                'raw_activities':          None,
+                'resolved_items':          None,
+                # Routing flags
+                'is_project_closed': False,
+                'pipeline_error':    None,
+                # Final output
+                'final_result': None,
+            }
+
+            final_state = graph.invoke(initial_state)
+
+            if final_state.get('pipeline_error'):
+                agent_logger.warning(f"[Graph] Pipeline error — falling back to legacy: {final_state['pipeline_error']}")
+                print(f"  [Graph] Pipeline error — falling back to legacy: {final_state['pipeline_error']}")
+                raise RuntimeError(final_state['pipeline_error'])
+
+            result = final_state.get('final_result')
+            if result is None:
+                raise RuntimeError("Graph returned no final_result")
+
+            exec_trace.finish(status="OK")
+            return result
+
+        except Exception as e:
+            exec_trace.finish(status="ERROR", error=str(e))
+            agent_logger.error(f"[evaluate_document] Graph path failed ({e}), using legacy fallback.")
+            print(f"  [evaluate_document] Graph path failed ({e}), using legacy fallback.")
+            return cls._evaluate_document_legacy(
+                project_id=project_id,
+                document_id=document_id,
+                document_text=document_text,
+                db_cursor=db_cursor,
+                activity_map=activity_map,
+                request_map=request_map,
+                emit=emit,
+            )

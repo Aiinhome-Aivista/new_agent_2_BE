@@ -133,20 +133,37 @@ class ScopeClassifier:
                 })
             
             from core.prompts import get_batch_scope_classifier_prompt
+            from agents.llm_schemas import ScopeClassificationOutput
             prompt = get_batch_scope_classifier_prompt(items_for_prompt)
             try:
-                batch_results = LLMService.generate_json(prompt)
-                if not isinstance(batch_results, list):
-                    batch_results = [batch_results]
-                    
-                result_map = {str(res.get("id", "")) : res for res in batch_results}
+                # IMPROVEMENT 3: structured output eliminates JSON parse failures
+                structured_result = LLMService.generate_structured(
+                    prompt, ScopeClassificationOutput, fallback_key='items'
+                )
+
+                # Normalize to a flat list of result dicts
+                if isinstance(structured_result, ScopeClassificationOutput):
+                    batch_results = [si.model_dump() for si in structured_result.items]
+                elif isinstance(structured_result, dict):
+                    batch_results = structured_result.get('items', [])
+                    if not batch_results:
+                        for val in structured_result.values():
+                            if isinstance(val, list):
+                                batch_results = val
+                                break
+                elif isinstance(structured_result, list):
+                    batch_results = structured_result
+                else:
+                    batch_results = []
+
+                result_map = {str(res.get("id", "")): res for res in batch_results}
                 for idx, item in enumerate(batch_slice):
                     candidate_ref = item["candidate"]
                     res = result_map.get(str(idx), {})
                     scope_type = res.get("scope_type", "UNCERTAIN")
                     confidence = res.get("confidence", 0.5)
                     evidence_text = res.get("evidence_text", "No reasoning provided.")
-                    
+
                     # Enforce section ground truth over LLM boundary hallucinations
                     cand_sec = candidate_ref.get("section", "General")
                     if cand_sec in {"Scope of Work", "Deliverables", "Responsibilities", "Milestones", "Recurring Commitments"} and scope_type in {"OUT_OF_SCOPE", "UNCERTAIN"}:

@@ -11,6 +11,12 @@ try:
 except ImportError:
     _gemini_available = False
 
+try:
+    from langchain_google_genai import ChatGoogleGenerativeAI
+    _langchain_genai_available = True
+except ImportError:
+    _langchain_genai_available = False
+
 
 class LLMService:
     @classmethod
@@ -238,3 +244,57 @@ class LLMService:
                 except Exception as retry_e:
                     raise RuntimeError(f"JSON correction retry failed: {retry_e}")
             raise RuntimeError(f"Failed to parse JSON from LLM: {e}")
+
+    @classmethod
+    def generate_structured(cls, prompt: str, schema_class, fallback_key: str = None):
+        """
+        IMPROVEMENT 3: LangChain Structured Output.
+
+        Calls the LLM and enforces output structure at the token level using a
+        Pydantic BaseModel schema. Eliminates all json.loads() failures for
+        structured JSON extraction calls.
+
+        Args:
+            prompt: The prompt string to send to the LLM.
+            schema_class: A pydantic BaseModel subclass from agents/llm_schemas.py.
+            fallback_key: If the schema wraps items in a dict key (e.g. 'items'),
+                          pass that key to extract the list when falling back to
+                          generate_json().
+
+        Returns:
+            An instance of schema_class on success, or falls back to generate_json()
+            result if structured output is unavailable.
+
+        IMPORTANT: Only for structured JSON extraction calls.
+        Do NOT use for narrative/prose LLM calls (alerts, summaries, etc.).
+        temperature=0 is enforced here for all extraction calls.
+        """
+        provider = str(getattr(settings, 'LLM_PROVIDER', 'gemini')).strip().lower()
+
+        # Use LangChain structured output only when Gemini + langchain-google-genai available
+        if provider == 'gemini' and _langchain_genai_available and settings.GEMINI_API_KEY:
+            try:
+                llm = ChatGoogleGenerativeAI(
+                    model=settings.GEMINI_MODEL or 'gemini-2.0-flash',
+                    temperature=0.0,
+                    google_api_key=settings.GEMINI_API_KEY,
+                )
+                structured_llm = llm.with_structured_output(schema_class)
+                result = structured_llm.invoke(prompt)
+                return result
+            except Exception as e:
+                print(f"[LLMService] Structured output failed ({e}), falling back to generate_json()")
+
+        # Fallback: regular JSON generation + manual parsing
+        raw = cls.generate_json(prompt)
+        # If raw is a list (some prompts return a list at top level), wrap it
+        if isinstance(raw, list) and fallback_key:
+            raw = {fallback_key: raw}
+        try:
+            if isinstance(raw, dict):
+                return schema_class(**raw)
+            # raw is already valid input
+            return schema_class.model_validate(raw)
+        except Exception as e:
+            print(f"[LLMService] Schema validation on fallback failed ({e}), returning raw dict")
+            return raw

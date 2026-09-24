@@ -119,6 +119,13 @@ class Settings(BaseSettings):
     ONEDRIVE_SYNC_INTERVAL_HOURS: int = 24
     ONEDRIVE_SYNC_INTERVAL_MINUTES: int = 0
 
+    # ── Observability & Evaluation Settings ──────────────────────────────────
+    OTEL_ENABLED: bool = True
+    OTEL_SERVICE_NAME: str = "acse-evaluator"
+    OTEL_EXPORTER_OTLP_ENDPOINT: str = ""  # Optional OTLP endpoint (Jaeger/Langfuse/SigNoz)
+    EVAL_JUDGE_MODEL: str = "gemini-3.1-flash-lite"
+    EVAL_AUTO_JUDGE_ONLINE: bool = False
+
     class Config:
         env_file = ".env"
         extra = "ignore"

@@ -7,15 +7,15 @@ class ScopeSectionDetector:
     """
     
     SECTION_PATTERNS = {
-        "Scope of Work": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Scope|Scope of Work|Project Scope|Engagement Scope|In Scope|Scope \& Deliverables)",
-        "Deliverables": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Deliverables|Key Deliverables|Project Deliverables|Outputs)",
-        "Responsibilities": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Responsibilities|Our Responsibilities|Vendor Responsibilities)",
-        "Client Responsibilities": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Client Responsibilities|Your Responsibilities)",
-        "Out of Scope": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Out of Scope|Exclusions|Not Included|Out-of-Scope)",
-        "Assumptions": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Assumptions|Key Assumptions|Project Assumptions|Commercial assumptions)",
-        "Dependencies": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Dependencies|Project Dependencies)",
-        "Milestones": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Milestones|Project Milestones.*|Timeline|Schedule)",
-        "Recurring Commitments": r"(?i)^(?:[#\*\-\s\d\.\:]+)?(?:Recurring Commitments?|Ongoing Commitments?|Recurring Deliverables?|Continuous Service|Managed Services?\s+Commitments?)"
+        "Scope of Work": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Scope of Work|Project Scope|Engagement Scope|In[- ]Scope|Scope & Deliverables|\bScope\b)",
+        "Deliverables": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Deliverables|Key Deliverables|Project Deliverables|Outputs)",
+        "Responsibilities": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Responsibilities|Our Responsibilities|Vendor Responsibilities)",
+        "Client Responsibilities": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Client Responsibilities|Your Responsibilities)",
+        "Out of Scope": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Out[- ]of[- ]Scope|Exclusions|Not Included)",
+        "Assumptions": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Assumptions|Key Assumptions|Project Assumptions|Commercial assumptions)",
+        "Dependencies": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Dependencies|Project Dependencies|Client Dependencies)",
+        "Milestones": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Milestones|Project Milestones.*|Timeline|Schedule)",
+        "Recurring Commitments": r"(?i)(?:^|[\b\s#\*\-\d\.\:])(?:Recurring Commitments?|Ongoing Commitments?|Recurring Deliverables?|Continuous Service|Managed Services?\s+Commitments?)"
     }
 
     @classmethod
