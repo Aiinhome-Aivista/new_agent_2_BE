@@ -10,7 +10,7 @@ from datetime import date, timedelta
 from typing import Any, Dict, List, Optional
 
 from services.llm_service import LLMService
-from core.prompts import get_recurrence_extraction_prompt
+from core.prompts import get_recurrence_extraction_prompt, get_short_obligation_prompt
 
 RECURRENCE_CONFIDENCE_THRESHOLD = 0.75
 PARTIAL_PERIOD_MIN_DAYS = 15
@@ -46,6 +46,8 @@ def _detect_recurrence_cadence(text: str) -> 'str | None':
 
 
 class RecurringDeliverableService:
+
+    _detect_recurrence_cadence = staticmethod(_detect_recurrence_cadence)
 
     MONTH_NAME_MAP = {
         'january': 1, 'february': 2, 'march': 3, 'april': 4, 'may': 5, 'june': 6,
@@ -155,37 +157,61 @@ class RecurringDeliverableService:
         except Exception:
             pass
 
-        candidates = [i for i in scope_items if i.get("scope_type") == "IN_SCOPE" and i.get("_db_id")]
+        candidates = [
+            i for i in scope_items 
+            if i.get("scope_type") != "OUT_OF_SCOPE" 
+            and not i.get("is_out_of_scope", False)
+            and i.get("scope_type") == "IN_SCOPE"
+            and i.get("_db_id")
+        ]
         if not candidates:
             print("[Recurring] No IN_SCOPE candidates.")
             return
 
-        print(f"[Recurring] Analysing {len(candidates)} IN_SCOPE candidates...")
-        recurrence_results = cls._extract_recurrence_batch(candidates)
+        # STEP 1: Deterministic cadence pre-filter runs BEFORE the LLM call (Item 14)
+        cadence_candidates = []
+        for item in candidates:
+            if item.get('scope_type') == 'OUT_OF_SCOPE' or item.get('is_out_of_scope', False):
+                continue
+            text_to_check = f"{item.get('name', '')} {item.get('description', '')}"
+            detected_cadence = _detect_recurrence_cadence(text_to_check) or item.get('recurrence_cadence')
+            if detected_cadence:
+                item['detected_cadence'] = detected_cadence
+                cadence_candidates.append(item)
+
+        if not cadence_candidates:
+            print("[Recurring] No candidates with recurrence cadence keywords detected.")
+            return
+
+        print(f"[Recurring] Analysing {len(cadence_candidates)} cadence-detected candidates via short obligation check (Item 15)...")
+        recurrence_results = cls._check_obligation_batch(cadence_candidates)
 
         recurring_count = 0
         occurrence_count = 0
-        for item, result in zip(candidates, recurrence_results):
-            # GAP 1 FIX: Deterministic override — if item name contains a
-            # recurrence keyword, force is_recurring=True and set cadence.
-            # This runs before LLM-based detection to catch what LLM misses.
-            try:
-                detected_cadence = _detect_recurrence_cadence(
-                    item.get('name', '') + ' ' + item.get('description', '')
-                ) or item.get('recurrence_cadence')
-                if detected_cadence:
-                    item['is_recurring'] = True
-                    item['recurrence_cadence'] = detected_cadence
-                    if not result.get('is_recurring') or not result.get('frequency'):
-                        result = dict(result)
-                        result['is_recurring'] = True
-                        result['frequency'] = detected_cadence.upper()
-                        result['confidence'] = 1.0
-                    print(f"  [RecurringService] Deterministic recurrence detected: "
-                          f"'{item.get('name')}' -> cadence='{detected_cadence}'")
-            except Exception as _det_e:
-                print(f"  [RecurringService] Warning: deterministic recurrence detection failed: {_det_e}")
-            # ... rest of existing loop continues unchanged
+        for item, result in zip(cadence_candidates, recurrence_results):
+            # GUARD: Out-of-scope items are NEVER vendor recurring obligations.
+            if item.get('scope_type') == 'OUT_OF_SCOPE':
+                print(f"  [RecurringService] Skipped OUT_OF_SCOPE item: '{item.get('name', '')[:50]}'")
+                continue
+
+            # ALSO guard: items with is_out_of_scope=True (field name variant)
+            if item.get('is_out_of_scope', False):
+                print(f"  [RecurringService] Skipped is_out_of_scope item: '{item.get('name', '')[:50]}'")
+                continue
+
+            detected_cadence = item.get('detected_cadence') or _detect_recurrence_cadence(
+                item.get('name', '') + ' ' + item.get('description', '')
+            ) or item.get('recurrence_cadence')
+
+            if detected_cadence:
+                item['is_recurring'] = True
+                item['recurrence_cadence'] = detected_cadence
+                if not result.get('is_recurring') or not result.get('frequency'):
+                    result = dict(result)
+                    result['is_recurring'] = True
+                    result['frequency'] = detected_cadence.upper()
+                    result['confidence'] = 1.0
+
             if not result.get("is_recurring"):
                 continue
             frequency = result.get("frequency", "").upper()
@@ -225,6 +251,87 @@ class RecurringDeliverableService:
 
         db.commit()
         print(f"[Recurring] Done — {recurring_count} recurring, {occurrence_count} occurrences.")
+
+    @classmethod
+    def _check_obligation_batch(cls, candidates: list[dict]) -> list[dict]:
+        """
+        Runs a short obligation-check LLM call for candidates with detected cadence keywords (Item 15).
+        """
+        from agents.llm_schemas import RecurrenceExtractionOutput
+        from core.prompts import get_short_obligation_prompt
+        results = [{"is_recurring": False}] * len(candidates)
+        for batch_start in range(0, len(candidates), BATCH_SIZE):
+            batch = candidates[batch_start:batch_start + BATCH_SIZE]
+            items_for_prompt = [
+                {
+                    "id": str(i),
+                    "name": c.get("name", ""),
+                    "description": c.get("description", ""),
+                    "evidence_text": c.get("evidence_text", ""),
+                    "detected_cadence": c.get("detected_cadence", "")
+                }
+                for i, c in enumerate(batch)
+            ]
+            prompt = get_short_obligation_prompt(items_for_prompt)
+            try:
+                structured_res = LLMService.generate_structured(
+                    prompt, RecurrenceExtractionOutput, fallback_key='items'
+                )
+                if isinstance(structured_res, RecurrenceExtractionOutput):
+                    batch_results = [it.model_dump() for it in structured_res.items]
+                elif isinstance(structured_res, dict):
+                    batch_results = structured_res.get('items', [])
+                elif isinstance(structured_res, list):
+                    batch_results = structured_res
+                else:
+                    batch_results = []
+                result_map = {str(r.get("id", "")): r for r in batch_results}
+                for i, c in enumerate(batch):
+                    res = result_map.get(str(i), {"is_recurring": True})
+                    if not res.get("frequency") and c.get("detected_cadence"):
+                        res["frequency"] = c["detected_cadence"].upper()
+                    if not res.get("confidence"):
+                        res["confidence"] = 0.95
+                    results[batch_start + i] = res
+            except Exception as exc:
+                print(f"[Recurring] Short obligation check failed: {exc}, using deterministic values")
+                for i, c in enumerate(batch):
+                    results[batch_start + i] = {
+                        "is_recurring": True,
+                        "frequency": c.get("detected_cadence", "MONTHLY").upper(),
+                        "confidence": 0.90
+                    }
+        return results
+
+    @classmethod
+    def detect_recurring(cls, candidates: list[dict], document_text: str = "") -> list[dict]:
+        """
+        Runs regex cadence detection first (0 tokens), then short LLM obligation-check
+        only for cadence-detected items. (Used by baseline_graph.py node_detect_recurrence)
+        """
+        cadence_candidates = []
+        for i in (candidates or []):
+            if i.get('scope_type') == 'OUT_OF_SCOPE' or i.get('is_out_of_scope', False):
+                continue
+            text_to_check = f"{i.get('name', '')} {i.get('description', '')}"
+            detected_cadence = _detect_recurrence_cadence(text_to_check) or i.get('recurrence_cadence')
+            if detected_cadence:
+                i_copy = dict(i)
+                i_copy['detected_cadence'] = detected_cadence
+                cadence_candidates.append(i_copy)
+
+        if not cadence_candidates:
+            return []
+
+        results = cls._check_obligation_batch(cadence_candidates)
+        recurring_items = []
+        for item, res in zip(cadence_candidates, results):
+            if res.get('is_recurring'):
+                item_copy = dict(item)
+                item_copy['is_recurring'] = True
+                item_copy['recurrence_cadence'] = res.get('frequency', item.get('detected_cadence', '')).lower()
+                recurring_items.append(item_copy)
+        return recurring_items
 
     @classmethod
     def _extract_recurrence_batch(cls, candidates):

@@ -38,7 +38,8 @@ class DocumentService:
             return None
         if cls._markitdown_converter is None:
             try:
-                from markitdown import MarkItDown
+                # pyrefly: ignore [missing-import]
+                from markitdown import MarkItDown  # type: ignore
                 cls._markitdown_converter = MarkItDown()
                 MARKITDOWN_AVAILABLE = True
             except ImportError:
@@ -58,8 +59,10 @@ class DocumentService:
 
         if cls._docling_converter is None:
             try:
-                from docling.document_converter import DocumentConverter, PdfFormatOption
-                from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode
+                # pyrefly: ignore [missing-import]
+                from docling.document_converter import DocumentConverter, PdfFormatOption  # type: ignore
+                # pyrefly: ignore [missing-import]
+                from docling.datamodel.pipeline_options import PdfPipelineOptions, TableFormerMode  # type: ignore
                 DOCLING_AVAILABLE = True
                 pipeline_options = PdfPipelineOptions()
                 pipeline_options.do_table_structure = True
@@ -75,7 +78,8 @@ class DocumentService:
             except Exception as e:
                 print(f"Warning: Failed to initialize Docling pipeline with custom options ({e}). Falling back to default DocumentConverter.")
                 try:
-                    from docling.document_converter import DocumentConverter
+                    # pyrefly: ignore [missing-import]
+                    from docling.document_converter import DocumentConverter  # type: ignore
                     cls._docling_converter = DocumentConverter()
                     DOCLING_AVAILABLE = True
                 except Exception as ex:
@@ -172,8 +176,14 @@ class DocumentService:
         if not markdown_text or not markdown_text.strip():
             return []
 
+        # Convert tabs to pipe delimiters so MarkdownHeaderTextSplitter
+        # (which drops non-printable ASCII chars like \t) preserves table columns
+        if "\t" in markdown_text:
+            markdown_text = markdown_text.replace("\t", " | ")
+
         headers_to_split_on = [("#", "H1"), ("##", "H2"), ("###", "H3")]
         try:
+            from langchain_text_splitters import MarkdownHeaderTextSplitter
             md_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
             header_splits = md_splitter.split_text(markdown_text)
 
@@ -275,12 +285,28 @@ class DocumentService:
                 para = docx.text.paragraph.Paragraph(element, doc)
                 if para.text.strip():
                     full_text.append(para.text)
-            elif element.tag.endswith('tbl'):
-                table = docx.table.Table(element, doc)
-                for row in table.rows:
-                    row_text = "\t".join([cell.text.strip().replace("\n", " ") for cell in row.cells])
-                    if row_text.strip():
-                        full_text.append(row_text)
+            elif element.tag.endswith('tbl') or element.tag.endswith('}tbl'):
+                try:
+                    from docx.table import Table as DocxTable
+                    table = DocxTable(element, doc)
+                    for row in table.rows:
+                        # Join cells with TAB — preserves column structure
+                        # for milestone name / date / status extraction
+                        cells = [
+                            cell.text.strip().replace('\n', ' ').replace('\t', ' ')
+                            for cell in row.cells
+                            if cell.text.strip()  # skip empty cells
+                        ]
+                        # Deduplicate merged cells (docx merges repeat the text)
+                        seen = []
+                        for c in cells:
+                            if not seen or c != seen[-1]:
+                                seen.append(c)
+                        row_text = '\t'.join(seen)
+                        if row_text.strip():
+                            full_text.append(row_text)
+                except Exception as e:
+                    print(f"  [DocumentService] Table parse warning: {e}")
 
         chunks = chunk_text("\n".join(full_text))
         return [{"page_number": None, "text": chunk, "chunk_index": idx} for idx, chunk in enumerate(chunks)]

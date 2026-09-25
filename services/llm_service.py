@@ -21,13 +21,18 @@ class LLMService:
         if settings.GEMINI_API_KEY:
             try:
                 from google import genai
+                try:
+                    from google.genai.models import Models
+                    Models._logged_afc_warning = True
+                except Exception:
+                    pass
                 return genai.Client(api_key=settings.GEMINI_API_KEY)
             except ImportError:
                 return None
         return None
 
     @classmethod
-    def _call_gemini(cls, prompt: str) -> str:
+    def _call_gemini(cls, prompt: str, temperature: float = 0.2, top_k: int = None, top_p: float = None) -> str:
         client = cls._get_gemini_client()
         if not client:
             raise RuntimeError("Gemini API key is not configured or google-genai library is missing.")
@@ -35,6 +40,15 @@ class LLMService:
         model = settings.GEMINI_MODEL or "gemini-flash-lite-latest"
         max_retries = 2
         last_error = None
+
+        call_config = {
+            "automatic_function_calling": {"disable": True},
+            "temperature": temperature,
+        }
+        if top_k is not None:
+            call_config["top_k"] = top_k
+        if top_p is not None:
+            call_config["top_p"] = top_p
 
         for attempt in range(max_retries):
             try:
@@ -47,18 +61,18 @@ class LLMService:
                 response = client.models.generate_content(
                     model=model,
                     contents=prompt,
-                    config={
-                        "automatic_function_calling": {"disable": True},
-                        "temperature": 0.0,
-                        "top_k": 1,
-                        "top_p": 1.0,
-                    }
+                    config=call_config
                 )
                 elapsed = time.time() - t0
                 _terminal_log("-" * 75)
                 _terminal_log(f"[LLM SUCCESS: GOOGLE GEMINI]")
                 _terminal_log(f"  Model:     {model}")
                 _terminal_log(f"  Duration:  {elapsed:.2f}s")
+                if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                    in_tok = getattr(response.usage_metadata, 'prompt_token_count', 0) or 0
+                    out_tok = getattr(response.usage_metadata, 'candidates_token_count', 0) or 0
+                    tot_tok = getattr(response.usage_metadata, 'total_token_count', 0) or (in_tok + out_tok)
+                    _terminal_log(f"  Tokens:    Prompt: {in_tok:,} | Completion: {out_tok:,} | Total: {tot_tok:,}")
                 _terminal_log("-" * 75)
                 return response.text or ""
             except Exception as e:
@@ -87,17 +101,32 @@ class LLMService:
             "Authorization": f"Bearer {settings.OPENAI_API_KEY}",
             "Content-Type": "application/json"
         }
+        model = settings.OPENAI_MODEL or "gpt-4o-mini"
         payload = {
-            "model": settings.OPENAI_MODEL or "gpt-4o-mini",
+            "model": model,
             "messages": [
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.2
         }
-        
+        _terminal_log("=" * 75)
+        _terminal_log(f"[LLM ACTIVE: OPENAI]")
+        _terminal_log(f"  Model:     {model}")
+        _terminal_log(f"  Status:    Sending request to OpenAI API ({len(prompt)} chars)...")
+        _terminal_log("=" * 75)
+        t0 = time.time()
         response = requests.post(url, headers=headers, json=payload, timeout=(10, settings.LLM_TIMEOUT))
         response.raise_for_status()
         data = response.json()
+        elapsed = time.time() - t0
+        _terminal_log("-" * 75)
+        _terminal_log(f"[LLM SUCCESS: OPENAI]")
+        _terminal_log(f"  Model:     {model}")
+        _terminal_log(f"  Duration:  {elapsed:.2f}s")
+        if "usage" in data:
+            u = data["usage"]
+            _terminal_log(f"  Tokens:    Prompt: {u.get('prompt_tokens', 0):,} | Completion: {u.get('completion_tokens', 0):,} | Total: {u.get('total_tokens', 0):,}")
+        _terminal_log("-" * 75)
         return data["choices"][0]["message"]["content"]
 
     @classmethod
@@ -111,17 +140,34 @@ class LLMService:
             "anthropic-version": "2023-06-01",
             "Content-Type": "application/json"
         }
+        model = settings.ANTHROPIC_MODEL or "claude-3-5-sonnet-20241022"
         payload = {
-            "model": settings.ANTHROPIC_MODEL or "claude-3-5-sonnet-20241022",
+            "model": model,
             "max_tokens": 4096,
             "messages": [
                 {"role": "user", "content": prompt}
             ]
         }
-        
+        _terminal_log("=" * 75)
+        _terminal_log(f"[LLM ACTIVE: ANTHROPIC CLAUDE]")
+        _terminal_log(f"  Model:     {model}")
+        _terminal_log(f"  Status:    Sending request to Anthropic Claude ({len(prompt)} chars)...")
+        _terminal_log("=" * 75)
+        t0 = time.time()
         response = requests.post(url, headers=headers, json=payload, timeout=(10, settings.LLM_TIMEOUT))
         response.raise_for_status()
         data = response.json()
+        elapsed = time.time() - t0
+        _terminal_log("-" * 75)
+        _terminal_log(f"[LLM SUCCESS: ANTHROPIC CLAUDE]")
+        _terminal_log(f"  Model:     {model}")
+        _terminal_log(f"  Duration:  {elapsed:.2f}s")
+        if "usage" in data:
+            u = data["usage"]
+            in_t = u.get("input_tokens", 0)
+            out_t = u.get("output_tokens", 0)
+            _terminal_log(f"  Tokens:    Prompt: {in_t:,} | Completion: {out_t:,} | Total: {in_t + out_t:,}")
+        _terminal_log("-" * 75)
         return data["content"][0]["text"]
 
     @classmethod
@@ -144,14 +190,28 @@ class LLMService:
             ],
             "temperature": 0.2
         }
-        
+        _terminal_log("=" * 75)
+        _terminal_log(f"[LLM ACTIVE: AZURE OPENAI]")
+        _terminal_log(f"  Deployment: {deployment}")
+        _terminal_log(f"  Status:     Sending request to Azure OpenAI ({len(prompt)} chars)...")
+        _terminal_log("=" * 75)
+        t0 = time.time()
         response = requests.post(url, headers=headers, json=payload, timeout=(10, settings.LLM_TIMEOUT))
         response.raise_for_status()
         data = response.json()
+        elapsed = time.time() - t0
+        _terminal_log("-" * 75)
+        _terminal_log(f"[LLM SUCCESS: AZURE OPENAI]")
+        _terminal_log(f"  Deployment: {deployment}")
+        _terminal_log(f"  Duration:   {elapsed:.2f}s")
+        if "usage" in data:
+            u = data["usage"]
+            _terminal_log(f"  Tokens:     Prompt: {u.get('prompt_tokens', 0):,} | Completion: {u.get('completion_tokens', 0):,} | Total: {u.get('total_tokens', 0):,}")
+        _terminal_log("-" * 75)
         return data["choices"][0]["message"]["content"]
 
     @classmethod
-    def _call_custom(cls, prompt: str) -> str:
+    def _call_custom(cls, prompt: str, temperature: float = 0.2, top_k: int = None, top_p: float = None) -> str:
         if not settings.LLM_API_URL:
             raise RuntimeError("LLM_API_URL is not configured for custom/local LLM provider.")
 
@@ -162,15 +222,16 @@ class LLMService:
         _terminal_log(f"  Status:    Local LLM inference in progress ({len(prompt)} chars)...")
         _terminal_log("=" * 75)
         t0 = time.time()
+        options = {"temperature": temperature}
+        if top_k is not None:
+            options["top_k"] = top_k
+        if top_p is not None:
+            options["top_p"] = top_p
         payload = {
             "model": settings.LLM_MODEL,
             "prompt": prompt,
             "stream": False,
-            "options": {
-                "temperature": 0.0,
-                "top_k": 1,
-                "top_p": 1.0,
-            }
+            "options": options
         }
         response = requests.post(
             settings.LLM_API_URL, 
@@ -184,17 +245,21 @@ class LLMService:
         _terminal_log(f"[LLM SUCCESS: LOCAL LLM]")
         _terminal_log(f"  Model:     {settings.LLM_MODEL}")
         _terminal_log(f"  Duration:  {elapsed:.2f}s")
+        prompt_eval_count = data.get("prompt_eval_count", 0) or 0
+        eval_count = data.get("eval_count", 0) or 0
+        if prompt_eval_count or eval_count:
+            _terminal_log(f"  Tokens:    Prompt: {prompt_eval_count:,} | Completion: {eval_count:,} | Total: {prompt_eval_count + eval_count:,}")
         _terminal_log("-" * 75)
         return data.get("response", "")
 
     @classmethod
-    def generate(cls, prompt: str) -> str:
+    def generate(cls, prompt: str, temperature: float = 0.2, top_k: int = None, top_p: float = None) -> str:
         provider = str(getattr(settings, "LLM_PROVIDER", "gemini")).strip().lower()
 
         # ── STRICT PRIORITY: Always execute configured Gemini model first if API key is present ──
         if settings.GEMINI_API_KEY or provider == "gemini":
             try:
-                return cls._call_gemini(prompt)
+                return cls._call_gemini(prompt, temperature=temperature, top_k=top_k, top_p=top_p)
             except Exception as e:
                 configured_model = settings.GEMINI_MODEL or "gemini-flash-lite-latest"
                 _terminal_log("*" * 75)
@@ -205,7 +270,7 @@ class LLMService:
                 _terminal_log(f"  Endpoint:  {settings.LLM_API_URL}")
                 _terminal_log("*" * 75)
                 if settings.LLM_API_URL:
-                    return cls._call_custom(prompt)
+                    return cls._call_custom(prompt, temperature=temperature, top_k=top_k, top_p=top_p)
                 raise e
 
         elif provider in ["openai", "chatgpt"]:
@@ -281,10 +346,10 @@ class LLMService:
         raise ValueError("Could not extract valid JSON from the response text.")
 
     @classmethod
-    def generate_json(cls, prompt: str, retry_count: int = 1) -> dict:
+    def generate_json(cls, prompt: str, retry_count: int = 1, temperature: float = 0.2, top_k: int = None, top_p: float = None) -> dict:
         """Generates JSON, with one retry if parsing fails."""
         try:
-            raw_response = cls.generate(prompt)
+            raw_response = cls.generate(prompt, temperature=temperature, top_k=top_k, top_p=top_p)
             return cls.extract_json(raw_response)
         except (json.JSONDecodeError, ValueError) as e:
             if retry_count > 0:
@@ -292,7 +357,7 @@ class LLMService:
                 from core.prompts import get_json_correction_prompt
                 correction_prompt = get_json_correction_prompt(raw_response, str(e))
                 try:
-                    corrected_response = cls.generate(correction_prompt)
+                    corrected_response = cls.generate(correction_prompt, temperature=temperature, top_k=top_k, top_p=top_p)
                     return cls.extract_json(corrected_response)
                 except Exception as retry_e:
                     raise RuntimeError(f"JSON correction retry failed: {retry_e}")
@@ -343,8 +408,8 @@ class LLMService:
             except Exception as e:
                 print(f"[LLMService] Structured output failed ({e}), falling back to generate_json()")
 
-        # Fallback: regular JSON generation + manual parsing
-        raw = cls.generate_json(prompt)
+        # Fallback: regular JSON generation + manual parsing with deterministic extraction parameters
+        raw = cls.generate_json(prompt, temperature=0.0, top_k=1, top_p=1.0)
         # If raw is a list (some prompts return a list at top level), wrap it
         if isinstance(raw, list) and fallback_key:
             raw = {fallback_key: raw}

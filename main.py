@@ -101,6 +101,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    # Clean shutdown on application exit
+    try:
+        from services.followup_scheduler import stop_scheduler
+        stop_scheduler()
+    except Exception:
+        pass
+
 
 app = FastAPI(
     title=settings.APP_NAME,
@@ -152,10 +159,32 @@ def root():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=settings.API_HOST or "0.0.0.0",
-        port=int(settings.API_PORT or 8080),
-        reload=True,
-        reload_excludes=["data/*", "*.log", "data/**/*", ".git/*"]
-    )
+    import sys
+    import os
+
+    # On Windows, Uvicorn's reload supervisor can hang waiting for watchfiles Rust thread.
+    # Register a native Windows Console Ctrl Handler to force-exit immediately on Ctrl+C / Ctrl+Break.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_ulong)
+            def _win32_ctrl_handler(ctrl_type):
+                if ctrl_type in (0, 1):  # CTRL_C_EVENT (0) or CTRL_BREAK_EVENT (1)
+                    os._exit(0)
+                return False
+            _global_ctrl_handler = _win32_ctrl_handler  # prevent garbage collection
+            ctypes.windll.kernel32.SetConsoleCtrlHandler(_global_ctrl_handler, True)
+        except Exception:
+            pass
+
+    try:
+        uvicorn.run(
+            "main:app",
+            host=settings.API_HOST or "0.0.0.0",
+            port=int(settings.API_PORT or 8080),
+            reload=True,
+            reload_excludes=["data/*", "*.log", "data/**/*", ".git/*"]
+        )
+    except KeyboardInterrupt:
+        sys.exit(0)
+

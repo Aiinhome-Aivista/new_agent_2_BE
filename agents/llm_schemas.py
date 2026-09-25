@@ -162,6 +162,13 @@ class RiskItem(BaseModel):
             "CRITICAL: If matched_baseline_item is set, entity_type MUST be MILESTONE, DEPENDENCY, or ACTION_ITEM — NEVER SCOPE_REQUEST."
         ))
     ]
+    risk_level: Annotated[
+        Optional[Literal["LOW", "MEDIUM", "HIGH", "CRITICAL"]],
+        Field(
+            default=None,
+            description="Optional qualitative risk level assessing project risk (LOW, MEDIUM, HIGH, CRITICAL)."
+        )
+    ]
     matched_baseline_item: Annotated[Optional[str], Field(
         default=None,
         description=(
