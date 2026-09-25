@@ -4,7 +4,12 @@ import re
 import time
 import os
 import sys
+import logging
 from core.config import settings
+
+# Silence SDK AFC/internal advisory warnings
+logging.getLogger("google_genai").setLevel(logging.ERROR)
+logging.getLogger("google_genai.models").setLevel(logging.ERROR)
 
 def _terminal_log(msg: str):
     """Prints directly to terminal with immediate flush and ASCII-safe characters."""
