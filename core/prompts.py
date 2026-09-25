@@ -206,7 +206,7 @@ CRITICAL RULES:
 5. Identify any due date or deadline mentioned.
 6. Identify if this item is explicitly blocking or delaying any other deliverables/activities.
    CRITICAL FOR DEPENDENCIES:
-   - `blocks` and `blocked_by` MUST contain project deliverables/activities ONLY (e.g. ["CRM Integration"], ["Production VPN Access"]).
+   - `blocks` and `blocked_by` MUST contain project deliverables/activities ONLY (e.g. ["Deliverable A"], ["Production Access"]).
    - NEVER put statuses ("Pending review", "Waiting", "Completed", "Blocked"), owners ("Customer", "Internal", "Development Team"), roles ("QA Lead", "Project Manager", "Architect"), or dates ("09 Sep 2026", "Next week") into `blocks` or `blocked_by`.
    - Valid values are ONLY names of project deliverables, features, integrations, or milestones mentioned in the document.
    - DIRECTIONALITY RULE (CRITICAL):
@@ -221,42 +221,16 @@ CRITICAL RULES:
 8. Ignore greetings, attendance lists, signatures, and agenda headings.
 9. RESOLUTION & FULFILLMENT EXTRACTION (CRITICAL):
     Extract EVERY item, deliverable, prerequisite, access, credential, dependency, or blocker that the document explicitly states is now completed, resolved, received, provided, signed off, or fulfilled into the `resolved_items` array.
-    - When a sentence states that an activity/deliverable was completed upon or after receiving prerequisites/dependencies (e.g. "CRM Integration completed after receiving production credentials and VPN access"):
+    - When a sentence states that an activity/deliverable was completed upon or after receiving prerequisites/dependencies (e.g. "Integration Module completed after receiving production credentials and network access"):
       You MUST extract separate entries in `resolved_items` for:
-      a) The completed activity/deliverable (e.g. "CRM Integration"), AND
-      b) EACH individual prerequisite, credential, access, approval, or dependency that was received/fulfilled (e.g. "Production CRM API credentials", "Production VPN access").
+      a) The completed activity/deliverable (e.g. "Integration Module"), AND
+      b) EACH individual prerequisite, credential, access, approval, or dependency that was received/fulfilled (e.g. "Production API credentials", "Production network access").
     - If an extracted resolved item conceptually matches any deliverable in the baseline or one of the CURRENT ACTIVE PROJECT RISKS listed above, use the normalized/standard title.
     - Include a confidence score (0.0 to 1.0) and the exact evidence sentence in `resolution_evidence`.
 10. ACTION ITEMS & TABLES EXTRACTION (CRITICAL):
-    Every row in Action Items, Decisions, Dependencies, or Customer Responsibility tables (e.g. 'Provide Production API Credentials', 'Provide Production VPN access') MUST be extracted as an individual entry in `extractions`. Do not omit them or bury them only inside another item's `blocked_by` list.
+    Every row in Action Items, Decisions, Dependencies, or Customer Responsibility tables (e.g. 'Provide Production API Credentials', 'Provide Network Access') MUST be extracted as an individual entry in `extractions`. Do not omit them or bury them only inside another item's `blocked_by` list.
 
-Output MUST be valid JSON conforming to the following structure:
-{{
-  "extractions": [
-    {{
-      "statement": "Production VPN Access",
-      "verb": "provide",
-      "owner": "CUSTOMER",
-      "due_date": "2026-09-09",
-      "blocks": ["CRM Integration"],
-      "blocked_by": [],
-      "confidence": 0.98,
-      "source_sentence": "Customer must provide Production VPN Access by Sept 9, which is delaying the CRM Integration."
-    }}
-  ],
-  "resolved_items": [
-    {{
-      "name": "Production CRM API credentials",
-      "resolution_evidence": "Production API credentials were received.",
-      "confidence": 0.96
-    }},
-    {{
-      "name": "Production VPN access",
-      "resolution_evidence": "VPN access was granted.",
-      "confidence": 0.96
-    }}
-  ]
-}}
+Return a JSON object. Fields: extractions (array of activity objects), resolved_items (array of resolved item objects).
 """
 
 # Phase 1b: Batch Activity Risk Agent
@@ -280,19 +254,19 @@ RULES:
 
    CRITICAL RULE — matched_baseline_item STRICT MATCHING:
    When assigning matched_baseline_item, you MUST prefer the baseline item whose name has the HIGHEST lexical overlap with the activity name.
-   - If the activity name contains words that exactly appear in a baseline item name (e.g., "Azure AD", "SSO", "Single Sign-On"), use THAT baseline item — do not substitute a semantically related but lexically different item.
+   - If the activity name contains words that exactly appear in a baseline item name (e.g. distinct proper nouns or key domain terms), use THAT baseline item — do not substitute a semantically related but lexically different item.
    - Only use a semantically related baseline item if NO baseline item shares significant lexical overlap (3+ words or a distinctive proper noun) with the activity.
-   - "Role-based access control" is a separate baseline item from "Azure AD Single Sign-On (SSO)". Do not assign an SSO activity to "Role-based access control" — they are distinct deliverables.
+   - Do not confuse distinct deliverables that have separate scopes (e.g. "User Authentication" vs "Role-Based Access Control" are distinct deliverables).
    - If matched_baseline_item is set, it MUST appear verbatim (or near-verbatim) in the baseline scope items list provided in the context.
    - GENERAL PRINCIPLE: Prefer lexical match over semantic match for matched_baseline_item. The deterministic Python resolver handles semantics — your job is lexical accuracy.
 
 2. STATUS EXTRACTION:
    - Identify the current execution status: IN_PROGRESS, BLOCKED, DELAYED, COMPLETED, NOT_STARTED, WAITING_ON_CUSTOMER, or UNKNOWN.
-   - If an activity is explicitly stated as completed, finished, resolved, signed off, or delivered (e.g. "CRM Integration completed after receiving credentials and VPN access"), its status MUST be COMPLETED.
+   - If an activity is explicitly stated as completed, finished, resolved, signed off, or delivered (e.g. "Module completed after receiving credentials and network access"), its status MUST be COMPLETED.
 
 3. BLOCKED BY & PREREQUISITES (STRICT EVIDENCE-BACKED ENTITY ONLY):
-   - `blocked_by` MUST contain explicit ACTIVE prerequisite activities, deliverables, or resource dependencies mentioned in the text (e.g. ["Production CRM API Credentials"], ["Production VPN Access"], ["Backend APIs"], ["Security Review"], ["QA Validation"]).
-   - ONLY include items explicitly established in evidence as CURRENT active prerequisites or blockers. NEVER invent, infer, or guess dependencies across unrelated workstreams (e.g. do NOT put "CRM Integration" under "Analytics Dashboard" unless the sentence explicitly says so).
+   - `blocked_by` MUST contain explicit ACTIVE prerequisite activities, deliverables, or resource dependencies mentioned in the text (e.g. ["Production API Credentials"], ["Network Access"], ["Backend APIs"], ["Security Review"], ["QA Validation"]).
+   - ONLY include items explicitly established in evidence as CURRENT active prerequisites or blockers. NEVER invent, infer, or guess dependencies across unrelated workstreams (e.g. do NOT put "Module A" under "Analytics Dashboard" unless the sentence explicitly says so).
    - If a deliverable is COMPLETED, or if the prerequisites were already RECEIVED/FULFILLED/RESOLVED, they are NO LONGER blocking — return an empty array [] for `blocked_by`. Do NOT list fulfilled prerequisites as active blockers!
    - NEVER include statuses ("Pending review", "Waiting", "Completed"), owners ("Customer", "Vendor", "Internal"), roles ("QA Lead"), dates, or evidence phrases.
    - If not blocked, return an empty array [].
@@ -345,31 +319,7 @@ RULES:
    - `business_impact.future`: What will slip in the future?
    - `ai_interpretation`: Coherent story interpreting the evidence.
 
-Output MUST be a valid JSON array with one entry per activity, in the SAME ORDER as provided:
-[
-  {{
-    "activity": "Activity name as given",
-    "entity_type": "MILESTONE|DEPENDENCY|SCOPE_REQUEST|ACTION_ITEM|RISK",
-    "matched_baseline_item": "Canonical short baseline entity name, or null if no match",
-    "owner": "INTERNAL|CUSTOMER|VENDOR|THIRD_PARTY",
-    "status": "IN_PROGRESS|BLOCKED|DELAYED|COMPLETED|NOT_STARTED|WAITING_ON_CUSTOMER",
-    "progress": 70,
-    "blocked_by": ["Item 1"],
-    "blocks": ["Downstream Item 1"],
-    "evidence_text": "Exact quote from document proving this status/blocker.",
-    "narratives": {{
-        "executive_summary": "1-2 sentence summary",
-        "gap_analysis": "Expected vs Actual",
-        "why_important": "Non-technical explanation",
-        "business_impact": {{
-           "immediate": "Immediate impact",
-           "future": "Future impact"
-        }},
-        "ai_interpretation": "AI interpretation of evidence"
-    }},
-    "recommended_action": "Specific actionable recommendation to resolve this item, if blocked or delayed, else null"
-  }}
-]
+Return a JSON array, one object per input activity in the SAME ORDER as provided.
 """
 
 # Phase 2: Deliverable Timeline Evaluation Agent
@@ -785,16 +735,7 @@ For EACH item, classify it as "IN_SCOPE", "OUT_OF_SCOPE", or "UNCERTAIN".
 - If the evidence states it's excluded, or it's the client's responsibility, or it's an assumption, choose OUT_OF_SCOPE.
 - If there is not enough evidence to be sure, choose UNCERTAIN.
 
-Output your result strictly as a JSON ARRAY of objects, matching the input "id".
-Schema Example:
-[
-  {{
-    "id": "0",
-    "scope_type": "IN_SCOPE", 
-    "confidence": 0.9, 
-    "evidence_text": "<Brief 1-sentence reasoning quoting the evidence>"
-  }}
-]
+Return a JSON array. One object per input item with keys: id, scope_type, confidence, evidence_text.
 """
 
 def get_single_scope_classifier_prompt(candidate: dict, combined_evidence: str) -> str:
@@ -897,7 +838,7 @@ RULES:
    - A one-time deliverable with a specific deadline.
    - A general description of project activities (e.g., "The team may discuss progress in monthly meetings").
    - A monitoring/meeting activity not tied to a contractual deliverable output.
-   - Incidentally mentioned with a time period (e.g., "monthly steering committee discussed CRM progress").
+   - Incidentally mentioned with a time period (e.g., "monthly steering committee discussed project progress").
 
 3. FREQUENCY — If recurring, identify the frequency as exactly one of:
    "WEEKLY" | "BIWEEKLY" | "MONTHLY" | "BIMONTHLY" | "QUARTERLY" | "EVERY_4_MONTHS" | "SEMIANNUAL" | "YEARLY"
@@ -922,36 +863,34 @@ RULES:
 
 6. DO NOT calculate individual occurrence dates. That is handled separately.
 
-Output strictly as a JSON ARRAY of objects, one per input item, matching the input "id":
-[
-  {{
-    "id": "0",
-    "is_recurring": true,
-    "frequency": "MONTHLY",
-    "commitment_title": "Application Improvement",
-    "start_date": null,
-    "end_date": null,
-    "confidence": 0.95,
-    "reasoning": "EL explicitly states 'Developer shall provide a monthly improvement' — clear recurring vendor obligation."
-  }},
-  {{
-    "id": "1",
-    "is_recurring": false,
-    "frequency": null,
-    "commitment_title": null,
-    "start_date": null,
-    "end_date": null,
-    "confidence": 0.0,
-    "reasoning": "One-time CRM integration deliverable with a specific deadline — not recurring."
-  }}
-]
+Return a JSON array. One object per input item with keys: id, is_recurring, frequency, commitment_title, start_date, end_date, confidence, reasoning.
+"""
 
-Rules for output:
-- "is_recurring" MUST be a boolean.
-- "frequency" MUST be one of "WEEKLY","BIWEEKLY","MONTHLY","BIMONTHLY","QUARTERLY","EVERY_4_MONTHS","SEMIANNUAL","YEARLY" or null.
-- "start_date" and "end_date" MUST be "YYYY-MM-DD" strings or null.
-- "confidence" MUST be a float between 0.0 and 1.0.
-- Output ONLY the JSON array. No markdown blocks, no explanations outside JSON.
+
+def get_short_obligation_prompt(items_for_prompt: list[dict]) -> str:
+    """
+    Short obligation-check prompt (Item 15) for candidates with cadence keywords detected.
+    Rapidly evaluates if candidate represents an active recurring vendor obligation under the contract.
+    """
+    import json
+    return f"""You are a Contract Obligation Classifier.
+Evaluate the following items (each has a detected recurrence cadence keyword) to confirm if each item is an ACTIVE CONTRACTUAL RECURRING DELIVERABLE that the vendor must repeatedly deliver.
+
+Items:
+{json.dumps(items_for_prompt, indent=2)}
+
+Rules:
+1. is_recurring: true ONLY if the vendor is contractually obligated to deliver this periodically.
+2. is_recurring: false if it is an exclusion, customer responsibility, or incidental meeting mention.
+3. frequency: canonical uppercase (WEEKLY, BIWEEKLY, MONTHLY, BIMONTHLY, QUARTERLY, EVERY_4_MONTHS, SEMIANNUAL, YEARLY).
+4. confidence: float 0.0 to 1.0.
+
+Return JSON format with schema:
+{{
+  "items": [
+    {{"id": "0", "is_recurring": true, "frequency": "MONTHLY", "confidence": 0.95, "start_date": null, "end_date": null}}
+  ]
+}}
 """
 
 # ==========================================

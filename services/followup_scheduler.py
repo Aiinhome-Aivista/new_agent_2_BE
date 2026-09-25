@@ -12,8 +12,8 @@ from repositories.document_repository import DocumentRepository
 
 logger = logging.getLogger("followup_scheduler")
 
-# Background scheduler instance
-scheduler = BackgroundScheduler()
+# Background scheduler instance with daemon threads so it exits cleanly on shutdown
+scheduler = BackgroundScheduler(daemon=True)
 
 def get_followup_recipients(cursor: Any, project_id: int) -> List[Dict[str, str]]:
     """
@@ -398,4 +398,15 @@ def start_scheduler():
             total_minutes,
             od_total_minutes,
         )
+
+
+def stop_scheduler():
+    """Stops the APScheduler background thread cleanly."""
+    if scheduler.running:
+        try:
+            scheduler.shutdown(wait=False)
+            logger.info("APScheduler stopped.")
+        except Exception as e:
+            logger.error("Error stopping APScheduler: %s", e)
+
 

@@ -2,7 +2,6 @@ from services.embedding_service import EmbeddingService
 from services.chroma_service import ChromaService
 from services.bm25_service import BM25Service
 from core.config import settings
-from sentence_transformers import CrossEncoder
 
 class HybridRetrievalService:
     _reranker = None
@@ -10,6 +9,7 @@ class HybridRetrievalService:
     @classmethod
     def get_reranker(cls):
         if cls._reranker is None and settings.ENABLE_RERANKER:
+            from sentence_transformers import CrossEncoder
             cls._reranker = CrossEncoder(settings.RERANKER_MODEL)
         return cls._reranker
 

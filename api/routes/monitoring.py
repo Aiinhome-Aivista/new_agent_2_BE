@@ -440,3 +440,100 @@ def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, 
             "error": doc.get("processing_error")
         }
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OBSERVABILITY & EVALUATION ENDPOINTS
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get("/traces")
+def get_execution_traces(
+    project_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD", "PMO_REVIEWER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Returns recent OpenTelemetry / agent execution traces for this project.
+    Includes node execution times, span hierarchies, token usages, and status.
+    """
+    verify_project_access(project_id, current_user, db)
+    from services.telemetry_service import telemetry
+    traces = telemetry.trace_store.list_traces(project_id=project_id, limit=limit)
+    return {"success": True, "data": traces}
+
+
+@router.get("/traces/{trace_id}")
+def get_trace_detail(
+    project_id: int,
+    trace_id: str,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD", "PMO_REVIEWER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Returns full span-level breakdown of a single execution trace.
+    """
+    verify_project_access(project_id, current_user, db)
+    from services.telemetry_service import telemetry
+    trace_obj = telemetry.trace_store.get(trace_id)
+    if not trace_obj or (trace_obj.project_id is not None and trace_obj.project_id != project_id):
+        raise HTTPException(status_code=404, detail="Trace not found for this project")
+    return {"success": True, "data": trace_obj.to_dict()}
+
+
+@router.post("/judge/{document_id}")
+def run_llm_judge(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Runs an independent LLM-as-a-Judge evaluation on a processed document.
+    Grades faithfulness (grounding / hallucinations), coverage, and severity calibration.
+    """
+    verify_project_access(project_id, current_user, db)
+    from services.eval_service import AgentEvaluationService
+    from repositories.document_repository import DocumentRepository
+
+    doc = DocumentRepository.get_document(db, document_id, project_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    ext = os.path.splitext(doc["storage_key"])[1].lower()
+    temp_path = os.path.join(tempfile.gettempdir(), f"judge_{uuid.uuid4()}{ext}")
+    try:
+        StorageService.download_to_temp_file(doc["storage_key"], temp_path)
+        chunks = DocumentService.parse_document(temp_path, ext)
+        doc_text = "\n".join([c.get("text", "") for c in chunks])
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
+    cursor = db.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT title as activity, risk_level, reasoning FROM tracker_items WHERE project_id = %s AND document_id = %s",
+        (project_id, document_id)
+    )
+    items = cursor.fetchall() or []
+    cursor.close()
+
+    eval_result = {"subAgentResults": {"activities": items}}
+    report = AgentEvaluationService.evaluate_with_llm_judge(doc_text, eval_result)
+    return {"success": True, "data": report.model_dump()}
+
+
+@router.get("/benchmark")
+def run_eval_benchmark(
+    project_id: int,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Executes offline evaluation benchmark on standard golden scenarios
+    and returns overall accuracy, hallucination rate, and critique.
+    """
+    verify_project_access(project_id, current_user, db)
+    from services.eval_service import AgentEvaluationService
+    benchmark_report = AgentEvaluationService.run_offline_benchmark()
+    return {"success": True, "data": benchmark_report.model_dump()}

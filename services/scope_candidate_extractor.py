@@ -1,5 +1,46 @@
 import re
 
+# Comprehensive bullet character detection.
+# Covers all bullet/list-item characters found in real-world
+# EL, IFA, SOW, MoM, and Status Report documents from any
+# word processor (Microsoft Word, Google Docs, LibreOffice,
+# PDF export, MarkItDown conversion output).
+# Generic: no document-specific characters.
+_BULLET_PATTERN = re.compile(
+    r'^(?:'
+    r'[\u2022\u25CF\u25E6\u2023\u2043\u00B7\u27A2\u2192\u2013\u2014\u2012]'  # Unicode bullets/dashes/arrows
+    r'|[-\*\+]'               # ASCII hyphens, asterisks, plus signs
+    r'|o(?=\s+[A-Z\u201C\u2018])'  # lowercase 'o' only if followed by capital (Word outline bullets)
+    r')\s+'
+)
+
+# Strip bullet character from the start of a line
+_BULLET_STRIP_PATTERN = re.compile(
+    r'^(?:[\u2022\u25CF\u25E6\u2023\u2043\u00B7\u27A2\u2192\u2013\u2014\u2012]|[-\*\+]|o(?=\s+[A-Z]))\s+'
+)
+
+# Milestone table row detector.
+# Handles three real-world formats:
+#   Format A (TAB): "Azure AD SSO\t15 Nov 2026\tPlanned\t..."
+#   Format B (PIPE): "| Azure AD SSO | 15 Nov 2026 | Planned | ..."
+#   Format C (2+ spaces): "Azure AD SSO  15 Nov 2026  Planned"
+# Generic: date and status patterns cover all common EL formats.
+# Does NOT match smushed rows with no separator (correctly rejects them).
+_MILESTONE_ROW_PATTERN = re.compile(
+    r'^(?:\|?\s*)?'
+    r'(.+?)'                            # milestone name (non-greedy)
+    r'(?:\t|\s*\|\s*|\s{2,})'          # column separator: TAB or PIPE or 2+ spaces
+    r'(\d{1,2}\s+'                      # date: day
+    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\w*'  # month
+    r'\s+\d{4})'                        # year
+    r'(?:\t|\s*\|\s*|\s{2,})'          # column separator
+    r'(Completed?|Done|In\s+Progress|Ongoing|Planned|Scheduled|'
+    r'Future|Upcoming|Not\s+Started|Pending|Active|Blocked|Delayed|Cancelled?)'
+    r'(?:\t|\s*\|\s*|\s{2,})?'         # optional trailing separator
+    r'(.*)$',                           # optional remarks
+    re.IGNORECASE
+)
+
 class ScopeCandidateExtractor:
     """
     Extracts candidate scope items from chunks using deterministic rules (bullets, numbering, short sentences).
@@ -7,6 +48,7 @@ class ScopeCandidateExtractor:
     
     # Sections from which we want to extract candidates
     TARGET_SECTIONS = {
+        "In Scope",
         "Scope of Work", 
         "Deliverables", 
         "Responsibilities", 
@@ -57,6 +99,10 @@ class ScopeCandidateExtractor:
 
         # Table header row detection (e.g. "Phase  Timeline  Status  Remarks")
         if re.search(r'\b(phase|milestone|deliverable)\b.*?\b(timeline|date|status|remarks)\b', lower_text):
+            return True
+
+        # Table separator rows (e.g. "| --- | --- | --- | --- |")
+        if re.match(r'^[\s\|\-:]+$', text):
             return True
 
         # Pure parenthetical frequency / occurrence notes (e.g. "(Monthly, from March 2026 through December 2026 — 10 occurrences)")
@@ -154,10 +200,11 @@ class ScopeCandidateExtractor:
                 if not line:
                     continue
                     
-                # Rule 1: Bullet points
-                if re.match(r'^[\-\•\*o]\s+', line):
-                    candidate_text = re.sub(r'^[\-\•\*o]\s+', '', line).strip()
+                # Rule 1: Bullet points (Comprehensive Unicode-aware bullets/dashes/arrows)
+                if _BULLET_PATTERN.match(line):
+                    candidate_text = _BULLET_STRIP_PATTERN.sub('', line, count=1).strip()
                     if candidate_text and not cls._is_heading(candidate_text):
+                        print(f'  [BulletExtractor] Extracted via bullet: "{candidate_text[:50]}"')
                         cls._process_and_add(candidates, candidate_text, chunk, document_id)
                         continue
                 
@@ -168,12 +215,13 @@ class ScopeCandidateExtractor:
                         cls._process_and_add(candidates, candidate_text, chunk, document_id)
                         continue
                         
-                # Rule 3: Table rows with dates (e.g., M1  Discovery  15 Jul)
-                table_match = re.search(r'^(.*?)(?:\t|\s{2,})([0-9]{1,2}\s+[A-Za-z]+(?:\s+[0-9]{2,4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4})(?:(?:\t|\s{2,})(.*))?$', line)
-                if table_match:
-                    item_text = table_match.group(1).strip()
-                    date_text = table_match.group(2).strip()
-                    status_text = table_match.group(3).strip() if table_match.group(3) else "Planned"
+                # Rule 3: Table rows with dates (handles TAB, PIPE, and 2+ spaces; rejects smushed rows)
+                m = _MILESTONE_ROW_PATTERN.match(line)
+                if m:
+                    item_text = m.group(1).strip().strip('|').strip()
+                    date_text = m.group(2).strip()
+                    status_text = m.group(3).strip()
+                    remarks = (m.group(4) or '').strip().strip('|').strip()
                     
                     if len(item_text) > 2 and not cls._is_heading(item_text) and item_text.lower() != 'phase':
                         cand = cls._create_candidate(item_text, chunk, document_id)
@@ -189,6 +237,7 @@ class ScopeCandidateExtractor:
                         else:
                             cand["milestone_status"] = "Planned"
                             
+                        print(f'  [MilestoneRow] Extracted: "{item_text}" -> Date: {date_text}, Status: {cand["milestone_status"]}')
                         candidates.append(cand)
                     continue
                         

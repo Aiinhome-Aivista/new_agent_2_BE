@@ -106,6 +106,88 @@ def _validate_matched_baseline_item(
     return best_match
 
 
+PLANNING_VERBS = {'plan', 'plans', 'planned', 'planning', 'will be', 'schedule', 'scheduled', 'propose', 'proposed', 'target', 'targeting'}
+NO_ACTION_SIGNALS = [
+    'no action required', 'no action needed', 'informational only',
+    'fyi only', 'on track no risk', 'no blocker', 'no blockers',
+    'proceeding normally', 'status quo'
+]
+
+COMPLETION_NOUNS = {
+    'completion', 'complete', 'completed', 'signoff', 'sign-off',
+    'acceptance', 'approval', 'approved', 'delivery', 'closure',
+    'handover', 'finalization', 'readiness', 'execution', 'passed', 'passing'
+}
+
+
+def _normalize_owner(raw_owner: str = None, is_out_of_scope: bool = False, entity_type: str = '') -> str:
+    """
+    Normalizes the owner of a tracker item (Item 49).
+    Scope creep items (is_out_of_scope=True) ALWAYS return 'Customer'.
+    Other owners are mapped to standard capitalized roles: 'Customer', 'Internal', 'Vendor', 'Third Party'.
+    """
+    if is_out_of_scope:
+        return 'Customer'
+
+    if not raw_owner:
+        if str(entity_type).upper() in ('DEPENDENCY', 'BLOCKER'):
+            return 'Customer'
+        return 'Internal'
+
+    s = str(raw_owner).strip().upper()
+    if any(k in s for k in ('CUSTOMER', 'CLIENT', 'USER')):
+        return 'Customer'
+    if 'VENDOR' in s:
+        return 'Vendor'
+    if any(k in s for k in ('THIRD', 'THIRD_PARTY', 'EXTERNAL', 'PARTNER')):
+        return 'Third Party'
+    if any(k in s for k in ('INTERNAL', 'TEAM', 'DEV', 'DEVELOPER', 'ENGINEER')):
+        return 'Internal'
+    return 'Internal'
+
+
+def _is_planning_or_no_action(name: str, sentence: str = "", status: str = "", blockers: list = None) -> bool:
+    """
+    Planning-only filter before tracker item creation (Item 46).
+    Filters out items that describe future plans or informational notes
+    where no action is required and no active blocker/delay exists.
+    """
+    text = f"{name or ''} {sentence or ''}".lower()
+    
+    # 1. Check explicit no-action signals
+    for signal in NO_ACTION_SIGNALS:
+        if signal in text:
+            # If not blocked and not delayed, skip tracker creation
+            if not blockers and status not in ('BLOCKED', 'DELAYED'):
+                return True
+
+    # 2. Check planning verbs if item is not blocked and has no delay/risk signal
+    if not blockers and status in ('NOT_STARTED', 'IN_PROGRESS', 'UNKNOWN', ''):
+        has_planning_verb = any(v in text for v in PLANNING_VERBS)
+        if has_planning_verb:
+            risk_words = ('delay', 'delayed', 'block', 'blocked', 'risk', 'issue', 'behind', 'slip', 'missed', 'escalat')
+            if not any(rw in text for rw in risk_words):
+                return True
+
+    return False
+
+
+def _is_fabricated_prereq_title(title: str) -> bool:
+    """
+    Fabricated-title guard for prereq extraction (Item 48).
+    Rejects items matching the pattern <short_word> + <completion_noun>
+    like 'SIT Completion', 'UAT Sign-off', 'QA Approval'.
+    """
+    if not title:
+        return True
+    import re
+    words = re.findall(r'[a-zA-Z0-9]+', str(title).lower())
+    if len(words) <= 2:
+        if any(w in COMPLETION_NOUNS for w in words):
+            return True
+    return False
+
+
 def _resolve_composite_subphases(
     resolved_title: str,
     resolution_evidence: str,
@@ -117,7 +199,7 @@ def _resolve_composite_subphases(
     BUG 3 FIX: When a composite milestone resolves (e.g., 'System Integration Testing (SIT), UAT, Production Deployment'),
     checks if any active tracker item is a named sub-phase of that milestone.
     A sub-phase is identified when its name or primary acronym is contained within the resolved title
-    (case-insensitive, normalized). Generic: no hardcoded milestone names.
+    (case-insensitive, normalized). Generic: uses ''.join(w[0] for w in words) and word-boundary check (Item 47).
 
     Returns list of additionally resolved item titles.
     """
@@ -143,10 +225,35 @@ def _resolve_composite_subphases(
             is_subphase = False
             if len(item_name_lower) > 5 and item_name_lower in resolved_title_lower:
                 is_subphase = True
-            elif "uat" in item_name_lower and "uat" in resolved_title_lower:
-                is_subphase = True
-            elif "sit" in item_name_lower and "sit" in resolved_title_lower:
-                is_subphase = True
+            else:
+                import re
+                # 1. Direct substring check without parentheticals
+                clean_name = re.sub(r'\(.*?\)', '', item_name_lower).strip()
+                if len(clean_name) > 5 and clean_name in resolved_title_lower:
+                    is_subphase = True
+
+                # 2. Dynamic acronym check (Item 47): computes ''.join(w[0] for w in words)
+                if not is_subphase:
+                    words = [w for w in re.findall(r'[a-zA-Z0-9]+', clean_name)
+                             if w not in ('and', 'or', 'of', 'the', 'for', 'in', 'to', 'a', 'an', 'with')]
+                    if len(words) >= 2:
+                        acronym = ''.join(w[0] for w in words)
+                        if len(acronym) >= 2 and re.search(r'\b' + re.escape(acronym) + r'\b', resolved_title_lower):
+                            is_subphase = True
+
+                # 3. Check acronyms from parentheses e.g. "(UAT)" -> "uat"
+                if not is_subphase:
+                    for paren_acronym in re.findall(r'\(([a-zA-Z0-9]{2,6})\)', item_name_lower):
+                        if re.search(r'\b' + re.escape(paren_acronym) + r'\b', resolved_title_lower):
+                            is_subphase = True
+                            break
+
+                # 4. Check if item_name is an acronym or contains key phase acronym
+                if not is_subphase:
+                    for token in re.findall(r'\b[a-zA-Z0-9]{2,6}\b', item_name_lower):
+                        if token in ('uat', 'sit') and re.search(r'\b' + re.escape(token) + r'\b', resolved_title_lower):
+                            is_subphase = True
+                            break
 
             if is_subphase:
                 TrackerAuditAgent.persist_tracker_item(
@@ -935,9 +1042,10 @@ class RiskEvaluationAgent:
             return "Track execution progress"
 
     @classmethod
-    def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
-                          activity_map: dict = None, request_map: dict = None,
-                          emit: Optional[Callable[[str, int], None]] = None) -> dict:
+    def _evaluate_document_legacy(cls, project_id: int, document_id: int, document_text: str, db_cursor,
+                                  activity_map: dict = None, request_map: dict = None,
+                                  emit: Optional[Callable[[str, int], None]] = None) -> dict:
+        """Original monolithic evaluate_document — preserved as legacy fallback."""
         activity_map = activity_map or {}
         request_map = request_map or {}
 
@@ -1054,12 +1162,30 @@ class RiskEvaluationAgent:
                 }
                 new_reasoning = json.dumps(r_parsed)
 
-                db_cursor.execute("""
-                    UPDATE tracker_items
-                    SET risk_status = 'PENDING_CONFIRMATION',
-                        reasoning = %s
-                    WHERE id = %s
-                """, (new_reasoning, item_id))
+                # Closure auto-resolve SQL UPDATE (Item 50):
+                # When auto_resolve is enabled, updates risk_status to RESOLVED and risk_severity_score to 0 directly.
+                # Default behavior surfaces as PENDING_CONFIRMATION for PM review.
+                auto_resolve_closure = False
+                if auto_resolve_closure:
+                    db_cursor.execute("""
+                        UPDATE tracker_items
+                        SET risk_status = 'RESOLVED',
+                            risk_severity_score = 0,
+                            status = 'RESOLVED',
+                            risk_score = 0,
+                            execution_priority_score = 0,
+                            resolved_at = NOW(),
+                            resolution = 'Project closure detected',
+                            reasoning = %s
+                        WHERE id = %s
+                    """, (new_reasoning, item_id))
+                else:
+                    db_cursor.execute("""
+                        UPDATE tracker_items
+                        SET risk_status = 'PENDING_CONFIRMATION',
+                            reasoning = %s
+                        WHERE id = %s
+                    """, (new_reasoning, item_id))
 
                 try:
                     audit_details = json.dumps({
@@ -1246,7 +1372,9 @@ class RiskEvaluationAgent:
             else:
                 if not raw_exec_status or raw_exec_status in ("UNKNOWN", ""):
                     raw_exec_status = "NOT_STARTED"
-                item_blocked_by = item.get("blocked_by", [])
+                # Fabricated-title guard for prereqs (Item 48)
+                raw_blocked_by = item.get("blocked_by", [])
+                item_blocked_by = [b for b in raw_blocked_by if not _is_fabricated_prereq_title(b)]
 
             cleaned_activities.append({
                 "activity": name,
@@ -2409,7 +2537,14 @@ class RiskEvaluationAgent:
             resolved_in_this_run=resolved_count
         )
         try:
-            final_assessment = LLMService.generate_json(aggregation_prompt)
+            from agents.llm_schemas import RiskAggregationOutput
+            structured_agg = LLMService.generate_structured(aggregation_prompt, RiskAggregationOutput)
+            if isinstance(structured_agg, RiskAggregationOutput):
+                final_assessment = structured_agg.model_dump(by_alias=True)
+            elif isinstance(structured_agg, dict):
+                final_assessment = structured_agg
+            else:
+                final_assessment = LLMService.generate_json(aggregation_prompt)
         except Exception as agg_err:
             print(f"Warning: Risk aggregation LLM call failed ({agg_err}). Using deterministic fallback assessment.")
             max_score = max([it.get('risk_score', 0) for it in out_of_scope_activities + timeline_deliverables] or [0])
@@ -2420,7 +2555,7 @@ class RiskEvaluationAgent:
                 "summary": f"Identified {len(out_of_scope_activities)} potential scope deviations and {len(timeline_deliverables)} timeline deliverable items.",
                 "recommendations": ["Review detected items against engagement baseline."],
                 "project_executive_summary": {
-                    "status": "⚠ At Risk" if max_score >= 40 else "✔ On Track",
+                    "status": "At Risk" if max_score >= 40 else "On Track",
                     "tracked_items": len(out_of_scope_activities) + len(timeline_deliverables),
                     "progress_percent": milestone_pct,
                     "resolved_items": resolved_count
@@ -2582,6 +2717,7 @@ class RiskEvaluationAgent:
                 execution_status=oos_item.get('execution_status', oos_item.get('current_status', 'OPEN')),
                 is_scope_creep=True
             )
+            norm_owner = _normalize_owner(oos_item.get("owner"), is_out_of_scope=True, entity_type='SCOPE_CREEP')
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, 'ACTIVITY',
                 True, item_risk_score, item_risk_level, 'SCOPE_CREEP',
@@ -2590,7 +2726,7 @@ class RiskEvaluationAgent:
                 status=target_status,
                 execution_priority_score=random.randint(1, 9),
                 risk_severity_score=item_risk_score,
-                owner=oos_item.get("owner", "Customer"),
+                owner=norm_owner,
                 graph_role="SCOPE_CREEP",
                 risk_status="RESOLVED" if target_status == "RESOLVED" else "OPEN"
             )
@@ -2608,6 +2744,16 @@ class RiskEvaluationAgent:
             deliv_name = deliv.get('deliverable', 'Unknown')  # Already canonical from pipeline
 
             card_title = deliv_name
+
+            # Planning-only filter (Item 46): skip items that are pure planning notes with no action needed
+            if _is_planning_or_no_action(
+                card_title,
+                deliv.get('mom_evidence') or deliv.get('reasoning', ''),
+                status=deliv.get('execution_status', deliv.get('current_status', '')),
+                blockers=deliv.get('blockers', [])
+            ) and deliv.get('risk_score', 0) == 0 and not deliv.get('is_scope_creep'):
+                print(f"  [PlanningFilter] Skipped planning-only item with no action required: '{card_title}'")
+                continue
 
             deliv_name_clean = deliv_name.lower().strip()
             ref_id = None
@@ -2656,6 +2802,12 @@ class RiskEvaluationAgent:
                 is_scope_creep=deliv.get('is_scope_creep', False)
             )
 
+            norm_owner = _normalize_owner(
+                deliv.get("owner") or deliv.get("dependency_owner"),
+                is_out_of_scope=deliv.get('is_scope_creep', False),
+                entity_type=deliv.get('entity_type', '')
+            )
+
             TrackerAuditAgent.persist_tracker_item(
                 db_cursor, project_id, document_id, item_type,
                 False, item_risk_score, item_risk_level, actual_risk_cat,
@@ -2675,8 +2827,7 @@ class RiskEvaluationAgent:
                 canonical_id=deliv.get('canonical_id', ''),
                 risk_severity_score=deliv.get('risk_severity_score',
                     deliv.get('risk_score', item_risk_score)),
-                # Problem 2 fix: propagate owner
-                owner=deliv.get("owner", deliv.get("dependency_owner", "Internal")),
+                owner=norm_owner,
             )
 
             # Use alert threshold from DB config (not hardcoded 70)
@@ -2896,3 +3047,84 @@ class RiskEvaluationAgent:
             "recommendations": recommendations,
             "subAgentResults": sub_agent_results
         }
+
+    # ── PUBLIC ENTRY POINT ─────────────────────────────────────────────────────
+    # Called by all API routes. Uses the LangGraph evaluation graph.
+    # Falls back to _evaluate_document_legacy on any graph error.
+    @classmethod
+    def evaluate_document(cls, project_id: int, document_id: int, document_text: str, db_cursor,
+                          activity_map: dict = None, request_map: dict = None,
+                          emit: Optional[Callable[[str, int], None]] = None) -> dict:
+        """
+        Public entry point for document risk evaluation.
+
+        Runs via the LangGraph evaluation graph (evaluation_graph.py):
+          load_baseline → extract_activities → detect_closure
+            ├─ [closed]  → handle_closure → END
+            └─ [normal]  → run_pipeline   → END
+
+        The graph passes already-extracted activities to run_pipeline so that
+        LLM Call #1 (activity extraction) is NOT duplicated — it runs once in
+        node_extract_activities, then the result is forwarded via activity_map.
+
+        Falls back to _evaluate_document_legacy on any unexpected graph failure.
+        """
+        from agents.evaluation_graph import get_evaluation_graph, EvaluationState
+        from services.telemetry_service import telemetry
+        from core.structured_logger import agent_logger
+
+        exec_trace = telemetry.start_trace(project_id=project_id, document_id=document_id)
+        try:
+            graph = get_evaluation_graph()
+            initial_state: EvaluationState = {
+                'project_id':    project_id,
+                'document_id':   document_id,
+                'document_text': document_text,
+                'db_cursor':     db_cursor,
+                'activity_map':  activity_map or {},
+                'request_map':   request_map or {},
+                'emit':          emit,
+                # Intermediate results — all start as None/empty
+                'risk_params':             None,
+                'risk_thresholds':         None,
+                'scope_items':             None,
+                'all_baseline_items':      None,
+                'dependency_graph':        None,
+                'dependency_context_block': None,
+                'extraction_result':       None,
+                'raw_activities':          None,
+                'resolved_items':          None,
+                # Routing flags
+                'is_project_closed': False,
+                'pipeline_error':    None,
+                # Final output
+                'final_result': None,
+            }
+
+            final_state = graph.invoke(initial_state)
+
+            if final_state.get('pipeline_error'):
+                agent_logger.warning(f"[Graph] Pipeline error — falling back to legacy: {final_state['pipeline_error']}")
+                print(f"  [Graph] Pipeline error — falling back to legacy: {final_state['pipeline_error']}")
+                raise RuntimeError(final_state['pipeline_error'])
+
+            result = final_state.get('final_result')
+            if result is None:
+                raise RuntimeError("Graph returned no final_result")
+
+            exec_trace.finish(status="OK")
+            return result
+
+        except Exception as e:
+            exec_trace.finish(status="ERROR", error=str(e))
+            agent_logger.error(f"[evaluate_document] Graph path failed ({e}), using legacy fallback.")
+            print(f"  [evaluate_document] Graph path failed ({e}), using legacy fallback.")
+            return cls._evaluate_document_legacy(
+                project_id=project_id,
+                document_id=document_id,
+                document_text=document_text,
+                db_cursor=db_cursor,
+                activity_map=activity_map,
+                request_map=request_map,
+                emit=emit,
+            )

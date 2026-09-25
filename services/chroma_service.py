@@ -1,5 +1,3 @@
-import chromadb
-from chromadb.config import Settings as ChromaSettings
 from core.config import settings
 import os
 import threading
@@ -14,6 +12,8 @@ class ChromaService:
         if cls._client is None:
             with cls._lock:
                 if cls._client is None:
+                    import chromadb
+                    from chromadb.config import Settings as ChromaSettings
                     db_path = os.path.abspath(settings.CHROMA_PATH)
                     os.makedirs(db_path, exist_ok=True)
                     cls._client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))

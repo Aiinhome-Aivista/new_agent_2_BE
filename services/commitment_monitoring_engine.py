@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from core.helpers import is_title_match
 
 class CommitmentMonitoringEngine:
     @classmethod
@@ -8,13 +9,29 @@ class CommitmentMonitoringEngine:
         Returns a list of synthetic risks to inject into the graph.
         """
         synthetic_risks = []
-        # Risk date calculation: today's real date is taken as priority for overdue risk calculation
-        # even if any date is mentioned in MoM.
-        try:
-            from datetime import date
-            today = date.today()
-        except Exception:
-            today = datetime.now(timezone.utc).date()
+        # Reference date calculation (Item 64):
+        # Overdue comparisons use reference_date derived from document_date parameter,
+        # with fallback to date.today() when no document_date is provided.
+        from datetime import date
+        reference_date = None
+        if document_date:
+            try:
+                if isinstance(document_date, datetime):
+                    reference_date = document_date.date()
+                elif isinstance(document_date, date):
+                    reference_date = document_date
+                elif isinstance(document_date, str):
+                    clean_str = document_date.split('T')[0].split(' ')[0]
+                    reference_date = datetime.strptime(clean_str, "%Y-%m-%d").date()
+            except Exception as e:
+                print(f"  [CommitmentMonitor] Warning: Could not parse document_date '{document_date}': {e}")
+                reference_date = None
+
+        if not reference_date:
+            try:
+                reference_date = date.today()
+            except Exception:
+                reference_date = datetime.now(timezone.utc).date()
                 
         # What did the LLM extract as having an update?
         extracted_names = [a.get("canonical_title", "").strip().lower() for a in llm_extracted_activities if a.get("canonical_title")]
@@ -28,15 +45,6 @@ class CommitmentMonitoringEngine:
                 extracted_names.append(res["name"].strip().lower())
             if res.get("canonical_name"):
                 extracted_names.append(res["canonical_name"].strip().lower())
-        
-        def _is_title_match(a: str, b: str) -> bool:
-            if not a or not b: return False
-            import re, difflib
-            a_c = re.sub(r'[^a-zA-Z0-9]', '', a).lower()
-            b_c = re.sub(r'[^a-zA-Z0-9]', '', b).lower()
-            if not a_c or not b_c: return False
-            if a_c == b_c or a_c in b_c or b_c in a_c: return True
-            return difflib.SequenceMatcher(None, a_c, b_c).ratio() >= 0.80
 
         # Collect all items to evaluate:
         # 1. Project milestones from state_snapshot
@@ -114,12 +122,12 @@ class CommitmentMonitoringEngine:
                 p_date = planned_date.date() if isinstance(planned_date, datetime) else planned_date
                 if isinstance(p_date, str):
                     p_date = datetime.strptime(p_date.split(' ')[0], "%Y-%m-%d").date()
-                days_overdue = (today - p_date).days
+                days_overdue = (reference_date - p_date).days
             except Exception:
                 continue
 
             if is_rec:
-                print(f"  [CommitmentMonitor] Checking recurring occurrence: '{name}' deadline={p_date}, reference_date={today}")
+                print(f"  [CommitmentMonitor] Checking recurring occurrence: '{name}' deadline={p_date}, reference_date={reference_date}")
 
             # If it's overdue or due within the next 30 days, we EXPECT an update
             if days_overdue >= -30:
@@ -132,7 +140,7 @@ class CommitmentMonitoringEngine:
                     if e_name == name_clean or e_name in name_clean or name_clean in e_name:
                         mentioned = True
                         break
-                    if _is_title_match and _is_title_match(name, e_name):
+                    if is_title_match(name, e_name):
                         mentioned = True
                         break
 

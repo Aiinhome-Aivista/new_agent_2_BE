@@ -1,67 +1,112 @@
+"""
+IMPROVEMENT 3 (applied): LangChain Structured Output for extraction agents.
+
+ActivityExtractorAgent and BatchActivityRiskAgent now call
+LLMService.generate_structured() with their respective Pydantic schemas.
+This enforces JSON structure at the token level and eliminates all
+manual json.loads() / regex parsing failures.
+
+COMPATIBILITY GUARANTEE:
+- All output dict keys are IDENTICAL to what the pipeline already reads.
+- The structured path produces the same data shape as the old generate_json() path.
+- Falls back to generate_json() automatically if structured output is unavailable.
+"""
+
 import json
 from services.llm_service import LLMService
 
 
 class ActivityExtractorAgent:
     @classmethod
-    def extract_activities(cls, document_text: str, active_tracker_block: str = "None") -> list:
+    def extract_activities(cls, document_text: str, active_tracker_block: str = "None") -> dict:
         """
-        STEP 1: Single-pass extraction.
-        
+        STEP 1: Single-pass activity extraction with structured output.
+
         The Risk Tracker is a contractual monitoring system, not an activity log.
         Every tracker item must represent a contractual deliverable or scope request —
         not the sentence from the meeting minutes.
 
-        Therefore this extractor returns:
-          - A normalized business entity name (e.g. "SAP Integration", not "Evaluate SAP Integration Request")
-          - The original source sentence preserved as evidence
-          - Confidence score
-
-        Normalization rules applied by the LLM:
-          - Strip action verbs: "Evaluate", "Review", "Prepare", "Discuss", "Assess", "Propose"
-          - Strip request/proposal/proposal noise words: "Request", "Proposal", "Assessment", "Development", "Implementation"
-          - Strip customer responsibility preambles: "Customer shall provide", "Client must supply"
-          - Strip date suffixes from deliverable names (dates are metadata, not titles)
-          - Merge semantically equivalent activities into a single business entity
+        Returns a dict with keys:
+          - raw_activities: list of extracted activity dicts
+          - activities:     same list (pipeline compatibility alias)
+          - extractions:    same list (legacy fallback key)
+          - resolved_items: list of resolved/completed items
         """
+        from agents.llm_schemas import DocumentExtractionSchema
         from core.prompts import get_activity_extractor_prompt
+
         prompt = get_activity_extractor_prompt(document_text, active_tracker_block)
-        result = LLMService.generate_json(prompt)
-        extractions = result.get("extractions", [])
-        # The extraction prompt uses `statement` as the primary key;
-        # normalise to `activity` so the downstream pipeline always finds one key.
-        for item in extractions:
-            if not item.get("activity") and item.get("statement"):
-                item["activity"] = item["statement"]
+
+        try:
+            result = LLMService.generate_structured(
+                prompt, DocumentExtractionSchema, fallback_key='extractions'
+            )
+
+            # Normalize to the dict shape the rest of the pipeline expects
+            if isinstance(result, DocumentExtractionSchema):
+                raw_activities = [item.model_dump() for item in result.extractions]
+                resolved_items = [item.model_dump() for item in result.resolved_items]
+            elif isinstance(result, dict):
+                # Fallback path returned a dict
+                raw_activities = result.get('extractions') or result.get('activities') or result.get('raw_activities') or []
+                resolved_items = result.get('resolved_items', [])
+            else:
+                raw_activities = []
+                resolved_items = []
+
+        except Exception as e:
+            print(f"[ActivityExtractorAgent] generate_structured error: {e}. Falling back to generate_json.")
+            fallback = LLMService.generate_json(prompt)
+            raw_activities = (
+                fallback.get('extractions') or
+                fallback.get('activities') or
+                fallback.get('raw_activities') or []
+            )
+            resolved_items = fallback.get('resolved_items', [])
+
+        # Normalise: ensure every item has both 'activity' and 'statement' keys
+        for item in raw_activities:
+            if isinstance(item, dict):
+                if not item.get('activity') and item.get('statement'):
+                    item['activity'] = item['statement']
+                if not item.get('statement') and item.get('activity'):
+                    item['statement'] = item['activity']
+                if not item.get('status'):
+                    item['status'] = 'IN_PROGRESS'
+
         return {
-            "activities": extractions,        # primary key read by risk_evaluation_agent
-            "extractions": extractions,       # legacy fallback key
-            "resolved_items": result.get("resolved_items", [])
+            'raw_activities': raw_activities,  # new canonical key
+            'activities':     raw_activities,  # pipeline compatibility
+            'extractions':    raw_activities,  # legacy fallback key
+            'resolved_items': resolved_items,
         }
+
+    @classmethod
+    def extract(cls, document_text: str, scope_items: list = None,
+                active_tracker_items: list = None) -> dict:
+        """
+        Alias used by evaluation_graph.py node_extract_activities.
+        Builds the active_tracker_block string from active_tracker_items.
+        """
+        active_tracker_block = "None"
+        if active_tracker_items:
+            active_tracker_block = "\n".join(
+                [f"- {it.get('title', '')}" for it in active_tracker_items]
+            ) or "None"
+        return cls.extract_activities(document_text, active_tracker_block)
 
 
 class BatchActivityRiskAgent:
     @classmethod
     def evaluate_batch(cls, activities_with_contexts: list, milestone_progress_block: str = "") -> list:
         """
-        PHASE 1: Batch risk diagnosis.
+        PHASE 1: Batch risk diagnosis with structured output.
+
         Evaluates ALL ambiguous activities in a SINGLE LLM call.
+        The LLM diagnoses risk category, level, execution status, and confidence.
+        Scoring happens in Phase 2 (RiskScoringEngine) — NOT here.
 
-        The LLM's job here is DIAGNOSIS ONLY — it identifies:
-          - What category of risk exists (SCOPE_CREEP / DELAY / DEPENDENCY / BLOCKED / NONE)
-          - Which diagnostic signals are present (deadline_missed, customer_dependency, etc.)
-          - What the business impact level is (LOW / MEDIUM / HIGH)
-          - How confident it is (0.0–1.0)
-
-        The LLM does NOT produce a numeric score.
-        Scoring happens in Phase 2 (RiskScoringEngine) using deterministic weighted rules.
-
-        KEY RULE — Tracker Title Priority:
-        1. If a matched_baseline_item exists in the approved IN_SCOPE baseline → use that as title.
-        2. If it matches an OUT_OF_SCOPE/excluded item → use that as title.
-        3. Only if NO baseline match exists → use the normalized activity name as title.
-
-        CRITICAL: An approved IN_SCOPE baseline item can NEVER be classified as SCOPE_CREEP.
+        Returns a plain list of dicts for downstream RiskScoringEngine compatibility.
         """
         if not activities_with_contexts:
             return []
@@ -70,28 +115,72 @@ class BatchActivityRiskAgent:
         for i, item in enumerate(activities_with_contexts, 1):
             activities_block += f"""
 --- Activity {i} ---
-Activity Name: {item['activity']}
-Original MoM Evidence: {item.get('source_sentence', item['activity'])}
+Activity Name: {item.get('activity', '')}
+Original MoM Evidence: {item.get('source_sentence', item.get('activity', ''))}
 Baseline Context:
-{item['context']}
+{item.get('context', '')}
 """
 
+        from agents.llm_schemas import BatchRiskScoringSchema
         from core.prompts import get_batch_activity_risk_prompt
+
         prompt = get_batch_activity_risk_prompt(milestone_progress_block, activities_block)
-        result = LLMService.generate_json(prompt)
-        if isinstance(result, list):
-            return result
-        # Robust fallback: if the LLM wrapped the array in an object (e.g. {"evaluated_activities": [...]})
-        if isinstance(result, dict):
-            # First check common keys
-            for key in ["activities", "results", "evaluations", "evaluated_activities"]:
-                if key in result and isinstance(result[key], list):
-                    return result[key]
-            # If not found, just return the first list we find in the dict values
-            for val in result.values():
-                if isinstance(val, list):
-                    return val
-        return []
+
+        try:
+            result = LLMService.generate_structured(
+                prompt, BatchRiskScoringSchema, fallback_key='items'
+            )
+
+            if isinstance(result, BatchRiskScoringSchema):
+                items = [item.model_dump() for item in result.items]
+                for it in items:
+                    if 'status' in it and 'execution_status' not in it:
+                        it['execution_status'] = it['status']
+                return items
+            elif isinstance(result, dict):
+                # Fallback path
+                items = []
+                for key in ['items', 'activities', 'results', 'evaluations', 'evaluated_activities']:
+                    if key in result and isinstance(result[key], list):
+                        items = result[key]
+                        break
+                if not items:
+                    for val in result.values():
+                        if isinstance(val, list):
+                            items = val
+                            break
+                for it in items:
+                    if isinstance(it, dict) and 'status' in it and 'execution_status' not in it:
+                        it['execution_status'] = it['status']
+                return items
+            elif isinstance(result, list):
+                for it in result:
+                    if isinstance(it, dict) and 'status' in it and 'execution_status' not in it:
+                        it['execution_status'] = it['status']
+                return result
+
+        except Exception as e:
+            print(f"[BatchActivityRiskAgent] generate_structured error: {e}. Falling back to generate_json.")
+
+        # Ultimate fallback: original generate_json() path
+        raw = LLMService.generate_json(prompt)
+        items = []
+        if isinstance(raw, list):
+            items = raw
+        elif isinstance(raw, dict):
+            for key in ['activities', 'results', 'evaluations', 'evaluated_activities', 'items']:
+                if key in raw and isinstance(raw[key], list):
+                    items = raw[key]
+                    break
+            if not items:
+                for val in raw.values():
+                    if isinstance(val, list):
+                        items = val
+                        break
+        for it in items:
+            if isinstance(it, dict) and 'status' in it and 'execution_status' not in it:
+                it['execution_status'] = it['status']
+        return items
 
 
 class DeliverableTimelineEvaluationAgent:
@@ -101,6 +190,9 @@ class DeliverableTimelineEvaluationAgent:
         Extracts deliverable progress from the MoM/Status Report.
         Must strictly adhere to the rule of NEVER inventing percentages.
         Consolidates multiple references into a single progress record per baseline item.
+
+        NOTE: This call produces prose + structured progress — not pure JSON schema.
+        It is intentionally left on generate_json() (not structured output).
         """
         if not approved_baseline_items:
             return []
@@ -110,7 +202,6 @@ class DeliverableTimelineEvaluationAgent:
             baseline_block += f"- ID: {item.get('id', 'Unknown')} | Deliverable: {item.get('name', 'Unknown')}\n"
 
         risk_block = ""
-        import json
         try:
             risk_block = json.dumps(risk_eval_output, indent=2)
         except Exception:
@@ -120,4 +211,3 @@ class DeliverableTimelineEvaluationAgent:
         prompt = get_deliverable_timeline_evaluation_prompt(baseline_block, risk_block, document_text)
         result = LLMService.generate_json(prompt)
         return result.get("progress_records", [])
-
