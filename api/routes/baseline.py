@@ -20,6 +20,7 @@ import difflib
 import re
 import time
 from core.database import get_db, get_db_connection
+from core.helpers import safe_json_loads, safe_json_dumps, is_title_match, find_best_match
 from api.dependencies.auth import get_current_user, require_roles, verify_project_access
 from services.document_service import DocumentService
 from agents.scope_extraction_agent import ScopeExtractionAgent
@@ -304,13 +305,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             elif "CANCEL" in raw_status:
                 completion_status = "CANCELLED"
 
-            existing_item = None
-            best_ratio = 0.0
-            for db_item in existing_scope_items:
-                ratio = difflib.SequenceMatcher(None, item_name.lower(), db_item["name"].lower()).ratio()
-                if ratio > 0.8 and ratio > best_ratio:
-                    best_ratio = ratio
-                    existing_item = db_item
+            existing_item, best_ratio = find_best_match(item_name, existing_scope_items, key="name", threshold=0.8)
             
             if existing_item:
                 tags = []
@@ -489,13 +484,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             item_name = item.get("name", "Unknown")
             deadline = item.get("deadline") if item.get("deadline") else None
             
-            existing_deliv = None
-            best_ratio = 0.0
-            for db_item in existing_deliverables:
-                ratio = difflib.SequenceMatcher(None, item_name.lower(), db_item["name"].lower()).ratio()
-                if ratio > 0.8 and ratio > best_ratio:
-                    best_ratio = ratio
-                    existing_deliv = db_item
+            existing_deliv, best_ratio = find_best_match(item_name, existing_deliverables, key="name", threshold=0.8)
             
             if existing_deliv:
                 BaselineRepository.update_deliverable(
@@ -967,112 +956,8 @@ def _matches_any(target: str, pool: set) -> bool:
             return True
     return False
 
-def _is_title_match(a: str, b: str) -> bool:
-    """
-    100% Generic, document-agnostic matching algorithm.
-    Works for ANY project, ANY baseline, and ANY industry domain.
-    """
-    if not a or not b:
-        return False
-        
-    a_clean = re.sub(r'[\(\)\[\]\{\}\-_,\.:;\t\r\n]+', ' ', a).lower().strip()
-    b_clean = re.sub(r'[\(\)\[\]\{\}\-_,\.:;\t\r\n]+', ' ', b).lower().strip()
-    
-    if a_clean == b_clean:
-        return True
-
-    # Check for period/month or year conflict (e.g. May 2026 vs Aug 2026 vs generic CSI)
-    MONTH_TOKENS = {
-        'january', 'february', 'march', 'april', 'may', 'june',
-        'july', 'august', 'september', 'october', 'november', 'december',
-        'jan', 'feb', 'mar', 'apr', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'
-    }
-    months_a = {w for w in re.findall(r'\b[a-zA-Z]+\b', a.lower()) if w in MONTH_TOKENS}
-    months_b = {w for w in re.findall(r'\b[a-zA-Z]+\b', b.lower()) if w in MONTH_TOKENS}
-    
-    # If both specify different months -> Conflict!
-    if months_a and months_b and not (months_a & months_b):
-        return False
-
-    # If one specifies a month and the other does not -> Conflict!
-    # A generic activity title cannot match a specific monthly occurrence.
-    if bool(months_a) != bool(months_b):
-        return False
-
-    years_a = {w for w in re.findall(r'\b20\d{2}\b', a)}
-    years_b = {w for w in re.findall(r'\b20\d{2}\b', b)}
-    if years_a and years_b and not (years_a & years_b):
-        return False
-    if bool(years_a) != bool(years_b) and (months_a or months_b):
-        return False
-
-    # 1. Parenthetical aliases
-    def get_parentheses_aliases(raw: str):
-        aliases = [raw.lower().strip()]
-        for p in re.findall(r'\((.*?)\)', raw):
-            if p.strip():
-                aliases.append(p.strip().lower())
-        no_parens = re.sub(r'\(.*?\)', '', raw).strip().lower()
-        if no_parens:
-            aliases.append(no_parens)
-        return list(set(aliases))
-
-    a_parens = get_parentheses_aliases(a)
-    b_parens = get_parentheses_aliases(b)
-    for ap in a_parens:
-        for bp in b_parens:
-            if ap == bp:
-                return True
-
-    # 2. Compound multi-phase protection
-    a_parts = [p.strip() for p in re.split(r'[,;/]|\band\b', a) if len(p.strip()) > 2]
-    b_parts = [p.strip() for p in re.split(r'[,;/]|\band\b', b) if len(p.strip()) > 2]
-
-    words_a = _tokenize_stemmed_words(a)
-    words_b = _tokenize_stemmed_words(b)
-    acrs_a = _extract_acronyms(a)
-    acrs_b = _extract_acronyms(b)
-
-    pool_a = words_a | acrs_a
-    pool_b = words_b | acrs_b
-
-    if len(a_parts) > 1 and len(b_parts) == 1:
-        first_pool = _tokenize_stemmed_words(a_parts[0]) | _extract_acronyms(a_parts[0])
-        matched_in_first = sum(1 for wb in words_b if _matches_any(wb, first_pool))
-        if len(words_b) > 0 and (matched_in_first / len(words_b)) >= 0.70:
-            return True
-        return False
-    elif len(b_parts) > 1 and len(a_parts) == 1:
-        first_pool = _tokenize_stemmed_words(b_parts[0]) | _extract_acronyms(b_parts[0])
-        matched_in_first = sum(1 for wa in words_a if _matches_any(wa, first_pool))
-        if len(words_a) > 0 and (matched_in_first / len(words_a)) >= 0.70:
-            return True
-        return False
-
-    # 3. Dynamic acronym & word match
-    matched_a_in_b = sum(1 for wa in words_a if _matches_any(wa, pool_b))
-    matched_b_in_a = sum(1 for wb in words_b if _matches_any(wb, pool_a))
-
-    len_a = len(words_a)
-    len_b = len(words_b)
-    
-    if len_a > 0 and len_b > 0:
-        containment_a = matched_a_in_b / len_a
-        containment_b = matched_b_in_a / len_b
-        
-        if min(len_a, len_b) <= 3 and max(containment_a, containment_b) >= 0.65 and max(matched_a_in_b, matched_b_in_a) >= 2:
-            return True
-        if max(containment_a, containment_b) >= 0.75 and max(matched_a_in_b, matched_b_in_a) >= 2:
-            return True
-        if (containment_a >= 0.50 and containment_b >= 0.50) and (matched_a_in_b >= 2 or matched_b_in_a >= 2):
-            return True
-
-    # 4. Levenshtein / Sequence Matcher
-    ratio = difflib.SequenceMatcher(None, a_clean, b_clean).ratio()
-    if ratio >= 0.85:
-        return True
-
-    return False
+# Canonical domain-agnostic title matching algorithm imported from core.helpers
+_is_title_match = is_title_match
 
 MONTH_MAP = {
     'january': 1, 'february': 2, 'march': 3, 'april': 4,
@@ -1223,10 +1108,7 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
     raw_graph = {}
     for item in all_tracker_items:
         title = item["title"]
-        try:
-            r = json.loads(item.get("reasoning") or "{}") if isinstance(item.get("reasoning"), str) else (item.get("reasoning") or {})
-        except Exception:
-            r = {}
+        r = safe_json_loads(item.get("reasoning"))
             
         blocks_list = r.get("blocks", [])
         if isinstance(blocks_list, list):
@@ -1393,15 +1275,12 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
         owner = item.get("owner") or "Internal"
         
         if days_until_due == 9999:
-            try:
-                r_obj = json.loads(item.get("reasoning") or "{}") if isinstance(item.get("reasoning"), str) else (item.get("reasoning") or {})
-                due_date_str = r_obj.get("due_date")
-                if due_date_str:
-                    d_parsed = _parse_due_date(due_date_str)
-                    if d_parsed is not None:
-                        days_until_due = d_parsed
-            except Exception:
-                pass
+            r_obj = safe_json_loads(item.get("reasoning"))
+            due_date_str = r_obj.get("due_date")
+            if due_date_str:
+                d_parsed = _parse_due_date(due_date_str)
+                if d_parsed is not None:
+                    days_until_due = d_parsed
 
         try:
             score_res = RiskScoringEngine.calculate(
@@ -1441,17 +1320,14 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
         # ──────────────────────────────────────────────────────────────────────────
         # 📝 STEP 2F: PM Impact & Executive Summary Synchronization
         # ──────────────────────────────────────────────────────────────────────────
-        try:
-            r_json = json.loads(item.get("reasoning") or "{}") if isinstance(item.get("reasoning"), str) else (item.get("reasoning") or {})
-            if isinstance(r_json, dict):
-                if new_graph_role == "ROOT_CAUSE" and old_exec_status in ["BLOCKED", "IN_PROGRESS"]:
-                    if "business_impact" in r_json and isinstance(r_json["business_impact"], dict):
-                        r_json["business_impact"]["immediate"] = "Prerequisites satisfied. Unblocked and ready for execution."
-                    r_json["executive_summary"] = f"Prerequisites completed; {title} is now unblocked and ready for implementation."
-                updated_reasoning_str = json.dumps(r_json)
-            else:
-                updated_reasoning_str = item.get("reasoning")
-        except Exception:
+        r_json = safe_json_loads(item.get("reasoning"))
+        if isinstance(r_json, dict) and r_json:
+            if new_graph_role == "ROOT_CAUSE" and old_exec_status in ["BLOCKED", "IN_PROGRESS"]:
+                if "business_impact" in r_json and isinstance(r_json["business_impact"], dict):
+                    r_json["business_impact"]["immediate"] = "Prerequisites satisfied. Unblocked and ready for execution."
+                r_json["executive_summary"] = f"Prerequisites completed; {title} is now unblocked and ready for implementation."
+            updated_reasoning_str = safe_json_dumps(r_json)
+        else:
             updated_reasoning_str = item.get("reasoning")
 
         # Step 7: Update tracker_items

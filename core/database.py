@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import mysql.connector
 from mysql.connector import Error
 # pyrefly: ignore [missing-import]
@@ -16,3 +17,40 @@ def get_db():
         yield conn
     finally:
         conn.close()
+
+@contextmanager
+def db_cursor(db, dictionary: bool = True):
+    """
+    Context manager for database cursor that guarantees cursor closure.
+    """
+    cursor = db.cursor(dictionary=dictionary)
+    try:
+        yield cursor
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass
+
+@contextmanager
+def db_transaction(db, dictionary: bool = True):
+    """
+    Context manager for safe database transactions.
+    Yields a cursor, commits on success, and rolls back on exception.
+    Always closes the cursor.
+    """
+    cursor = db.cursor(dictionary=dictionary)
+    try:
+        yield cursor
+        db.commit()
+    except Exception:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            cursor.close()
+        except Exception:
+            pass

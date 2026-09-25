@@ -6,19 +6,6 @@ import os
 import sys
 from core.config import settings
 
-try:
-    from google import genai
-    _gemini_available = True
-except ImportError:
-    _gemini_available = False
-
-try:
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    _langchain_genai_available = True
-except ImportError:
-    _langchain_genai_available = False
-
-
 def _terminal_log(msg: str):
     """Prints directly to terminal with immediate flush and ASCII-safe characters."""
     try:
@@ -31,10 +18,12 @@ def _terminal_log(msg: str):
 class LLMService:
     @classmethod
     def _get_gemini_client(cls):
-        if not _gemini_available:
-            return None
         if settings.GEMINI_API_KEY:
-            return genai.Client(api_key=settings.GEMINI_API_KEY)
+            try:
+                from google import genai
+                return genai.Client(api_key=settings.GEMINI_API_KEY)
+            except ImportError:
+                return None
         return None
 
     @classmethod
@@ -335,11 +324,12 @@ class LLMService:
         """
         provider = str(getattr(settings, 'LLM_PROVIDER', 'gemini')).strip().lower()
 
-        # Use LangChain structured output only when Gemini + langchain-google-genai available
-        if provider == 'gemini' and _langchain_genai_available and settings.GEMINI_API_KEY:
+        # Use LangChain structured output when Gemini is provider and API key is set
+        if provider == 'gemini' and settings.GEMINI_API_KEY:
             try:
+                from langchain_google_genai import ChatGoogleGenerativeAI
                 llm = ChatGoogleGenerativeAI(
-                    model=settings.GEMINI_MODEL or 'gemini-2.0-flash',
+                    model=settings.GEMINI_MODEL or "gemini-flash-lite-latest",
                     temperature=0.0,
                     top_k=1,
                     top_p=1.0,
@@ -348,6 +338,8 @@ class LLMService:
                 structured_llm = llm.with_structured_output(schema_class)
                 result = structured_llm.invoke(prompt)
                 return result
+            except ImportError:
+                pass
             except Exception as e:
                 print(f"[LLMService] Structured output failed ({e}), falling back to generate_json()")
 

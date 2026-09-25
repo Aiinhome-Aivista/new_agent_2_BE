@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from core.helpers import is_title_match
 
 class CommitmentMonitoringEngine:
     @classmethod
@@ -28,15 +29,6 @@ class CommitmentMonitoringEngine:
                 extracted_names.append(res["name"].strip().lower())
             if res.get("canonical_name"):
                 extracted_names.append(res["canonical_name"].strip().lower())
-        
-        def _is_title_match(a: str, b: str) -> bool:
-            if not a or not b: return False
-            import re, difflib
-            a_c = re.sub(r'[^a-zA-Z0-9]', '', a).lower()
-            b_c = re.sub(r'[^a-zA-Z0-9]', '', b).lower()
-            if not a_c or not b_c: return False
-            if a_c == b_c or a_c in b_c or b_c in a_c: return True
-            return difflib.SequenceMatcher(None, a_c, b_c).ratio() >= 0.80
 
         # Collect all items to evaluate:
         # 1. Project milestones from state_snapshot
@@ -132,7 +124,7 @@ class CommitmentMonitoringEngine:
                     if e_name == name_clean or e_name in name_clean or name_clean in e_name:
                         mentioned = True
                         break
-                    if _is_title_match and _is_title_match(name, e_name):
+                    if is_title_match(name, e_name):
                         mentioned = True
                         break
 

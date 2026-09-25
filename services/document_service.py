@@ -8,27 +8,22 @@ import fitz # PyMuPDF
 import docx
 from docx import Document
 
-# pyrefly: ignore [missing-import]
-from langchain_text_splitters import RecursiveCharacterTextSplitter, MarkdownHeaderTextSplitter
-
-# Optional import of Microsoft MarkItDown for universal document to Markdown conversion
-try:
-    # pyrefly: ignore [missing-import]
-    from markitdown import MarkItDown
-    MARKITDOWN_AVAILABLE = True
-except ImportError:
-    MARKITDOWN_AVAILABLE = False
-
-# Lazy flag for docling to avoid 15-20s top-level PyTorch import penalty
+# Lazy flags
+MARKITDOWN_AVAILABLE = None
 DOCLING_AVAILABLE = None
 
+_text_splitter = None
+
 def chunk_text(text: str) -> List[str]:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.CHUNK_SIZE,
-        chunk_overlap=settings.CHUNK_OVERLAP,
-        separators=["\n\n", "\n", ". ", " ", ""]
-    )
-    return text_splitter.split_text(text)
+    global _text_splitter
+    if _text_splitter is None:
+        from langchain_text_splitters import RecursiveCharacterTextSplitter
+        _text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=settings.CHUNK_SIZE,
+            chunk_overlap=settings.CHUNK_OVERLAP,
+            separators=["\n\n", "\n", ". ", " ", ""]
+        )
+    return _text_splitter.split_text(text)
 
 
 class DocumentService:
@@ -38,11 +33,17 @@ class DocumentService:
     @classmethod
     def get_markitdown_converter(cls):
         """Lazy initializer for Microsoft MarkItDown converter."""
-        if not MARKITDOWN_AVAILABLE:
+        global MARKITDOWN_AVAILABLE
+        if MARKITDOWN_AVAILABLE is False:
             return None
         if cls._markitdown_converter is None:
             try:
+                from markitdown import MarkItDown
                 cls._markitdown_converter = MarkItDown()
+                MARKITDOWN_AVAILABLE = True
+            except ImportError:
+                MARKITDOWN_AVAILABLE = False
+                return None
             except Exception as e:
                 print(f"Warning: Failed to initialize MarkItDown ({e}).")
                 cls._markitdown_converter = None

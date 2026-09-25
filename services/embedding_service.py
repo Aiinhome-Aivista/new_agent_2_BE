@@ -1,4 +1,3 @@
-from sentence_transformers import SentenceTransformer
 from core.config import settings
 
 class EmbeddingService:
@@ -7,6 +6,7 @@ class EmbeddingService:
     @classmethod
     def get_model(cls):
         if cls._model is None:
+            from sentence_transformers import SentenceTransformer
             cls._model = SentenceTransformer(settings.EMBEDDING_MODEL)
         return cls._model
 

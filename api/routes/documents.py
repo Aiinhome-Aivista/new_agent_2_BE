@@ -33,50 +33,68 @@ def confirm_upload_document(
     current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])),
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
-    verify_project_access(project_id, current_user, db)
-    
-    cursor = db.cursor(dictionary=True)
-    cursor.execute("SELECT project_name, monitoring_status FROM projects WHERE id = %s", (project_id,))
-    project = cursor.fetchone()
-    cursor.close()
-    
-    if project and project.get("monitoring_status") == "CLOSED":
-        raise HTTPException(status_code=400, detail="Cannot upload documents to a closed project.")
-
-    if document_type in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
-        raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to upload EL or IFA documents.")
-        
-    import re
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in [".pdf", ".docx", ".txt"]:
-        raise HTTPException(status_code=400, detail="Unsupported file format")
-
-    base_name = os.path.splitext(file.filename)[0]
-    safe_base_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)
-    unique_filename = f"{safe_base_name}_{uuid.uuid4().hex[:8]}{ext}"
-    project_name = project.get("project_name", f"Project_{project_id}") if project else f"Project_{project_id}"
-    
     try:
-        storage_key = StorageService.upload_fileobj(file.file, project_id, project_name, unique_filename)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to finalize file storage to S3: {e}")
+        verify_project_access(project_id, current_user, db)
         
-    document_id = DocumentRepository.create_document(
-        db=db,
-        project_id=project_id,
-        document_name=file.filename,
-        document_type=document_type,
-        storage_key=storage_key,
-        uploaded_by=current_user["id"]
-    )
-    db.commit()
-    return {"success": True, "message": "Document uploaded successfully", "data": {"id": document_id}}
+        cursor = db.cursor(dictionary=True)
+        cursor.execute("SELECT project_name, monitoring_status FROM projects WHERE id = %s", (project_id,))
+        project = cursor.fetchone()
+        cursor.close()
+        
+        if project and project.get("monitoring_status") == "CLOSED":
+            raise HTTPException(status_code=400, detail="Cannot upload documents to a closed project.")
+
+        if document_type in ["EL", "IFA"] and current_user["role"] != "ENGAGEMENT_MANAGER":
+            raise HTTPException(status_code=403, detail="Only Engagement Managers are authorized to upload EL or IFA documents.")
+            
+        import re
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in [".pdf", ".docx", ".txt"]:
+            raise HTTPException(status_code=400, detail="Unsupported file format")
+
+        base_name = os.path.splitext(file.filename)[0]
+        safe_base_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', base_name)
+        unique_filename = f"{safe_base_name}_{uuid.uuid4().hex[:8]}{ext}"
+        project_name = project.get("project_name", f"Project_{project_id}") if project else f"Project_{project_id}"
+        
+        try:
+            storage_key = StorageService.upload_fileobj(file.file, project_id, project_name, unique_filename)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Failed to finalize file storage to S3: {e}")
+            
+        document_id = DocumentRepository.create_document(
+            db=db,
+            project_id=project_id,
+            document_name=file.filename,
+            document_type=document_type,
+            storage_key=storage_key,
+            uploaded_by=current_user["id"]
+        )
+        db.commit()
+        return {"success": True, "message": "Document uploaded successfully", "data": {"id": document_id}}
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            db.rollback()
+        except Exception:
+            pass
+        raise HTTPException(status_code=500, detail=f"Failed to upload document: {str(e)}")
 
 @router.get("/")
-def get_documents(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    verify_project_access(project_id, current_user, db)
-    docs = DocumentRepository.get_documents_by_project(db, project_id)
-    return {"success": True, "data": docs}
+def get_documents(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    try:
+        verify_project_access(project_id, current_user, db)
+        docs = DocumentRepository.get_documents_by_project(db, project_id)
+        return {"success": True, "data": docs}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch documents: {str(e)}")
 
 class DocumentTypeCreate(BaseModel):
     name: str
@@ -84,11 +102,20 @@ class DocumentTypeCreate(BaseModel):
     description: str = ""
 
 @router.get("/types")
-def get_document_types(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
-    verify_project_access(project_id, current_user, db)
-    types = DocumentRepository.get_master_document_types(db)
-    custom_types = DocumentRepository.get_project_document_types(db, project_id)
-    return {"success": True, "data": types + custom_types}
+def get_document_types(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    try:
+        verify_project_access(project_id, current_user, db)
+        types = DocumentRepository.get_master_document_types(db)
+        custom_types = DocumentRepository.get_project_document_types(db, project_id)
+        return {"success": True, "data": types + custom_types}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch document types: {str(e)}")
 
 @router.post("/types")
 def create_document_type(
