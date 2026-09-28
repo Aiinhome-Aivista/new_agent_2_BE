@@ -229,6 +229,22 @@ CRITICAL RULES:
     - Include a confidence score (0.0 to 1.0) and the exact evidence sentence in `resolution_evidence`.
 10. ACTION ITEMS & TABLES EXTRACTION (CRITICAL):
     Every row in Action Items, Decisions, Dependencies, or Customer Responsibility tables (e.g. 'Provide Production API Credentials', 'Provide Network Access') MUST be extracted as an individual entry in `extractions`. Do not omit them or bury them only inside another item's `blocked_by` list.
+11. DELIVERABLE vs BLOCKER DISTINCTION (CRITICAL — RC5):
+    A DELIVERABLE is a contracted scope item that appears (or should appear) in the project baseline.
+    A BLOCKER/PREREQUISITE is a reason WHY a deliverable cannot proceed (e.g. missing access, pending review, approval gate).
+
+    RULE: When the document says "X is pending Y" or "X is waiting for Y" or "Y is needed before X":
+    - EXTRACT X as the deliverable (look it up in the baseline/active tracker by name)
+    - EXTRACT Y as a blocker ONLY — put Y into X.blocked_by, NOT as a standalone deliverable entry
+    - Do NOT create a separate extractions entry for Y if Y is a sub-activity, review gate, or prerequisite and NOT a standalone contracted deliverable
+
+    EXAMPLES (apply to any domain — these patterns are universal):
+    - "Module A is waiting for security review" → Extract Module A with blocked_by=["Security review"]. Do NOT create a separate entry for "Security review".
+    - "Feature B is blocked pending QA validation" → Extract Feature B with blocked_by=["QA validation"]. Do NOT create a separate entry for "QA validation".
+    - "Integration X cannot proceed until production credentials are provided" → Extract Integration X with blocked_by=["Production credentials"]. ALSO extract "Production credentials" as an ACTION_ITEM with owner=CUSTOMER (since it's a customer dependency that must be tracked).
+
+    The key test: Is this item a CONTRACTED DELIVERABLE the team must build? → Create a full extractions entry.
+    Is this item a GATE/REVIEW/APPROVAL/EXTERNAL INPUT blocking a contracted deliverable? → Put it in blocked_by only (unless it is also a customer action item that must be separately tracked).
 
 Return a JSON object. Fields: extractions (array of activity objects), resolved_items (array of resolved item objects).
 """

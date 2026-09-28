@@ -1782,8 +1782,24 @@ class RiskEvaluationAgent:
         in_scope_activities = list(deterministic_in_scope)
         
         # 3. Execution Priority Analysis & Risk Scoring
-        from datetime import datetime
-        today = datetime.now().date()
+        from datetime import datetime, date as date_type
+        # RC3 FIX: Use document's upload date as reference, not server clock.
+        # This ensures the same MoM document always produces the same overdue/days_until_due
+        # values regardless of when the pipeline runs.
+        try:
+            db_cursor.execute(
+                "SELECT uploaded_at FROM documents WHERE id = %s",
+                (document_id,)
+            )
+            doc_row = db_cursor.fetchone()
+            if doc_row:
+                doc_uploaded = doc_row['uploaded_at'] if isinstance(doc_row, dict) else doc_row[0]
+                today = doc_uploaded.date() if hasattr(doc_uploaded, 'date') else date_type.today()
+            else:
+                today = date_type.today()
+        except Exception:
+            today = date_type.today()
+        print(f"  [Pipeline] Reference date for schedule calculations: {today}")
         category_priorities = RiskConfigurationService.get_category_priorities(db_cursor)
 
         # ── PHASE A: PRE-PROCESSING & CANDIDATE GENERATION ──
