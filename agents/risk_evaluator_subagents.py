@@ -191,8 +191,11 @@ class DeliverableTimelineEvaluationAgent:
         Must strictly adhere to the rule of NEVER inventing percentages.
         Consolidates multiple references into a single progress record per baseline item.
 
-        NOTE: This call produces prose + structured progress — not pure JSON schema.
-        It is intentionally left on generate_json() (not structured output).
+        Uses structured output (DeliverableProgressOutput) to enforce:
+        - progress_status is always a valid Literal value
+        - progress_percentage is null when not explicitly stated (never hallucinated)
+        - evidence_text is required for every record
+        Falls back to generate_json() if structured output is unavailable.
         """
         if not approved_baseline_items:
             return []
@@ -208,6 +211,19 @@ class DeliverableTimelineEvaluationAgent:
             risk_block = str(risk_eval_output)
 
         from core.prompts import get_deliverable_timeline_evaluation_prompt
+        from agents.llm_schemas import DeliverableProgressOutput
+
         prompt = get_deliverable_timeline_evaluation_prompt(baseline_block, risk_block, document_text)
+
+        try:
+            structured = LLMService.generate_structured(prompt, DeliverableProgressOutput)
+            if isinstance(structured, DeliverableProgressOutput):
+                return [r.model_dump() for r in structured.progress_records]
+            elif isinstance(structured, dict):
+                return structured.get("progress_records", [])
+        except Exception as e:
+            print(f"[DeliverableTimelineEvaluationAgent] generate_structured failed ({e}), falling back to generate_json")
+
+        # Fallback: original generate_json path
         result = LLMService.generate_json(prompt)
         return result.get("progress_records", [])

@@ -1,5 +1,66 @@
 import json
 
+
+def _merge_reasoning_json(existing_json_str: str, new_reasoning) -> dict:
+    """
+    Merges new reasoning into existing reasoning JSON by operating
+    entirely in dict/JSON space — never via string concatenation.
+
+    Rules:
+    - PRESERVE always: execution_chain, blocks, blocked_by, owner,
+      graph_role, canonical_id, blocking_names, direct_blocking_names.
+      These fields define the dependency graph and must never be
+      overwritten by a partial update.
+    - UPDATE if provided: executive_summary, evidence_text, gap_analysis,
+      why_important, recommended_action, update_note, ai_interpretation.
+    - ADD if new: any key not already in the existing dict.
+
+    Generic: field names match the reasoning JSON schema used across
+    all tracker items regardless of risk category or document type.
+    """
+    # Parse existing
+    try:
+        existing = json.loads(existing_json_str) if existing_json_str else {}
+        if not isinstance(existing, dict):
+            existing = {'legacy_text': str(existing)}
+    except Exception:
+        existing = {'legacy_text': str(existing_json_str or '')}
+
+    # Parse new reasoning
+    if isinstance(new_reasoning, str):
+        try:
+            new_dict = json.loads(new_reasoning)
+            if not isinstance(new_dict, dict):
+                new_dict = {'update_note': str(new_reasoning)}
+        except Exception:
+            new_dict = {'update_note': new_reasoning}
+    elif isinstance(new_reasoning, dict):
+        new_dict = new_reasoning
+    else:
+        new_dict = {}
+
+    # These fields define the dependency graph — never overwrite them
+    STRUCTURAL_FIELDS = {
+        'execution_chain', 'blocks', 'blocked_by', 'blocking_names',
+        'direct_blocking_names', 'blocks_ids', 'blocked_by_ids',
+        'owner', 'graph_role', 'canonical_id', 'm_id',
+        'cascade_count', 'dependency_status',
+    }
+
+    merged = {**existing}
+    for key, value in new_dict.items():
+        if key in STRUCTURAL_FIELDS:
+            # Only update structural field if it does not already exist
+            # or is empty/null in existing
+            existing_val = existing.get(key)
+            if existing_val is None or existing_val == [] or existing_val == '':
+                merged[key] = value
+            # else: silently keep existing value
+        else:
+            merged[key] = value  # always update non-structural fields
+
+    return merged
+
 # Maps runtime risk categories to their immutable "origin" label.
 # This is set once on INSERT and never changed — preserving historical context.
 _ORIGIN_MAP = {
@@ -241,18 +302,13 @@ class TrackerAuditAgent:
                 final_exec_score = execution_priority_score if execution_priority_score is not None else risk_score
                 final_risk_level = risk_level
                 final_priority   = priority_order if priority_order is not None else existing_priority
-                if reasoning and (reasoning[:50] not in (existing_reasoning or "")):
-                    base_text = existing_reasoning or ""
-                    try:
-                        ex_parsed = json.loads(existing_reasoning)
-                        if isinstance(ex_parsed, dict) and "text" in ex_parsed and isinstance(ex_parsed["text"], str):
-                            base_text = ex_parsed["text"]
-                    except Exception:
-                        pass
-                    final_reasoning = (base_text + "\nUpdate: " + reasoning).strip()
-                else:
-                    final_reasoning = existing_reasoning
-                final_reasoning = _embed_owner_in_reasoning(final_reasoning, owner)
+                # RC1 FIX: Always merge in JSON space — never string concatenation.
+                # String concat destroys execution_chain, blocks, blocked_by fields
+                # which are required for dependency graph reconstruction.
+                merged_dict = _merge_reasoning_json(existing_reasoning, reasoning)
+                if owner:
+                    merged_dict['owner'] = owner
+                final_reasoning = json.dumps(merged_dict)
 
             final_exec_status = (execution_status or status or 'NOT_STARTED').upper()
             if final_exec_status in ('UNKNOWN', ''):

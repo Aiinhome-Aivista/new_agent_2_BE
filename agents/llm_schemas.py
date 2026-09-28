@@ -365,3 +365,212 @@ class RiskAggregationOutput(BaseModel):
 
     class Config:
         populate_by_name = True
+
+
+# ══════════════════════════════════════════════════════════════
+# SCOPE EXTRACTION (ScopeExtractionAgent — EL / IFA baseline)
+# ══════════════════════════════════════════════════════════════
+
+class ScopeItemExtracted(BaseModel):
+    """One scope item extracted from an Engagement Letter or Inter-Firm Approval."""
+
+    name: Annotated[str, Field(
+        description="Short, normalised name for this scope item (e.g. 'CRM Integration', 'UAT Phase')."
+    )]
+    description: Annotated[Optional[str], Field(
+        default=None,
+        description="One-sentence description of what this item entails."
+    )]
+    scope_type: Annotated[
+        Literal["IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"],
+        Field(description=(
+            "IN_SCOPE = the vendor/delivery team is contracted to deliver this. "
+            "OUT_OF_SCOPE = explicitly excluded, a client responsibility, or an assumption/prerequisite. "
+            "UNCERTAIN = not enough evidence to classify with confidence."
+        ))
+    ]
+    source_page: Annotated[Optional[int], Field(
+        default=None,
+        description="Page number in the document where this item was found. Null if unknown."
+    )]
+    source_section: Annotated[Optional[str], Field(
+        default=None,
+        description="Section heading under which this item was found (e.g. 'Scope of Work', 'Out of Scope', 'Assumptions')."
+    )]
+    evidence_text: Annotated[str, Field(
+        description=(
+            "One sentence explaining the classification, quoting the specific evidence from the contract. "
+            "MUST be taken ONLY from the section where the item was extracted — "
+            "NEVER cite 'Out of Scope' section for an IN_SCOPE item."
+        )
+    )]
+    confidence: Annotated[float, Field(
+        ge=0.0, le=1.0,
+        description="Confidence in this classification. 0.95+ = unambiguous section heading. 0.5–0.75 = inferred."
+    )]
+    deadline: Annotated[Optional[str], Field(
+        default=None,
+        description="Deadline in YYYY-MM-DD format if EXPLICITLY stated in the contract. Null if not stated. NEVER invent a date."
+    )]
+
+
+class DeliverableExtracted(BaseModel):
+    name: Annotated[str, Field(description="Short name of the contractual deliverable.")]
+    description: Annotated[Optional[str], Field(default=None, description="Brief description.")]
+    deadline: Annotated[Optional[str], Field(default=None, description="Deadline in YYYY-MM-DD or null.")]
+    owner: Annotated[Optional[str], Field(default=None, description="Owner/responsible party name.")]
+
+
+class StakeholderExtracted(BaseModel):
+    name: Annotated[str, Field(description="Person or organisation name.")]
+    role: Annotated[Optional[str], Field(default=None, description="Their role in the project.")]
+    responsibility: Annotated[Optional[str], Field(default=None, description="Their primary responsibility.")]
+
+
+class MilestoneExtracted(BaseModel):
+    name: Annotated[str, Field(description="Milestone name.")]
+    description: Annotated[Optional[str], Field(default=None, description="Brief description of the milestone.")]
+    target_date: Annotated[Optional[str], Field(
+        default=None,
+        description="Target date in YYYY-MM-DD format. Null if not explicitly stated."
+    )]
+
+
+class ScopeExtractionOutput(BaseModel):
+    """Output schema for ScopeExtractionAgent (Engagement Letter / IFA baseline parsing)."""
+
+    project_name: Annotated[Optional[str], Field(default=None, description="Project or engagement name.")]
+    client_name: Annotated[Optional[str], Field(default=None, description="Client organisation name.")]
+    engagement_type: Annotated[Optional[str], Field(default=None, description="Type of engagement (e.g. 'Technology Advisory', 'Implementation').")]
+    scope_items: Annotated[List[ScopeItemExtracted], Field(
+        default_factory=list,
+        description=(
+            "Every scope item found in the document — both IN_SCOPE and OUT_OF_SCOPE. "
+            "NEVER group distinct phases (e.g. SIT, UAT, Production) into a single item — extract each as a separate entry."
+        )
+    )]
+    deliverables: Annotated[List[DeliverableExtracted], Field(
+        default_factory=list,
+        description="Contractual deliverables explicitly listed in the document."
+    )]
+    stakeholders: Annotated[List[StakeholderExtracted], Field(
+        default_factory=list,
+        description="Key stakeholders and their roles."
+    )]
+    milestones: Annotated[List[MilestoneExtracted], Field(
+        default_factory=list,
+        description="Project milestones with target dates."
+    )]
+    assumptions: Annotated[List[str], Field(
+        default_factory=list,
+        description="Project assumptions listed in the document."
+    )]
+    constraints: Annotated[List[str], Field(
+        default_factory=list,
+        description="Project constraints listed in the document."
+    )]
+    dependencies: Annotated[List[str], Field(
+        default_factory=list,
+        description="External dependencies listed in the document."
+    )]
+
+
+# ══════════════════════════════════════════════════════════════
+# MILESTONE DEPENDENCY EXTRACTION (MilestoneDependencyExtractor)
+# ══════════════════════════════════════════════════════════════
+
+class MilestoneDependencyEdge(BaseModel):
+    """One explicit predecessor → successor dependency between two milestones."""
+
+    parent_milestone: Annotated[str, Field(
+        description=(
+            "The EXACT name of the milestone that must finish first. "
+            "MUST match one of the milestone names provided in the input list verbatim."
+        )
+    )]
+    child_milestone: Annotated[str, Field(
+        description=(
+            "The EXACT name of the milestone that cannot start until the parent is complete. "
+            "MUST match one of the milestone names provided in the input list verbatim."
+        )
+    )]
+
+
+class MilestoneDependencyOutput(BaseModel):
+    """
+    Output schema for MilestoneDependencyExtractor.
+    ONLY include an edge when the document EXPLICITLY states one milestone must precede another.
+    Do NOT guess or infer based on common sense — explicit text only.
+    If no dependencies exist, return an empty list.
+    """
+
+    dependencies: Annotated[List[MilestoneDependencyEdge], Field(
+        default_factory=list,
+        description=(
+            "List of explicit predecessor → successor dependency edges between milestones. "
+            "Empty list if the document contains no explicit sequencing statements."
+        )
+    )]
+
+
+# ══════════════════════════════════════════════════════════════
+# DELIVERABLE TIMELINE PROGRESS (DeliverableTimelineEvaluationAgent)
+# ══════════════════════════════════════════════════════════════
+
+class DeliverableProgressRecord(BaseModel):
+    """Progress record for one approved baseline deliverable, extracted from the MoM/Status Report."""
+
+    scope_item_id: Annotated[int, Field(
+        description="The ID of the baseline scope item from the input list. MUST match an ID from the provided baseline."
+    )]
+    progress_status: Annotated[
+        Literal["NOT_STARTED", "IN_PROGRESS", "BLOCKED", "COMPLETED", "DELAYED", "RESCHEDULED", "AT_RISK", "PENDING"],
+        Field(description=(
+            "Current status of this deliverable based strictly on the document text. "
+            "COMPLETED = explicitly stated as done/delivered/signed off. "
+            "DELAYED = past planned date but still in progress. "
+            "BLOCKED = waiting for an explicit prerequisite."
+        ))
+    ]
+    progress_percentage: Annotated[Optional[int], Field(
+        default=None,
+        ge=0, le=100,
+        description=(
+            "Completion percentage as an integer 0–100, ONLY if explicitly stated in the document. "
+            "NEVER invent or estimate a percentage. Null if not mentioned. "
+            "If the document says 'Completed' do NOT output 100 unless the text literally says 100%."
+        )
+    )]
+    execution_summary: Annotated[str, Field(
+        description=(
+            "One sentence summarising the current execution state for this deliverable. "
+            "If the document has multiple references to this item, consolidate them into one summary."
+        )
+    )]
+    dependencies: Annotated[List[str], Field(
+        default_factory=list,
+        description="Active blockers or prerequisites mentioned in the document for this deliverable. Empty list if none."
+    )]
+    confidence: Annotated[float, Field(
+        ge=0.0, le=1.0,
+        description="Confidence in this progress record. 0.9+ = explicitly stated in document. 0.5 = inferred."
+    )]
+    evidence_text: Annotated[str, Field(
+        description="The exact sentence or clause from the document that is the primary evidence for this status."
+    )]
+
+
+class DeliverableProgressOutput(BaseModel):
+    """
+    Output schema for DeliverableTimelineEvaluationAgent.
+    One record per approved baseline deliverable ONLY.
+    Do NOT create duplicate records for the same deliverable.
+    """
+
+    progress_records: Annotated[List[DeliverableProgressRecord], Field(
+        description=(
+            "One progress record per baseline deliverable that has a status update in the document. "
+            "Omit deliverables with NO mention in the document rather than creating empty records."
+        )
+    )]
+

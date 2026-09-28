@@ -1331,14 +1331,16 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
             updated_reasoning_str = item.get("reasoning")
 
         # Step 7: Update tracker_items
+        # RC2 FIX: risk_score is NOT updated here — it is set at creation and is stable.
+        # execution_priority_score reflects graph position (changes as graph topology changes).
+        # risk_score reflects severity (set by RiskScoringEngine at creation, never changed here).
         cursor.execute("""
             UPDATE tracker_items
             SET execution_priority_score = %s,
                 graph_role = %s,
                 execution_status = %s,
                 recommended_action = %s,
-                reasoning = %s,
-                risk_score = %s
+                reasoning = %s
             WHERE id = %s
         """, (
             new_exec_score,
@@ -1346,7 +1348,6 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
             new_exec_status,
             new_rec_action,
             updated_reasoning_str,
-            new_exec_score,
             item["id"]
         ))
         
