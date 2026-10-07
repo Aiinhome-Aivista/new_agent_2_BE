@@ -36,6 +36,63 @@ class TrackerRepository:
                         conn.commit()
                     except Exception:
                         pass  # Column already exists
+
+                # IMPROVEMENT B: Create execution_priority_band_config table (client-configurable band ranges)
+                try:
+                    cursor.execute(
+                        "CREATE TABLE IF NOT EXISTS execution_priority_band_config ("
+                        "  band_id INT AUTO_INCREMENT PRIMARY KEY,"
+                        "  band_name VARCHAR(50) NOT NULL,"
+                        "  graph_role VARCHAR(40) NOT NULL,"
+                        "  cascade_min INT NULL COMMENT 'NULL = any cascade count',"
+                        "  cascade_max INT NULL COMMENT 'NULL = any cascade count',"
+                        "  score_min INT NOT NULL,"
+                        "  score_max INT NOT NULL,"
+                        "  schedule_urgency_weight FLOAT NOT NULL DEFAULT 0.0,"
+                        "  status_weight FLOAT NOT NULL DEFAULT 0.0,"
+                        "  is_active TINYINT NOT NULL DEFAULT 1,"
+                        "  project_id INT NULL COMMENT 'NULL = global default; set for project override',"
+                        "  UNIQUE KEY uq_band_project (band_name, project_id),"
+                        "  INDEX idx_graph_role (graph_role),"
+                        "  INDEX idx_project_id (project_id)"
+                        ")"
+                    )
+                    conn.commit()
+                    # Seed default rows (match hardcoded fallback exactly)
+                    cursor.execute("""
+                        INSERT IGNORE INTO execution_priority_band_config
+                          (band_name, graph_role, cascade_min, cascade_max, score_min, score_max)
+                        VALUES
+                          ('ROOT_CAUSE_HIGH',      'ROOT_CAUSE',           2,    NULL, 90, 100),
+                          ('ROOT_CAUSE_MED',        'ROOT_CAUSE',           1,    1,    80, 89),
+                          ('ROOT_CAUSE_LOW',        'ROOT_CAUSE',           0,    0,    70, 79),
+                          ('INTERMEDIATE_BLOCKER',  'INTERMEDIATE_BLOCKER', NULL, NULL, 60, 79),
+                          ('TERMINAL_ACTIVITY',     'TERMINAL_ACTIVITY',    NULL, NULL, 40, 59),
+                          ('ISOLATED',              'ISOLATED',             NULL, NULL, 20, 39),
+                          ('SCOPE_CREEP',           'SCOPE_CREEP',          NULL, NULL,  0,  9)
+                    """)
+                    conn.commit()
+                except Exception as e:
+                    pass  # Table already exists or seed already done
+
+                # IMPROVEMENT A2: Ensure STATUS_URGENCY and SCHEDULE_URGENCY exist in risk_parameter_config
+                for param_sql in [
+                    "INSERT IGNORE INTO risk_parameter_config "
+                    "  (parameter_code, parameter_name, enabled, weight, max_score, evaluation_type, description) "
+                    "VALUES "
+                    "  ('STATUS_URGENCY', 'Status Urgency', 1, 0.0, 10, 'NUMERIC', "
+                    "   'Weight of BLOCKED vs IN_PROGRESS status on execution priority bonus. 0=disabled.')",
+                    "INSERT IGNORE INTO risk_parameter_config "
+                    "  (parameter_code, parameter_name, enabled, weight, max_score, evaluation_type, description) "
+                    "VALUES "
+                    "  ('SCHEDULE_URGENCY', 'Schedule Urgency', 1, 0.0, 10, 'NUMERIC', "
+                    "   'Weight of deadline proximity on execution priority bonus. 0=disabled (default).')",
+                ]:
+                    try:
+                        cursor.execute(param_sql)
+                        conn.commit()
+                    except Exception:
+                        pass  # Already exists
                 cursor.close()
                 conn.close()
         except Exception as e:
@@ -131,6 +188,18 @@ class TrackerRepository:
                 it["deliverable"] = it.get("title") or it.get("name")
             if not it.get("title"):
                 it["title"] = it.get("name")
+
+            # NEW (prompt-2): Read exec_priority_reason from reasoning JSON if present.
+            # This gives the frontend a human-readable reason for each item's score.
+            if it.get('reasoning'):
+                try:
+                    r_exec = json.loads(it['reasoning'])
+                    if isinstance(r_exec, dict) and r_exec.get('exec_priority_reason'):
+                        it['exec_priority_reason'] = r_exec['exec_priority_reason']
+                except Exception:
+                    pass
+            if not it.get('exec_priority_reason'):
+                it['exec_priority_reason'] = it.get('recommended_action', '')
         
         TrackerRepository._fetch_and_attach_audit_trails(db, items, project_id)
         

@@ -86,28 +86,62 @@ class NormalizationService:
 
         Returns (canonical_title, is_confirmed_in_scope)
         """
+        from agents.risk_evaluation_agent import _deterministic_match
+        from services.entity_resolver import _clean_baseline_name
         all_items = (all_baseline_items or []) + (in_scope_items or [])
 
+        def _format_matched_title(si: dict) -> str:
+            cleaned = _clean_baseline_name(si.get("name", ""))
+            if ":" in cleaned and len(cleaned) > 60:
+                short_part = cleaned.split(":")[0].strip()
+                return cls.normalize_scope_item(short_part)
+            return cls.normalize_scope_item(cleaned or si.get("scope_item_normalized", si.get("name", "")))
+
+        # Priority 1: Check explicitly matched baseline item against in-scope items
         if matched_baseline_item:
+            si_match, conf, _ = _deterministic_match(matched_baseline_item, in_scope_items)
+            if si_match:
+                return _format_matched_title(si_match), True
+
             norm_match = cls.normalize_scope_item(matched_baseline_item).lower()
-
-            # Priority 1: check IN_SCOPE items first
-            for si in in_scope_items:
+            for si in (in_scope_items or []):
                 si_norm = cls.normalize_scope_item(si["name"]).lower()
-                if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
-                    # Final normalization pass on the DB normalized name in case of legacy dirty data
-                    final_title = cls.normalize_scope_item(si.get("scope_item_normalized", si["name"]))
-                    return final_title, True
+                if norm_match == si_norm or (len(norm_match) >= 6 and (norm_match in si_norm or si_norm in norm_match)):
+                    return _format_matched_title(si), True
 
-            # Priority 2: check ALL baseline items (including OUT_OF_SCOPE exclusions)
+            # Priority 1b: If matched_baseline_item was explicitly given, check all items (e.g. out-of-scope exclusions)
+            si_match_all, conf_all, _ = _deterministic_match(matched_baseline_item, all_items)
+            if si_match_all:
+                is_in_scope = (str(si_match_all.get("scope_type", "IN_SCOPE")).upper() == "IN_SCOPE" and
+                               str(si_match_all.get("category", "")).upper() != "OUT_OF_SCOPE" and
+                               str(si_match_all.get("type", "")).upper() != "OUT_OF_SCOPE")
+                if is_in_scope:
+                    return _format_matched_title(si_match_all), True
+                # Never rewrite an activity's title into an out-of-scope assumption sentence
+                return cls.normalize_scope_item(activity_name or matched_baseline_item), False
+
             for si in all_items:
                 si_norm = cls.normalize_scope_item(si["name"]).lower()
-                if norm_match == si_norm or norm_match in si_norm or si_norm in norm_match:
-                    final_title = cls.normalize_scope_item(si.get("scope_item_normalized", si["name"]))
-                    return final_title, False
+                if norm_match == si_norm or (len(norm_match) >= 6 and (norm_match in si_norm or si_norm in norm_match)):
+                    is_in_scope = (str(si.get("scope_type", "IN_SCOPE")).upper() == "IN_SCOPE" and
+                                   str(si.get("category", "")).upper() != "OUT_OF_SCOPE" and
+                                   str(si.get("type", "")).upper() != "OUT_OF_SCOPE")
+                    if is_in_scope:
+                        return _format_matched_title(si), True
+                    return cls.normalize_scope_item(activity_name or matched_baseline_item), False
 
-            # Priority 2 fallback: use whatever the LLM said (already normalized by the prompt, but we enforce it)
-            return cls.normalize_scope_item(matched_baseline_item), False
+        # Priority 2: Check activity_name against IN_SCOPE items ONLY (never match against out-of-scope assumptions)
+        if activity_name:
+            si_match, conf, _ = _deterministic_match(activity_name, in_scope_items)
+            if si_match:
+                return _format_matched_title(si_match), True
 
-        # Priority 3: no baseline match — use normalized activity name
-        return cls.normalize_scope_item(activity_name), False
+            norm_match = cls.normalize_scope_item(activity_name).lower()
+            for si in (in_scope_items or []):
+                si_norm = cls.normalize_scope_item(si["name"]).lower()
+                if norm_match == si_norm or (len(norm_match) >= 6 and (norm_match in si_norm or si_norm in norm_match)):
+                    return _format_matched_title(si), True
+
+        # Priority 3: No baseline match — use normalized activity name (never rewrite to assumption sentence)
+        return cls.normalize_scope_item(activity_name or matched_baseline_item), False
+

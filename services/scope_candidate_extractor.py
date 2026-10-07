@@ -69,9 +69,36 @@ class ScopeCandidateExtractor:
         "status", "remarks", "client responsibilities", "dependencies"
     }
 
+    SECTION_HEADING_PATTERNS = [
+        r'scope\s+of\s+services',
+        r'in[\s-]scope\s+deliverables',
+        r'one[\s-]time\s+modernization',
+        r'foundation\s+milestones',
+        r'recurring\s+in[\s-]scope',
+        r'recurring\s+managed',
+        r'monthly\s+operational\s+deliverables',
+        r'quarterly\s+governance',
+        r'strategic\s+deliverables',
+        r'out[\s-]of[\s-]scope\s+items',
+        r'commercial\s+terms',
+        r'retainers?\s+&\s+payment',
+        r'payment\s+schedule',
+        r'service\s+level\s+agreement',
+        r'sla\s+matrix',
+        r'term[,\s]+termination',
+        r'mutual\s+acceptance',
+        r'in\s+witness\s+whereof',
+        r'master\s+services\s+engagement\s+letter',
+        r'engagement\s+purpose\s+&\s+background',
+    ]
+
     @classmethod
     def _is_heading(cls, text: str) -> bool:
-        lower_text = text.lower().strip()
+        if not text:
+            return True
+        # Strip markdown bold, italic, headings: **, *, __, _, #
+        cleaned = re.sub(r'[\*_#]+', '', text).strip()
+        lower_text = cleaned.lower()
         if not lower_text:
             return True
 
@@ -79,7 +106,7 @@ class ScopeCandidateExtractor:
         if lower_text in cls.HEADING_BLACKLIST:
             return True
 
-        # Strip section numbering (e.g., "6. Recurring Commitments", "Section 1: Project Overview", "4. Assumptions")
+        # Strip section numbering (e.g., "2.1 One-Time...", "Section 1: ...", "4. Assumptions", "A) ...")
         cleaned_prefix = re.sub(
             r'^(?:section\s+[0-9]+[:\.\s]*|[0-9]+(?:\.[0-9]+)*[:\.\s]+|[A-Za-z]\)\s*)',
             '',
@@ -97,6 +124,14 @@ class ScopeCandidateExtractor:
         if cleaned_punct in cls.HEADING_BLACKLIST:
             return True
 
+        # Table rows starting with | or separator rows
+        raw_stripped = text.strip()
+        if raw_stripped.startswith('|'):
+            if ('---' in raw_stripped or 'category' in lower_text or 'cadence' in lower_text or 
+                'severity' in lower_text or 'definition' in lower_text or 'for:' in lower_text or 
+                'name:' in lower_text or 'title:' in lower_text or 'date:' in lower_text or 'fee' in lower_text):
+                return True
+
         # Table header row detection (e.g. "Phase  Timeline  Status  Remarks")
         if re.search(r'\b(phase|milestone|deliverable)\b.*?\b(timeline|date|status|remarks)\b', lower_text):
             return True
@@ -105,13 +140,23 @@ class ScopeCandidateExtractor:
         if re.match(r'^[\s\|\-:]+$', text):
             return True
 
-        # Pure parenthetical frequency / occurrence notes (e.g. "(Monthly, from March 2026 through December 2026 — 10 occurrences)")
+        # Pure parenthetical frequency / occurrence notes
         if re.match(r'^\s*\(.*?\b(?:occurrences?|monthly|weekly|quarterly|yearly)\b.*?\)\s*$', text, re.IGNORECASE):
             return True
 
         for h in ["change request process", "change control process", "formal change request"]:
             if h in lower_text:
                 return True
+
+        # B2 FIX: Contractual section heading patterns
+        for pat in cls.SECTION_HEADING_PATTERNS:
+            if re.search(pat, lower_text):
+                # Ensure it's a heading and not a full bullet sentence containing deliverables
+                if len(cleaned_prefix) < 90 or not re.search(
+                    r'\b(provider\s+shall|conduct|deliver|analyze|execute|continuous|provisioning|deployment|cutover|audit\s+and\s+publish)\b',
+                    lower_text
+                ):
+                    return True
 
         return False
 

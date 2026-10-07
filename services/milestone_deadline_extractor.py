@@ -1,6 +1,37 @@
 import re
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from services.llm_service import LLMService
+
+
+# B4 FIX: Regex for "Weeks N–M" or "Week N" relative deadline patterns
+_WEEKS_RANGE_RE = re.compile(
+    r'\bweeks?\s*([0-9]+)\s*(?:[\u2013\u2014\u2012\-]\s*([0-9]+))?',
+    re.IGNORECASE,
+)
+
+
+def resolve_relative_week_deadline(deadline_text: str, project_start: date) -> str | None:
+    """
+    B4 FIX: Convert a relative week range string to an ISO date.
+
+    Examples (project_start = 2026-10-05):
+      "Weeks 1–4"  →  project_start + 4 weeks - 1 day = 2026-11-01
+      "Week 3"     →  project_start + 3 weeks - 1 day = 2026-10-25
+      "Weeks 9–12" →  project_start + 12 weeks - 1 day = 2026-12-27
+
+    Returns None if the text does not contain a week range pattern.
+    Generic: uses only regex + arithmetic, no hardcoded milestone names.
+    """
+    if not deadline_text or not project_start:
+        return None
+    m = _WEEKS_RANGE_RE.search(deadline_text)
+    if not m:
+        return None
+    start_week = int(m.group(1))
+    end_week = int(m.group(2)) if m.group(2) else start_week
+    # Deadline = last day of the ending week
+    deadline = project_start + timedelta(weeks=end_week) - timedelta(days=1)
+    return deadline.isoformat()
 
 class MilestoneDeadlineExtractor:
     
@@ -12,19 +43,30 @@ class MilestoneDeadlineExtractor:
     MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer"]
 
     @classmethod
-    def extract(cls, candidates: list[dict]) -> list[dict]:
+    def extract(cls, candidates: list[dict], project_start: date = None) -> list[dict]:
         """
         Enriches scope items with milestone and deadline information.
         Must run AFTER deduplication.
+
+        B4 FIX: project_start is used to resolve relative week deadlines
+        like "Weeks 1–4" → absolute date. Defaults to today if not provided.
         """
+        _proj_start = project_start or date.today()
         llm_batch = []
         for candidate in candidates:
             # 0. Preserve existing timeline metadata if already extracted from table or prior step
             if candidate.get("deadline_text"):
-                candidate["deadline"] = candidate.get("deadline") or cls._normalize_date(candidate["deadline_text"])
+                existing_dt = candidate.get("deadline_text", "")
+                # B4 FIX: if existing deadline_text is a relative week range, resolve it
+                if not candidate.get("deadline") and _WEEKS_RANGE_RE.search(existing_dt):
+                    candidate["deadline"] = resolve_relative_week_deadline(existing_dt, _proj_start)
+                    candidate["extraction_method"] = candidate.get("extraction_method") or "Deterministic_WeekOffset"
+                    candidate["extraction_confidence"] = candidate.get("extraction_confidence") or 0.85
+                else:
+                    candidate["deadline"] = candidate.get("deadline") or cls._normalize_date(existing_dt)
+                    candidate["extraction_method"] = candidate.get("extraction_method") or "Deterministic"
+                    candidate["extraction_confidence"] = candidate.get("extraction_confidence") or 0.95
                 candidate["milestone"] = candidate.get("milestone") or candidate.get("name")
-                candidate["extraction_method"] = candidate.get("extraction_method") or "Deterministic"
-                candidate["extraction_confidence"] = candidate.get("extraction_confidence") or 0.95
                 continue
 
             evidence = candidate.get("evidence_text", "")
@@ -42,6 +84,17 @@ class MilestoneDeadlineExtractor:
             found_date_text = None
             found_milestone = None
             candidate_name_lower = candidate.get("name", "").lower()
+
+            # B4 FIX: Check for relative week range (e.g. "Weeks 1–4", "Weeks 5–8")
+            week_m = _WEEKS_RANGE_RE.search(candidate.get("name", "")) or _WEEKS_RANGE_RE.search(combined_text)
+            if week_m:
+                found_date_text = week_m.group(0).strip()
+                candidate["deadline_text"] = found_date_text
+                candidate["deadline"] = resolve_relative_week_deadline(found_date_text, _proj_start)
+                candidate["milestone"] = candidate.get("milestone") or candidate.get("name")
+                candidate["extraction_method"] = "Deterministic_WeekOffset"
+                candidate["extraction_confidence"] = 0.90
+                continue
             
             sentences = re.split(r'\.\s+', combined_text)
             for sentence in sentences:
@@ -122,7 +175,12 @@ class MilestoneDeadlineExtractor:
                     res = result_map.get(str(idx), {})
                     if res.get("has_schedule"):
                         candidate_ref["deadline_text"] = res.get("deadline_text")
-                        candidate_ref["deadline"] = cls._normalize_date(candidate_ref["deadline_text"])
+                        dl_text = candidate_ref.get("deadline_text") or ""
+                        # B4 FIX: resolve relative week deadline if present
+                        if _WEEKS_RANGE_RE.search(dl_text):
+                            candidate_ref["deadline"] = resolve_relative_week_deadline(dl_text, _proj_start)
+                        else:
+                            candidate_ref["deadline"] = cls._normalize_date(dl_text)
                         candidate_ref["milestone"] = res.get("milestone")
                         candidate_ref["milestone_status"] = res.get("milestone_status", "Planned")
                         candidate_ref["extraction_method"] = "LLM"
