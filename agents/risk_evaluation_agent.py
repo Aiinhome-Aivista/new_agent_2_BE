@@ -5,7 +5,7 @@ from typing import Callable, Optional
 from services.llm_service import LLMService
 from services.project_knowledge_service import ProjectKnowledgeService
 from services.risk_config_service import RiskConfigurationService
-from services.risk_scoring_engine import RiskScoringEngine
+from services.risk_scoring_engine import RiskScoringEngine, set_scoring_reference_date, _find_execution_context
 from agents.risk_evaluator_subagents import ActivityExtractorAgent, BatchActivityRiskAgent
 from agents.tracker_audit_agent import TrackerAuditAgent
 from agents.alerting_agent import AlertingAgent
@@ -19,7 +19,7 @@ from services.category_assignment_engine import CategoryAssignmentEngine
 
 def _normalize(text: str) -> str:
     """Normalize text for matching: lowercase, strip, remove common filler."""
-    stop_words = {"the", "a", "an", "of", "for", "in", "on", "to", "and", "or", "is", "was", "has", "have"}
+    stop_words = {"the", "an", "of", "for", "in", "on", "to", "and", "or", "is", "was", "has", "have"}
     words = text.lower().strip().split()
     return " ".join(w for w in words if w not in stop_words)
 
@@ -65,7 +65,16 @@ def _validate_matched_baseline_item(
     if not matched_baseline_item:
         return matched_baseline_item
 
-    candidates = (scope_items or []) + (canonical_registry or [])
+    raw_candidates = (scope_items or []) + (canonical_registry or [])
+    candidates = []
+    for item in raw_candidates:
+        if isinstance(item, dict):
+            s_type = str(item.get("scope_type", "IN_SCOPE")).upper()
+            cat = str(item.get("category", "")).upper()
+            t_val = str(item.get("type", "")).upper()
+            if s_type == "OUT_OF_SCOPE" or cat == "OUT_OF_SCOPE" or t_val == "OUT_OF_SCOPE":
+                continue
+        candidates.append(item)
     if not candidates:
         return matched_baseline_item
 
@@ -276,43 +285,58 @@ def _deterministic_match(activity_name: str, scope_items: list) -> tuple:
     """
     STEP 3: Deterministic Scope Matching.
     Tries exact → normalized → substring → token overlap in that order.
+    Checks raw name, cleaned name, milestone name, and short title aliases.
     
     Returns (scope_item_dict, confidence_score 0-100, match_type)
     If no match found, returns (None, 0, None).
-    
-    Per the spec: if confidence >= threshold, DO NOT invoke LLM.
     """
+    from services.entity_resolver import _clean_baseline_name, _extract_short_title_aliases
     act_norm = _normalize(activity_name)
-    act_words = set(act_norm.split())
+    act_words = {re.sub(r'[^\w]', '', w) for w in act_norm.split() if re.sub(r'[^\w]', '', w)}
 
     best_match = None
     best_score = 0
     best_type = None
 
-    for si in scope_items:
-        si_norm = _normalize(si["name"])
-        si_words = set(si_norm.split())
+    for si in (scope_items or []):
+        raw_name = si.get("name", "")
+        cleaned_name = _clean_baseline_name(raw_name)
+        si_norm = _normalize(raw_name)
+        si_cleaned_norm = _normalize(cleaned_name)
+        m_norm = _normalize(si.get("milestone_normalized") or si.get("milestone") or "")
 
-        # 1. Exact match (normalized)
-        if act_norm == si_norm:
-            return si, 100, "exact"
+        names_to_check = [si_norm]
+        if si_cleaned_norm and si_cleaned_norm != si_norm:
+            names_to_check.append(si_cleaned_norm)
+        if m_norm and m_norm not in names_to_check:
+            names_to_check.append(m_norm)
+        for alias in _extract_short_title_aliases(cleaned_name):
+            a_norm = _normalize(alias)
+            if a_norm and a_norm not in names_to_check:
+                names_to_check.append(a_norm)
 
-        # 2. Substring match
-        if act_norm in si_norm or si_norm in act_norm:
-            score = 90
-            if score > best_score:
-                best_match, best_score, best_type = si, score, "substring"
-            continue
+        for target_name in names_to_check:
+            # 1. Exact match (normalized)
+            if act_norm == target_name:
+                return si, 100, "exact"
 
-        # 3. Token overlap (Jaccard-style)
-        if act_words and si_words:
-            overlap = len(act_words & si_words)
-            union = len(act_words | si_words)
-            if union > 0:
-                jaccard = (overlap / union) * 100
-                # Require at least 2 common words AND >50% Jaccard
-                if overlap >= 2 and jaccard > 50 and jaccard > best_score:
-                    best_match, best_score, best_type = si, int(jaccard), "token_overlap"
+            # 2. Substring match
+            if (len(act_norm) >= 6 and act_norm in target_name) or (len(target_name) >= 6 and target_name in act_norm):
+                score = 90
+                if score > best_score:
+                    best_match, best_score, best_type = si, score, "substring"
+                continue
+
+            # 3. Token overlap (Jaccard-style)
+            t_words = {re.sub(r'[^\w]', '', w) for w in target_name.split() if re.sub(r'[^\w]', '', w)}
+            if act_words and t_words:
+                overlap = len(act_words & t_words)
+                union = len(act_words | t_words)
+                if union > 0:
+                    jaccard = (overlap / union) * 100
+                    # Match if strong overlap (3+ words, or 2+ words with >35% Jaccard)
+                    if (overlap >= 3 or (overlap >= 2 and jaccard >= 35)) and jaccard > best_score:
+                        best_match, best_score, best_type = si, max(int(jaccard), 75), "token_overlap"
 
     return best_match, best_score, best_type
 
@@ -1424,6 +1448,7 @@ class RiskEvaluationAgent:
                     "canonical_title": final_title,
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
+                    "is_in_scope": True,
                     "confidence": confidence,
                     "extraction_confidence": extraction_confidence,
                     "blocked_by": act_item.get("blocked_by", []),
@@ -1439,6 +1464,7 @@ class RiskEvaluationAgent:
                     "canonical_title": canonical_title,
                     "source_sentence": source_sentence,
                     "matched_si": matched_si,
+                    "is_in_scope": is_already_in_scope or (matched_si is not None and matched_si.get("scope_type") == "IN_SCOPE"),
                     "confidence": confidence,
                     "extraction_confidence": extraction_confidence,
                     "blocked_by": act_item.get("blocked_by", []),
@@ -1469,6 +1495,7 @@ class RiskEvaluationAgent:
                 "source_sentence": item.get("source_sentence", activity_name),
                 "context": context,
                 "matched_si": matched_si,
+                "is_in_scope": item.get("is_in_scope", False) or bool(matched_si),
                 "extraction_confidence": item.get("extraction_confidence", 100),
                 "blocked_by": item.get("blocked_by", []),
                 "blocks": item.get("blocks", []),
@@ -1800,6 +1827,8 @@ class RiskEvaluationAgent:
         except Exception:
             today = date_type.today()
         print(f"  [Pipeline] Reference date for schedule calculations: {today}")
+        # PART A1: Set module-level reference date so _parse_due_date() uses same clock.
+        set_scoring_reference_date(today)
         category_priorities = RiskConfigurationService.get_category_priorities(db_cursor)
 
         # ── PHASE A: PRE-PROCESSING & CANDIDATE GENERATION ──
@@ -1832,12 +1861,65 @@ class RiskEvaluationAgent:
             matched_si = context.get("matched_si")
             is_confirmed_in_scope = context.get("is_in_scope", False)
             
+            matched_baseline_item = result.get("matched_baseline_item", "") or ""
+
+            # B1 FIX: If matched_si is missing or unconfirmed, check LLM/canonical baseline matches via _deterministic_match
+            if not matched_si and matched_baseline_item:
+                det_si, conf, _ = _deterministic_match(matched_baseline_item, scope_items)
+                if det_si:
+                    matched_si = det_si
+                    is_confirmed_in_scope = (det_si.get("scope_type", "IN_SCOPE") == "IN_SCOPE")
+                else:
+                    m_base_norm = _normalize(matched_baseline_item)
+                    for si in (scope_items or []):
+                        s_name = si.get("name", "")
+                        s_norm = _normalize(s_name)
+                        s_m = _normalize(si.get("milestone") or si.get("milestone_normalized") or "")
+                        if (m_base_norm == s_norm or m_base_norm in s_norm or s_norm in m_base_norm or
+                            (s_m and (m_base_norm == s_m or m_base_norm in s_m or s_m in m_base_norm))):
+                            matched_si = si
+                            is_confirmed_in_scope = (si.get("scope_type", "IN_SCOPE") == "IN_SCOPE")
+                            break
+
+            # If canonical_title matches an in-scope item, confirm in scope
+            if not is_confirmed_in_scope and canonical_title:
+                det_si, conf, _ = _deterministic_match(canonical_title, scope_items)
+                if det_si:
+                    matched_si = matched_si or det_si
+                    is_confirmed_in_scope = (det_si.get("scope_type", "IN_SCOPE") == "IN_SCOPE")
+                else:
+                    c_norm = _normalize(canonical_title)
+                    for si in (scope_items or []):
+                        s_name = si.get("name", "")
+                        s_norm = _normalize(s_name)
+                        s_m = _normalize(si.get("milestone") or si.get("milestone_normalized") or "")
+                        if c_norm == s_norm or (s_m and c_norm == s_m):
+                            matched_si = matched_si or si
+                            is_confirmed_in_scope = (si.get("scope_type", "IN_SCOPE") == "IN_SCOPE")
+                            break
+
+            # Also check activity_name if still not confirmed in scope
+            if not is_confirmed_in_scope and activity_name:
+                det_si, conf, _ = _deterministic_match(activity_name, scope_items)
+                if det_si:
+                    matched_si = matched_si or det_si
+                    is_confirmed_in_scope = (det_si.get("scope_type", "IN_SCOPE") == "IN_SCOPE")
+
+            # Check full baseline (including OUT_OF_SCOPE items) ONLY if matched_baseline_item was explicitly given
+            if not matched_si and all_baseline_items and matched_baseline_item:
+                det_base, conf, _ = _deterministic_match(matched_baseline_item, all_baseline_items)
+                if det_base:
+                    matched_si = det_base
+                    is_confirmed_in_scope = (str(det_base.get("scope_type", "IN_SCOPE")).upper() == "IN_SCOPE")
+
             entity_type = result.get("entity_type", "MILESTONE").upper()
-            
             m_id = get_milestone_id(canonical_title)
+            if not m_id and matched_baseline_item:
+                m_id = get_milestone_id(matched_baseline_item)
+            if not m_id and activity_name:
+                m_id = get_milestone_id(activity_name)
             
             # Deterministic Source of Truth for Entity Type (Problem 5 Fix)
-            matched_baseline_item = result.get("matched_baseline_item", "") or ""
             has_baseline_evidence = (
                 m_id is not None or
                 is_confirmed_in_scope or
@@ -1940,14 +2022,26 @@ class RiskEvaluationAgent:
                 risk_cat = "EXECUTION_BLOCKER"
                 
             is_scope_creep = False
-            # Scope Creep Scenario 1: Completely missing from baseline (Rogue work)
-            if not matched_si and not is_confirmed_in_scope:
-                if entity_type in ["SCOPE_REQUEST", "MILESTONE"]:
-                    is_scope_creep = True
-                    risk_cat = "SCOPE_CREEP"
+            # Operational items (ACTION_ITEM, DEPENDENCY, TASK, MILESTONE, RISK) and customer actions are NEVER scope creep
+            if entity_type in ["ACTION_ITEM", "DEPENDENCY", "TASK", "MILESTONE", "RISK"] and entity_type != "SCOPE_REQUEST":
+                is_scope_creep = False
+            elif owner_display == "Customer" and entity_type != "SCOPE_REQUEST":
+                is_scope_creep = False
             # Scope Creep Scenario 2: Matches an item explicitly listed as OUT_OF_SCOPE in the contract
-            elif matched_si and not is_confirmed_in_scope:
-                if matched_si.get("type", "").upper() == "OUT_OF_SCOPE" or matched_si.get("category", "").upper() == "OUT_OF_SCOPE":
+            elif matched_si and (str(matched_si.get("type", "")).upper() == "OUT_OF_SCOPE" or 
+                               str(matched_si.get("category", "")).upper() == "OUT_OF_SCOPE" or
+                               str(matched_si.get("scope_type", "")).upper() == "OUT_OF_SCOPE"):
+                is_scope_creep = True
+                risk_cat = "SCOPE_CREEP"
+            # Confirmed in-scope, milestone found, or has clear baseline evidence -> NEVER scope creep
+            elif is_confirmed_in_scope or (matched_si and str(matched_si.get("scope_type", "")).upper() == "IN_SCOPE") or m_id is not None or has_baseline_evidence:
+                is_scope_creep = False
+            # Scope Creep Scenario 1: Rogue work explicitly extracted as SCOPE_REQUEST with no baseline evidence
+            elif entity_type in ["SCOPE_REQUEST"] and not has_baseline_evidence:
+                is_scope_creep = True
+                risk_cat = "SCOPE_CREEP"
+            elif not matched_si and not is_confirmed_in_scope and not has_baseline_evidence:
+                if entity_type == "SCOPE_REQUEST":
                     is_scope_creep = True
                     risk_cat = "SCOPE_CREEP"
 
@@ -1962,7 +2056,10 @@ class RiskEvaluationAgent:
                 if db_norm == c_norm or db_norm in c_norm or c_norm in db_norm:
                     date_m_id = mid
                     break
-            
+
+            if not date_m_id and m_id:
+                date_m_id = m_id
+
             p_date_str = None
             if date_m_id and date_m_id in milestone_details:
                 p_date_str = milestone_details[date_m_id].get("planned_date")
@@ -1982,6 +2079,10 @@ class RiskEvaluationAgent:
             if not p_date_str:
                 if result.get("planned_date"):
                     p_date_str = str(result["planned_date"])
+                elif matched_si and matched_si.get("deadline"):
+                    p_date_str = str(matched_si["deadline"])
+                elif result.get("due_date"):
+                    p_date_str = str(result["due_date"])
                 else:
                     for si in all_baseline_items:
                         if _normalize(si.get("name", "")) == c_norm and si.get("deadline"):
@@ -2132,7 +2233,92 @@ class RiskEvaluationAgent:
         print(f"  [ValidationGate] Enriching {len(unique_activities)} unique activities...")
         enriched_activities = ValidationService.enrich_candidates(unique_activities, scope_items=all_baseline_items)
 
-                                
+        # ── IMPROVEMENT B: Load band config once (DB-driven, falls back to hardcoded) ──
+        try:
+            band_config = RiskConfigurationService.get_band_config(db_cursor, project_id=project_id)
+        except Exception as _bc_err:
+            print(f"  [Pipeline] band_config load error: {_bc_err}, using hardcoded fallback")
+            from services.risk_scoring_engine import _HARDCODED_BAND_FALLBACK
+            band_config = _HARDCODED_BAND_FALLBACK
+
+        # ── PROMPT-2: Find execution context ONCE for the entire project ──
+        # All items are scored relative to this context (what PM needs to focus on today).
+        try:
+            open_items_for_context = [
+                {
+                    'title': a.get('canonical_title', ''),
+                    'name': a.get('canonical_title', ''),
+                    'deliverable': a.get('canonical_title', ''),
+                    'blocked_by': a.get('blocked_by', []),
+                    'blocking_names': a.get('downstream_names', []),
+                    'direct_blocking_names': a.get('direct_blocking_names', []),
+                    'progress': a.get('progress', 0),
+                    'expected_date': str(a.get('p_date_str', '')) if a.get('p_date_str') else (str(a.get('due_date', '')) if a.get('due_date') else None),
+                    'planned_date': str(a.get('p_date_str', '')) if a.get('p_date_str') else None,
+                    'due_date': str(a.get('due_date', '')) if a.get('due_date') else None,
+                    'deadline': str(a.get('p_date_str', '')) if a.get('p_date_str') else (str(a.get('due_date', '')) if a.get('due_date') else None),
+                    'graph_role': a.get('graph_role', 'ISOLATED'),
+                    'risk_category': a.get('risk_cat', ''),
+                    'category': a.get('category', a.get('risk_cat', '')),
+                    'entity_type': a.get('entity_type', 'MILESTONE'),
+                    'is_out_of_scope': a.get('is_scope_creep', False),
+                    'status': a.get('status', 'NOT_STARTED'),
+                    'is_recurring': a.get('is_recurring', False),
+                    'parent_scope_item_id': a.get('parent_scope_item_id'),
+                }
+                for a in enriched_activities
+                if a.get('status') not in ['COMPLETED', 'RESOLVED']
+            ]
+
+            # Fallback deadline lookup from scope_items for open context items
+            for c_item in open_items_for_context:
+                if not c_item.get('expected_date'):
+                    t_norm = _normalize(c_item.get('title', ''))
+                    for si in (scope_items or []):
+                        if _normalize(si.get('name', '')) == t_norm and (si.get('deadline') or si.get('planned_date')):
+                            d_val = str(si.get('deadline') or si.get('planned_date'))
+                            c_item['expected_date'] = d_val
+                            c_item['planned_date'] = d_val
+                            c_item['deadline'] = d_val
+                            break
+
+            # Ensure all approved baseline milestones with deadlines are available as target windows
+            known_context_titles = {
+                _normalize(item.get('title', '')) for item in open_items_for_context if item.get('title')
+            }
+            for si in (scope_items or []):
+                si_name = si.get('name', '')
+                si_norm = _normalize(si_name)
+                m_norm = _normalize(si.get('milestone_normalized') or si.get('milestone') or '')
+                if si_norm not in known_context_titles and (not m_norm or m_norm not in known_context_titles):
+                    deadline_val = si.get('deadline') or si.get('planned_date')
+                    if deadline_val:
+                        open_items_for_context.append({
+                            'title': si_name,
+                            'name': si_name,
+                            'deliverable': si_name,
+                            'blocked_by': [],
+                            'blocking_names': [],
+                            'direct_blocking_names': [],
+                            'progress': 0,
+                            'expected_date': str(deadline_val),
+                            'planned_date': str(deadline_val),
+                            'due_date': str(deadline_val),
+                            'deadline': str(deadline_val),
+                            'graph_role': 'ISOLATED',
+                            'risk_category': 'GENERAL',
+                            'is_out_of_scope': False,
+                            'status': 'NOT_STARTED',
+                        })
+
+            execution_context = _find_execution_context(
+                all_tracker_items=open_items_for_context,
+                reference_date=today,
+            )
+        except Exception as _ec_err:
+            print(f"  [Pipeline] execution_context error: {_ec_err}, using empty context")
+            execution_context = {}
+
         # ── PHASE C: RISK SCORING & AGGREGATION ──
         for idx, item in enumerate(enriched_activities):
             if item["status"] in ["COMPLETED", "RESOLVED"]:
@@ -2190,12 +2376,20 @@ class RiskEvaluationAgent:
                 business_phase=item.get("business_phase", "Execution"),
                 criticality_score=item.get("criticality_score", 0.0),
                 parallel_stream=item.get("parallel_stream", "Stream 1"),
-                # NEW: graph_role-based band scoring (Problems 1, 2)
+                # Band system parameters
                 graph_role=item.get("graph_role", "ISOLATED"),
-                # NEW: due_date fallback for days_until_due (Problem 3)
                 due_date=item.get("due_date"),
-                # NEW: explicit cascade_count for band determination
                 cascade_count=item.get("cascade_count", 0),
+                # NEW (prompt-2): context-driven scoring
+                execution_context=execution_context,
+                # NEW (Improvement A2): execution status for status-urgency bonus
+                execution_status=item.get("execution_status", item.get("status", "NOT_STARTED")),
+                # NEW (Improvement B): DB-driven band config
+                band_config=band_config,
+                # Progress for tier bonuses
+                progress_percent=item.get("progress", 0),
+                # Pass risk_params for weight lookups (SCHEDULE_URGENCY, STATUS_URGENCY)
+                risk_params=risk_params,
             )
             
             exec_prio = score_result["execution_priority"]
@@ -2212,6 +2406,7 @@ class RiskEvaluationAgent:
             cascade_priority = score_result.get("cascade_priority", 0)
             schedule_priority = score_result.get("schedule_priority", 0)
             execution_reasons = score_result.get("execution_reasons", [])
+            exec_priority_reason = score_result.get("exec_priority_reason", "")
             severity = RiskConfigurationService.classify_severity(risk_sev, risk_thresholds)
             
             full_reasoning = RiskScoringEngine.format_reasoning(
@@ -2238,7 +2433,8 @@ class RiskEvaluationAgent:
                 execution_priority=execution_priority,
                 cascade_priority=cascade_priority,
                 schedule_priority=schedule_priority,
-                execution_reasons=execution_reasons
+                execution_reasons=execution_reasons,
+                exec_priority_reason=exec_priority_reason,
             )
             
             queue_order = 9999

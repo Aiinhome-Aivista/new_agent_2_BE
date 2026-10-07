@@ -231,7 +231,27 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         # Pipeline Step 5: Milestone & Deadline Extraction
         t_step5 = time.time()
         emit("Extracting Milestones & Deadlines", 85)
-        enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates)
+
+        # B4 FIX: Fetch project start date for relative week deadline resolution (e.g. "Weeks 1–4")
+        proj_start_date = None
+        try:
+            from datetime import datetime as dt_cls, date as d_cls
+            p_cur = thread_conn.cursor(dictionary=True)
+            p_cur.execute("SELECT start_date FROM projects WHERE id = %s", (project_id,))
+            p_row = p_cur.fetchone()
+            p_cur.close()
+            if p_row and p_row.get("start_date"):
+                sd = p_row["start_date"]
+                if hasattr(sd, "date"):
+                    proj_start_date = sd.date()
+                elif isinstance(sd, d_cls):
+                    proj_start_date = sd
+                elif isinstance(sd, str):
+                    proj_start_date = dt_cls.strptime(sd[:10], "%Y-%m-%d").date()
+        except Exception as e:
+            print(f"[Baseline] Could not fetch project start date for relative deadlines: {e}")
+
+        enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates, project_start=proj_start_date)
         step5_time = time.time() - t_step5
 
         timeline_items = [c for c in enriched_candidates if c.get("milestone") or c.get("deadline_text") or c.get("deadline")]
@@ -1377,6 +1397,20 @@ def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Opt
                 forced_score = min(100, tgt_rec["new_score"] + 1)
                 cursor.execute("UPDATE tracker_items SET execution_priority_score = %s WHERE id = %s", (forced_score, src_rec["id"]))
                 src_rec["new_score"] = forced_score
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # 🔢 STEP 2G: Re-stamp priority_order on all open items
+    # Ensures priority_order strictly reflects the finalized execution_priority_score
+    # ──────────────────────────────────────────────────────────────────────────
+    cursor.execute("""
+        SELECT id FROM tracker_items
+        WHERE project_id = %s AND status = 'OPEN'
+        ORDER BY COALESCE(execution_priority_score, 0) DESC, COALESCE(risk_score, 0) DESC, id ASC
+    """, (project_id,))
+    open_recalc_rows = cursor.fetchall() or []
+    for rank_idx, r_row in enumerate(open_recalc_rows, start=1):
+        r_id = r_row["id"] if isinstance(r_row, dict) else r_row[0]
+        cursor.execute("UPDATE tracker_items SET priority_order = %s WHERE id = %s", (rank_idx, r_id))
 
 class ScopeItemCompletionUpdate(BaseModel):
     completion_status: Optional[str] = None

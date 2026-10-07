@@ -93,7 +93,60 @@ class RiskConfigurationService:
         """
         return cls._load("category_rules", db_cursor, cls._fetch_category_rules)
 
+    @classmethod
+    def get_band_config(cls, db_cursor, project_id: int = None) -> list:
+        """
+        IMPROVEMENT B: Loads execution priority band configuration from DB.
+        Project-specific rows override global rows for the same band_name.
+        Falls back to hardcoded defaults if table is empty or query fails.
+        Generic: no project-specific logic.
+
+        Returns list of band dicts with keys:
+          band_name, graph_role, cascade_min, cascade_max,
+          score_min, score_max, schedule_urgency_weight, status_weight, is_active
+
+        Clients customise band ranges by SQL only (no code deploy needed):
+          UPDATE execution_priority_band_config
+          SET schedule_urgency_weight = 0.4 WHERE band_name = 'ISOLATED';
+        """
+        from services.risk_scoring_engine import _HARDCODED_BAND_FALLBACK
+        try:
+            db_cursor.execute("""
+                SELECT band_name, graph_role, cascade_min, cascade_max,
+                       score_min, score_max, schedule_urgency_weight,
+                       status_weight, is_active
+                FROM execution_priority_band_config
+                WHERE is_active = 1
+                  AND (project_id = %s OR project_id IS NULL)
+                ORDER BY project_id DESC, cascade_min DESC
+            """, (project_id,))
+            rows = db_cursor.fetchall() or []
+            if rows:
+                result = []
+                seen_names = set()
+                for r in rows:
+                    row_dict = dict(r) if isinstance(r, dict) else dict(zip(
+                        ['band_name', 'graph_role', 'cascade_min', 'cascade_max',
+                         'score_min', 'score_max', 'schedule_urgency_weight',
+                         'status_weight', 'is_active'], r
+                    ))
+                    # Project-specific rows win (ORDER BY project_id DESC already ensures this)
+                    if row_dict['band_name'] not in seen_names:
+                        seen_names.add(row_dict['band_name'])
+                        result.append(row_dict)
+                project_specific = sum(1 for r in result if r.get('project_id') is not None)
+                if project_specific > 0:
+                    print(f"  [RiskConfig] Loaded {len(result)} band configs "
+                          f"({project_specific} project-specific for project {project_id})")
+                else:
+                    print(f"  [RiskConfig] Loaded {len(result)} band configs (global defaults)")
+                return result
+        except Exception as e:
+            print(f"  [RiskConfig] Band config DB read failed, using hardcoded fallback: {e}")
+        return _HARDCODED_BAND_FALLBACK
+
     # ── Utility ─────────────────────────────────────────────────────────────
+
 
     @classmethod
     def classify_severity(cls, score: int, thresholds: list) -> str:
