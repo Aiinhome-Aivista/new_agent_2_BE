@@ -109,6 +109,9 @@ uploaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 processing_progress INT DEFAULT 0,
 processing_step VARCHAR(255) NULL,
 processing_started_at TIMESTAMP NULL,
+input_tokens INT DEFAULT 0,
+output_tokens INT DEFAULT 0,
+total_tokens INT DEFAULT 0,
 
     CONSTRAINT fk_documents_project
         FOREIGN KEY (project_id)
@@ -117,7 +120,10 @@ processing_started_at TIMESTAMP NULL,
 
     CONSTRAINT fk_documents_user
         FOREIGN KEY (uploaded_by)
-        REFERENCES users(id)
+        REFERENCES users(id),
+
+    KEY idx_documents_project (project_id),
+    KEY idx_documents_type (project_id, document_type)
 );
 
 CREATE TABLE master_document_types (
@@ -229,6 +235,18 @@ recurrence_source VARCHAR(50) DEFAULT 'EL',
 parent_scope_item_id BIGINT NULL,
 occurrence_period VARCHAR(20) NULL,
 recurrence_confidence DECIMAL(5,4) NULL,
+recurrence_cadence VARCHAR(20) NULL COMMENT 'monthly, weekly, biweekly, quarterly, annually, daily',
+occurrence_label VARCHAR(50) NULL COMMENT 'Human label for this occurrence: Month 1, Q2, Week 3, etc.',
+estimated_start_date DATE NULL,
+estimated_deadline DATE NULL,
+date_provenance VARCHAR(30) NULL,
+estimation_confidence VARCHAR(20) NULL,
+estimation_basis TEXT NULL,
+plan_assumptions TEXT NULL,
+estimated_effort_low DECIMAL(6,2) NULL,
+estimated_effort_likely DECIMAL(6,2) NULL,
+estimated_effort_high DECIMAL(6,2) NULL,
+baseline_approval_status VARCHAR(20) NULL DEFAULT 'PENDING_REVIEW',
 
     CONSTRAINT fk_scope_item_baseline
         FOREIGN KEY (baseline_id)
@@ -259,47 +277,10 @@ recurrence_confidence DECIMAL(5,4) NULL,
         REFERENCES entity_types(id),
 
     CONSTRAINT uq_recurring_occurrence
-        UNIQUE (parent_scope_item_id, occurrence_period)
-);
+        UNIQUE (parent_scope_item_id, occurrence_period),
 
-CREATE TABLE deliverables (
-id BIGINT PRIMARY KEY AUTO_INCREMENT,
-baseline_id BIGINT NOT NULL,
-project_id BIGINT NOT NULL,
-name VARCHAR(500) NOT NULL,
-description TEXT,
-deadline DATE NULL,
-owner VARCHAR(255),
-delivery_status ENUM(
-'NOT_STARTED',
-'IN_PROGRESS',
-'COMPLETED',
-'BLOCKED',
-'DELAYED',
-'AT_RISK',
-'UNKNOWN'
-) NOT NULL DEFAULT 'NOT_STARTED',
-    progress_percentage DECIMAL(5,2) NULL,
-    last_update_at DATETIME NULL,
-    source_document_id BIGINT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    ON UPDATE CURRENT_TIMESTAMP,
-
-    CONSTRAINT fk_deliverable_baseline
-        FOREIGN KEY (baseline_id)
-        REFERENCES scope_baselines(id)
-        ON DELETE CASCADE,
-
-    CONSTRAINT fk_deliverable_project
-        FOREIGN KEY (project_id)
-        REFERENCES projects(id)
-        ON DELETE CASCADE,
-
-    CONSTRAINT fk_deliverable_document
-        FOREIGN KEY (source_document_id)
-        REFERENCES documents(id)
-        ON DELETE CASCADE
+    KEY idx_scope_items_project (project_id),
+    KEY idx_scope_items_baseline (baseline_id)
 );
 
 CREATE TABLE project_activities (
@@ -407,11 +388,6 @@ ON UPDATE CURRENT_TIMESTAMP,
     CONSTRAINT fk_finding_activity
         FOREIGN KEY (activity_id)
         REFERENCES project_activities(id)
-        ON DELETE SET NULL,
-
-    CONSTRAINT fk_finding_deliverable
-        FOREIGN KEY (deliverable_id)
-        REFERENCES deliverables(id)
         ON DELETE SET NULL
 );
 
@@ -516,21 +492,6 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         ON DELETE CASCADE
 );
 
-CREATE TABLE context_compactions (
-id BIGINT PRIMARY KEY AUTO_INCREMENT,
-project_id BIGINT NOT NULL,
-summary_text LONGTEXT NOT NULL,
-source_event_count INT NOT NULL,
-oldest_event_at DATETIME NULL,
-newest_event_at DATETIME NULL,
-created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    CONSTRAINT fk_compaction_project
-        FOREIGN KEY (project_id)
-        REFERENCES projects(id)
-        ON DELETE CASCADE
-);
-
 CREATE TABLE audit_logs (
 id BIGINT PRIMARY KEY AUTO_INCREMENT,
 project_id BIGINT NULL,
@@ -600,8 +561,8 @@ CREATE TABLE deliverable_progress (
     project_id BIGINT NOT NULL,
     scope_item_id BIGINT NOT NULL,
     source_document_id BIGINT NULL,
-    risk_evaluation_id BIGINT NOT NULL,
-    baseline_version INT NOT NULL,
+    risk_evaluation_id BIGINT NULL,
+    baseline_version INT NOT NULL DEFAULT 1,
     status_code VARCHAR(50) NOT NULL,
     progress_percentage INT NULL,
     progress_source VARCHAR(50) NOT NULL DEFAULT 'DOCUMENT',
@@ -625,7 +586,6 @@ CREATE INDEX idx_documents_project ON documents(project_id);
 CREATE INDEX idx_documents_type ON documents(project_id, document_type);
 CREATE INDEX idx_scope_items_project ON scope_items(project_id);
 CREATE INDEX idx_scope_items_baseline ON scope_items(baseline_id);
-CREATE INDEX idx_deliverables_project ON deliverables(project_id);
 CREATE INDEX idx_activities_project ON project_activities(project_id);
 CREATE INDEX idx_findings_project ON risk_findings(project_id);
 CREATE INDEX idx_findings_classification ON risk_findings(project_id, classification);
@@ -635,29 +595,12 @@ CREATE INDEX idx_workflow_project ON workflow_runs(project_id);
 CREATE INDEX idx_episodic_project ON episodic_memory(project_id, created_at);
 CREATE INDEX idx_audit_project ON audit_logs(project_id, created_at);
 
-CREATE TABLE `action_items` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `project_id` bigint NOT NULL,
-  `document_id` bigint DEFAULT NULL,
-  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `owner` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `due_date` date DEFAULT NULL,
-  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
-  `metadata` json DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  `resolved_at` timestamp NULL DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uuid` (`uuid`)
-) ENGINE=InnoDB AUTO_INCREMENT=19 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
 CREATE TABLE `alert_rule_config` (
   `severity` varchar(20) NOT NULL,
   `send_email` tinyint(1) NOT NULL DEFAULT '0',
   `min_score_threshold` int NOT NULL DEFAULT '70',
   PRIMARY KEY (`severity`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
-
 
 CREATE TABLE `category_assignment_rules` (
   `id` int NOT NULL AUTO_INCREMENT,
@@ -668,47 +611,6 @@ CREATE TABLE `category_assignment_rules` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB AUTO_INCREMENT=13 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
-CREATE TABLE `change_requests` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `project_id` bigint NOT NULL,
-  `document_id` bigint DEFAULT NULL,
-  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
-  `metadata` json DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  `resolved_at` timestamp NULL DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uuid` (`uuid`)
-) ENGINE=InnoDB AUTO_INCREMENT=9 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE `dependencies` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `project_id` bigint NOT NULL,
-  `document_id` bigint DEFAULT NULL,
-  `name` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `owner` varchar(255) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
-  `metadata` json DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  `resolved_at` timestamp NULL DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uuid` (`uuid`)
-) ENGINE=InnoDB AUTO_INCREMENT=5 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE `entity_history` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `entity_uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `project_id` bigint NOT NULL,
-  `document_id` bigint DEFAULT NULL,
-  `action` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `previous_status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `new_status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT NULL,
-  `changes` json DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  PRIMARY KEY (`id`)
-) ENGINE=InnoDB AUTO_INCREMENT=76 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `entity_links` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -752,19 +654,6 @@ CREATE TABLE `impact_matrix` (
   PRIMARY KEY (`impact_level`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
-CREATE TABLE `issues` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `project_id` bigint NOT NULL,
-  `document_id` bigint DEFAULT NULL,
-  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
-  `metadata` json DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  `resolved_at` timestamp NULL DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uuid` (`uuid`)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `milestone_dependencies` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -790,19 +679,6 @@ CREATE TABLE `milestone_type_config` (
   UNIQUE KEY `code` (`code`)
 ) ENGINE=InnoDB AUTO_INCREMENT=4 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
-CREATE TABLE `milestones` (
-  `id` bigint NOT NULL AUTO_INCREMENT,
-  `uuid` varchar(36) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `project_id` bigint NOT NULL,
-  `document_id` bigint DEFAULT NULL,
-  `title` varchar(500) COLLATE utf8mb4_unicode_ci NOT NULL,
-  `status` varchar(50) COLLATE utf8mb4_unicode_ci DEFAULT 'OPEN',
-  `metadata` json DEFAULT NULL,
-  `created_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP,
-  `resolved_at` timestamp NULL DEFAULT NULL,
-  PRIMARY KEY (`id`),
-  UNIQUE KEY `uuid` (`uuid`)
-) ENGINE=InnoDB AUTO_INCREMENT=15 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE `project_milestones` (
   `id` bigint NOT NULL AUTO_INCREMENT,
@@ -935,6 +811,24 @@ CREATE TABLE `tracker_items` (
   PRIMARY KEY (`id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+CREATE TABLE `execution_priority_band_config` (
+  `band_id` int NOT NULL AUTO_INCREMENT,
+  `band_name` varchar(50) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `graph_role` varchar(40) COLLATE utf8mb4_unicode_ci NOT NULL,
+  `cascade_min` int DEFAULT NULL COMMENT 'NULL = any cascade count',
+  `cascade_max` int DEFAULT NULL COMMENT 'NULL = any cascade count',
+  `score_min` int NOT NULL,
+  `score_max` int NOT NULL,
+  `schedule_urgency_weight` float NOT NULL DEFAULT '0',
+  `status_weight` float NOT NULL DEFAULT '0',
+  `is_active` tinyint NOT NULL DEFAULT '1',
+  `project_id` int DEFAULT NULL COMMENT 'NULL = global default; set for project override',
+  PRIMARY KEY (`band_id`),
+  UNIQUE KEY `uq_band_project` (`band_name`,`project_id`),
+  KEY `idx_graph_role` (`graph_role`),
+  KEY `idx_project_id` (`project_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 CREATE TABLE `drive_accounts` (
   `id` int NOT NULL AUTO_INCREMENT,
   `label` varchar(255) NOT NULL,
@@ -964,6 +858,42 @@ CREATE TABLE `drive_inbox` (
   UNIQUE KEY `uq_drive_file` (`drive_file_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
 
+CREATE TABLE `onedrive_accounts` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `label` varchar(255) NOT NULL,
+  `tenant_id` varchar(255) NOT NULL,
+  `client_id` varchar(255) NOT NULL,
+  `client_secret_enc` text NOT NULL,
+  `drive_type` enum('USER_DRIVE','SHAREPOINT_DRIVE') DEFAULT 'USER_DRIVE',
+  `target_user_email` varchar(255) DEFAULT NULL,
+  `target_drive_id` varchar(255) DEFAULT NULL,
+  `folder_id` varchar(512) DEFAULT 'root',
+  `added_by` int NOT NULL,
+  `is_active` tinyint(1) DEFAULT '1',
+  `last_synced_at` datetime DEFAULT NULL,
+  `created_at` datetime DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+CREATE TABLE `onedrive_inbox` (
+  `id` int NOT NULL AUTO_INCREMENT,
+  `onedrive_account_id` int NOT NULL,
+  `onedrive_file_id` varchar(512) NOT NULL,
+  `filename` varchar(512) NOT NULL,
+  `mime_type` varchar(255) DEFAULT NULL,
+  `web_url` varchar(1024) DEFAULT NULL,
+  `matched_project_id` int DEFAULT NULL,
+  `doc_type` varchar(50) DEFAULT 'MOM',
+  `status` enum('PENDING','ASSIGNED','PROCESSING','DONE','SKIPPED') DEFAULT 'PENDING',
+  `fetched_at` datetime DEFAULT CURRENT_TIMESTAMP,
+  `processed_at` datetime DEFAULT NULL,
+  `file_path` varchar(1024) DEFAULT NULL,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_onedrive_file` (`onedrive_file_id`),
+  KEY `fk_onedrive_account` (`onedrive_account_id`),
+  CONSTRAINT `fk_onedrive_account` FOREIGN KEY (`onedrive_account_id`) REFERENCES `onedrive_accounts` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
 DELIMITER //
 
 CREATE PROCEDURE truncate_all_tables_except_users_and_master()
@@ -972,21 +902,28 @@ BEGIN
 
     TRUNCATE TABLE alerts;
     TRUNCATE TABLE audit_logs;
-    TRUNCATE TABLE context_compactions;
     TRUNCATE TABLE deliverable_progress;
-    TRUNCATE TABLE deliverables;
     TRUNCATE TABLE document_types;
     TRUNCATE TABLE documents;
     TRUNCATE TABLE drive_inbox;
+    TRUNCATE TABLE entity_links;
+    TRUNCATE TABLE entity_registry;
     TRUNCATE TABLE episodic_memory;
     TRUNCATE TABLE finding_evidence;
+    TRUNCATE TABLE milestone_dependencies;
     TRUNCATE TABLE new_requests;
+    TRUNCATE TABLE onedrive_inbox;
     TRUNCATE TABLE project_activities;
+    TRUNCATE TABLE project_milestones;
     TRUNCATE TABLE project_users;
     TRUNCATE TABLE projects;
+    TRUNCATE TABLE rag_chat_messages;
+    TRUNCATE TABLE rag_chat_sessions;
+    TRUNCATE TABLE risk_evaluations;
     TRUNCATE TABLE risk_findings;
     TRUNCATE TABLE scope_baselines;
     TRUNCATE TABLE scope_items;
+    TRUNCATE TABLE scope_milestone_mapping;
     TRUNCATE TABLE stakeholders;
     TRUNCATE TABLE tracker_items;
     TRUNCATE TABLE workflow_runs;

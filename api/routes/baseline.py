@@ -37,6 +37,7 @@ from services.milestone_dependency_extractor import MilestoneDependencyExtractor
 from services.milestone_dependency_service import MilestoneDependencyService
 from services.recurring_deliverable_service import RecurringDeliverableService
 from services.rag_service import RAGService
+from services.baseline_logger import BaselineLogger
 
 # pyrefly: ignore [missing-import]
 import mysql.connector
@@ -48,6 +49,7 @@ import threading
 import uuid
 import tempfile
 from services.storage_service import StorageService
+from services.project_planning_service import ProjectPlanningService
 
 router = APIRouter()
 
@@ -92,11 +94,13 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
     # Establish a fresh connection for the thread
     thread_conn = get_db_connection()
     if not thread_conn:
-        print("!!! Background baseline pipeline failed to connect !!!")
+        print("!!! Background baseline pipeline failed to connect to database !!!")
         return
-        
+
+    logger = BaselineLogger(project_id, document_id)
+
     def emit(step: str, progress: int):
-        print(f"DEBUG: Starting emit for {step}")
+        logger.log(f"[PROGRESS {progress}%] {step}")
         try:
             upd_cursor = thread_conn.cursor()
             upd_cursor.execute(
@@ -105,9 +109,8 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             )
             thread_conn.commit()
             upd_cursor.close()
-            print(f"DEBUG: Successfully emitted {step}")
         except Exception as ex:
-            print(f"Failed to update baseline progress in DB for {step}: {ex}")
+            logger.log(f"Failed to update baseline progress in DB for {step}: {ex}", level="WARN")
 
     t_start = time.time()
     try:
@@ -119,59 +122,115 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         )
         thread_conn.commit()
         upd.close()
-        
+
         doc = BaselineRepository.get_document(thread_conn, document_id, project_id)
         if not doc:
             raise RuntimeError("Document not found")
 
-        print("\n" + "="*70)
-        print(f">> [BASELINE EXTRACTION PIPELINE] Starting Scope Extraction")
-        print(f"   Project ID: {project_id} | Document ID: {document_id}")
-        print(f"   Document: {doc.get('document_name', doc.get('storage_key', 'Unknown'))} ({doc.get('document_type', 'EL')})")
-        print(f"   Extraction Mode: {mode}")
-        print("="*70)
+        doc_name = doc.get('document_name', doc.get('storage_key', 'Unknown'))
+        doc_type = doc.get('document_type', 'EL')
+        storage_key = doc.get('storage_key', 'Unknown')
+        log_paths = logger.get_log_paths()
+
+        logger.banner(">> [BASELINE EXTRACTION PIPELINE] Starting Scope Extraction")
+        logger.input("Project ID", project_id)
+        logger.input("Document ID", document_id)
+        logger.input("Document Name", doc_name)
+        logger.input("Document Type", doc_type)
+        logger.input("Extraction Mode", mode)
+        logger.input("Storage Key", storage_key)
+        logger.log(f"Log File (Cumulative): {log_paths['unified_log']}")
+        logger.log(f"Log File (Run Specific): {log_paths['run_log']}")
 
         # Automatic VectorDB version control: remove vector chunks of any
-        # previous, superseded EL/IFA documents for this project. This keeps RAG
-        # answers consistent for BOTH modes, and additionally ensures the Deep
-        # Scan heatmap only sees the current document's chunks.
+        # previous, superseded EL/IFA documents for this project.
+        logger.process("Purging VectorDB chunks of superseded EL/IFA documents for this project...")
         _supersede_previous_vector_versions(thread_conn, project_id, document_id)
 
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
-        
+
+        # ── Step 1: Document Parsing & Text Extraction ──
+        t_step1 = time.time()
+        logger.step_start(1, "Document Parsing & Text Extraction")
+        logger.input("Storage Key", doc["storage_key"])
+        logger.input("Target Extension", ext)
+        logger.process("Downloading file from storage to temporary workspace...")
         try:
             StorageService.download_to_temp_file(doc["storage_key"], temp_path)
+            file_size_kb = os.path.getsize(temp_path) / 1024 if os.path.exists(temp_path) else 0
+            logger.input("Downloaded File Size", f"{file_size_kb:.1f} KB")
+            logger.process("Running MarkItDown / Docling parser and header-aware chunk splitter...")
             chunks = DocumentService.parse_document(temp_path, ext)
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
-        
-        # Pipeline Step 1: Detect Sections
-        t_step1 = time.time()
-        emit("Detecting Scope Sections", 15)
-        chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
         step1_time = time.time() - t_step1
+        total_chars = sum(len(c.get("text", "")) for c in chunks)
+        logger.output("Total Chunks Created", len(chunks))
+        logger.output("Total Characters Extracted", total_chars)
+        if chunks:
+            sample_preview = chunks[0].get("text", "")[:120].replace("\n", " ")
+            logger.output("Chunk 0 Sample", f'"{sample_preview}..."')
+
+        # ── Terminal Log: First 20 Raw Chunks (Step 1) ──
+        preview_count_s1 = min(20, len(chunks))
+        logger.raw_log(f"\n    >> [Step 1: First {preview_count_s1} of {len(chunks)} Raw Extracted Chunks] <<")
+        for i in range(preview_count_s1):
+            c = chunks[i]
+            c_idx = c.get("chunk_index", i)
+            c_page = c.get("page_number")
+            page_info = f"page={c_page}" if c_page is not None else "page=N/A"
+            c_text = (c.get("text") or "").strip()
+            c_len = len(c_text)
+            snippet = c_text[:160].replace("\r", " ").replace("\n", " ").strip()
+            logger.raw_log(f"    [Chunk {i+1:02d}/20] chunk_index={c_idx} | {page_info} | length={c_len} chars")
+            logger.raw_log(f"      Text: \"{snippet}...\"")
+        logger.raw_log("")
+        logger.step_end(1, "Document Parsing & Text Extraction", step1_time)
+
+        # ── Step 2: Scope Section Detection ──
+        t_step2 = time.time()
+        emit("Detecting Scope Sections", 15)
+        logger.step_start(2, "Scope Section Detection")
+        logger.input("Input Chunks Count", len(chunks))
+        logger.process("Executing deterministic regex matching on chunk headings and body text...")
+        chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
+        step2_time = time.time() - t_step2
 
         sec_counts = {}
         for c in chunks_with_sections:
             sec = c.get("section", "General")
             sec_counts[sec] = sec_counts.get(sec, 0) + 1
 
-        print("\n" + "-"*70)
-        print(f"[*] STEP 1: Document Parsing & Scope Section Detection (took {step1_time:.2f}s)")
-        print(f"   Total Chunks Parsed: {len(chunks)} | Scope Sections Identified: {len(sec_counts)}")
+        logger.output("Total Sectioned Chunks", len(chunks_with_sections))
+        logger.output("Distinct Sections Found", len(sec_counts))
         for sec, cnt in sorted(sec_counts.items(), key=lambda x: x[1], reverse=True):
-            print(f"   - {sec}: {cnt} chunk(s)")
+            logger.raw_log(f"    - Section '{sec}': {cnt} chunk(s)")
 
-        # Pipeline Step 2: Extract Candidates
-        # Branch on the selected extraction mode. Both branches MUST return
-        # candidates in the same dictionary shape so the rest of the pipeline
-        # (classification -> dedup -> milestones -> saving) is mode-agnostic.
-        t_step2 = time.time()
+        # ── Terminal Log: First 20 Section-Tagged Chunks (Step 2) ──
+        preview_count_s2 = min(20, len(chunks_with_sections))
+        logger.raw_log(f"\n    >> [Step 2: First {preview_count_s2} of {len(chunks_with_sections)} Section-Tagged Chunks] <<")
+        for i in range(preview_count_s2):
+            c = chunks_with_sections[i]
+            c_idx = c.get("chunk_index", i)
+            sec_name = c.get("section", "General")
+            c_text = (c.get("text") or "").strip()
+            c_len = len(c_text)
+            snippet = c_text[:160].replace("\r", " ").replace("\n", " ").strip()
+            logger.raw_log(f"    [ScopeSection] chunk_index={c_idx} belongs to Section: '{sec_name}' | length={c_len} chars")
+            logger.raw_log(f"      Text: \"{snippet}...\"")
+        logger.raw_log("")
+        logger.step_end(2, "Scope Section Detection", step2_time)
+
+        # ── Step 3: Candidate Scope Extraction ──
+        t_step3 = time.time()
         emit("Extracting Scope Candidates", 30)
+        logger.step_start(3, "Candidate Scope Extraction")
+        logger.input("Sectioned Chunks Count", len(chunks_with_sections))
+        logger.input("Extraction Mode", mode)
         if mode == DEEP_SCAN:
-            print("[Baseline] Using DEEP_SCAN (Map-Reduce + Heatmap) extraction mode.")
+            logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap) candidate extractor...")
             from services.deep_scan_extractor import DeepScanExtractor
             raw_candidates = DeepScanExtractor.extract_candidates(
                 project_id=project_id,
@@ -179,60 +238,61 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 document_type=doc.get("document_type", "EL"),
                 parsed_chunks=chunks,
                 sectioned_chunks=chunks_with_sections,
+                logger=logger,
             )
         else:
-            print("[Baseline] Using QUICK extraction mode.")
+            logger.process("Running QUICK deterministic extractor (bullets, numbered lists, table rows, clauses)...")
             raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
-        step2_time = time.time() - t_step2
-
-        print("\n" + "-"*70)
-        print(f"[*] STEP 2: Candidate Scope Extraction (took {step2_time:.2f}s)")
-        print(f"   Extraction Mode: {mode} | Total Candidates Extracted: {len(raw_candidates)}")
-        for idx, cand in enumerate(raw_candidates[:8], 1):
-            print(f"   [{idx:02d}] {cand.get('name', '')} (Section: {cand.get('section', 'General')})")
-        if len(raw_candidates) > 8:
-            print(f"   ... and {len(raw_candidates) - 8} more candidates")
-        
-        # Pipeline Step 3: Classification
-        t_step3 = time.time()
-        emit("Classifying Scope Items", 50)
-        classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
         step3_time = time.time() - t_step3
+
+        logger.output("Raw Candidates Extracted", len(raw_candidates))
+        for idx, cand in enumerate(raw_candidates, 1):
+            logger.item(idx, cand.get('name', ''), {"Section": cand.get('section', 'General'), "Type": "Pure Milestone" if cand.get("is_pure_milestone") else "Clause"})
+        logger.step_end(3, "Candidate Scope Extraction", step3_time)
+
+        # ── Step 4: Candidate Scope Classification ──
+        t_step4 = time.time()
+        emit("Classifying Scope Items", 50)
+        logger.step_start(4, "Candidate Scope Classification")
+        logger.input("Raw Candidates Count", len(raw_candidates))
+        logger.process("Applying deterministic section heading pre-filter (confidence=1.0) and LLM batch classifier...")
+        classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
+        step4_time = time.time() - t_step4
 
         class_counts = {}
         for c in classified_candidates:
             st = c.get("scope_type", "UNCERTAIN")
             class_counts[st] = class_counts.get(st, 0) + 1
 
-        print("\n" + "-"*70)
-        print(f"[*] STEP 3: Candidate Scope Classification (took {step3_time:.2f}s)")
-        print(f"   Total Classified: {len(classified_candidates)} | Breakdown: {class_counts}")
-        for stype in ["IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"]:
-            items_of_type = [c for c in classified_candidates if c.get("scope_type") == stype]
-            if items_of_type:
-                print(f"   > {stype} ({len(items_of_type)} items):")
-                for c in items_of_type[:5]:
-                    conf_pct = int((c.get("confidence") or 0.5) * 100)
-                    print(f"     * {c.get('name', '')} (Conf: {conf_pct}%)")
-                if len(items_of_type) > 5:
-                    print(f"     ... and {len(items_of_type)-5} more")
-            
-        # Pipeline Step 4: Fuzzy Deduplication
-        t_step4 = time.time()
+        logger.output("Classified Items Breakdown", class_counts)
+        for idx, c in enumerate(classified_candidates, 1):
+            conf_pct = int((c.get("confidence") or 0.5) * 100)
+            ev = (c.get("evidence_text") or "")[:80].replace("\n", " ")
+            logger.item(idx, c.get('name', ''), {"Class": c.get("scope_type"), "Conf": f"{conf_pct}%", "Evidence": f'"{ev}..."' if ev else "None"})
+        logger.step_end(4, "Candidate Scope Classification", step4_time)
+
+        # ── Step 5: Fuzzy Deduplication & Scope Consolidation ──
+        t_step5 = time.time()
         emit("Deduplicating Candidates", 70)
+        logger.step_start(5, "Fuzzy Deduplication & Scope Consolidation")
+        logger.input("Candidates Before Dedup", len(classified_candidates))
+        logger.process("Applying difflib SequenceMatcher fuzzy consolidation (threshold=0.80)...")
         deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
-        step4_time = time.time() - t_step4
+        step5_time = time.time() - t_step5
 
         merged_count = len(classified_candidates) - len(deduped_candidates)
-        print("\n" + "-"*70)
-        print(f"[*] STEP 4: Fuzzy Deduplication & Scope Consolidation (took {step4_time:.2f}s)")
-        print(f"   Before: {len(classified_candidates)} items -> After: {len(deduped_candidates)} items (Merged/Consolidated: {merged_count})")
-        
-        # Pipeline Step 5: Milestone & Deadline Extraction
-        t_step5 = time.time()
-        emit("Extracting Milestones & Deadlines", 85)
+        logger.output("Consolidated Candidates Count", len(deduped_candidates))
+        logger.output("Duplicate Items Merged", merged_count)
+        for idx, c in enumerate(deduped_candidates, 1):
+            logger.item(idx, c.get('name', ''), {"Class": c.get("scope_type"), "Section": c.get("section")})
+        logger.step_end(5, "Fuzzy Deduplication & Scope Consolidation", step5_time)
 
-        # B4 FIX: Fetch project start date for relative week deadline resolution (e.g. "Weeks 1–4")
+        # ── Step 6: Milestone & Deadline Extraction ──
+        t_step6 = time.time()
+        emit("Extracting Milestones & Deadlines", 85)
+        logger.step_start(6, "Milestone & Deadline Extraction")
+        logger.input("Input Candidates Count", len(deduped_candidates))
+
         proj_start_date = None
         try:
             from datetime import datetime as dt_cls, date as d_cls
@@ -249,72 +309,75 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 elif isinstance(sd, str):
                     proj_start_date = dt_cls.strptime(sd[:10], "%Y-%m-%d").date()
         except Exception as e:
-            print(f"[Baseline] Could not fetch project start date for relative deadlines: {e}")
+            logger.log(f"Could not fetch project start date for relative deadlines: {e}", level="WARN")
 
+        logger.input("Project Start Date", str(proj_start_date or 'None'))
+        logger.process("Matching absolute dates and calculating relative week intervals (Weeks 1-N)...")
         enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates, project_start=proj_start_date)
-        step5_time = time.time() - t_step5
+        step6_time = time.time() - t_step6
 
         timeline_items = [c for c in enriched_candidates if c.get("milestone") or c.get("deadline_text") or c.get("deadline")]
-        print("\n" + "-"*70)
-        print(f"[*] STEP 5: Milestone & Deadline Extraction (took {step5_time:.2f}s)")
-        print(f"   Total Candidates Enriched: {len(enriched_candidates)} | Items with Timeline/Date: {len(timeline_items)}")
-        for c in timeline_items[:6]:
-            d_val = c.get("deadline_text") or c.get("deadline") or "N/A"
+        logger.output("Candidates Enriched", len(enriched_candidates))
+        logger.output("Items with Timeline / Deadline", len(timeline_items))
+        for idx, c in enumerate(timeline_items, 1):
+            d_text = c.get("deadline_text") or "N/A"
+            d_norm = c.get("deadline") or "N/A"
             m_val = c.get("milestone") or c.get("name")
-            print(f"   * {m_val} -> Deadline: {d_val} (via {c.get('extraction_method', 'N/A')})")
-        if len(timeline_items) > 6:
-            print(f"   ... and {len(timeline_items)-6} more with timeline info")
-        
-        # Pipeline Step 6: Normalization and Diffing/Saving
-        t_step6 = time.time()
+            method = c.get("extraction_method", "N/A")
+            logger.item(idx, m_val, {"Raw Date": d_text, "Normalized ISO": d_norm, "Method": method})
+        logger.step_end(6, "Milestone & Deadline Extraction", step6_time)
+
+        # ── Step 7: Title Normalization & Scope Items DB Persistence ──
+        t_step7 = time.time()
         emit("Saving Baseline Draft", 95)
+        logger.step_start(7, "Title Normalization & Scope Items DB Persistence")
+        logger.input("Enriched Candidates Count", len(enriched_candidates))
+        logger.process("Normalizing deliverables and milestones to remove contractual verbs...")
         for item in enriched_candidates:
             item["scope_item_normalized"] = NormalizationService.normalize_scope_item(item.get("name"))
             item["milestone_normalized"] = NormalizationService.normalize_milestone(item.get("milestone"), item.get("scope_item_normalized"))
             item["deadline_original"] = item.get("deadline_text")
             item["deadline_normalized"] = item.get("deadline")
-            
+
         extracted_data = {
             "scope_items": enriched_candidates,
             "deliverables": [],
             "stakeholders": []
         }
-        
+
         existing_draft = BaselineRepository.get_draft_baseline(thread_conn, project_id)
         latest_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id)
 
         if existing_draft:
             baseline_id = existing_draft["id"]
+            logger.process(f"Updating existing draft baseline #{baseline_id}...")
             BaselineRepository.update_baseline_source_document(thread_conn, baseline_id, document_id)
             BaselineRepository.delete_scope_items_by_baseline(thread_conn, baseline_id)
-            BaselineRepository.delete_deliverables_by_baseline(thread_conn, baseline_id)
             BaselineRepository.delete_stakeholders_by_project(thread_conn, project_id)
             if latest_approved:
                 app_baseline_id = latest_approved["id"]
                 BaselineRepository.copy_scope_items(thread_conn, app_baseline_id, baseline_id)
-                BaselineRepository.copy_deliverables(thread_conn, app_baseline_id, baseline_id)
         else:
             max_v = BaselineRepository.get_max_baseline_version(thread_conn, project_id)
             next_version = max_v + 1
+            logger.process(f"Creating new draft baseline version {next_version}...")
             baseline_id = BaselineRepository.create_baseline(thread_conn, project_id, next_version, document_id)
             if latest_approved:
                 app_baseline_id = latest_approved["id"]
                 BaselineRepository.copy_scope_items(thread_conn, app_baseline_id, baseline_id)
-                BaselineRepository.copy_deliverables(thread_conn, app_baseline_id, baseline_id)
             BaselineRepository.delete_stakeholders_by_project(thread_conn, project_id)
-            
+
         has_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id) is not None
         existing_scope_items = BaselineRepository.get_scope_items_for_diff(thread_conn, baseline_id)
-        
+
+        saved_scope_count = 0
         for item in extracted_data.get("scope_items", []):
             item_name = item.get("name", "Unknown")
             item_type = item.get("scope_type", "UNCERTAIN")
-            
             item_category = item.get("category")
             if item.get("is_pure_milestone", False):
                 item_type = "IN_SCOPE"
                 item_category = "MILESTONE"
-            
             if not item_category:
                 item_category = "FUNCTIONAL"
 
@@ -326,7 +389,6 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 completion_status = "CANCELLED"
 
             existing_item, best_ratio = find_best_match(item_name, existing_scope_items, key="name", threshold=0.8)
-            
             if existing_item:
                 tags = []
                 old_type = existing_item["scope_type"]
@@ -375,8 +437,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                     category=item_category,
                     completion_status=completion_status
                 )
-                item_id = existing_item["id"]
-                item["_db_id"] = item_id
+                item["_db_id"] = existing_item["id"]
             else:
                 item_id = BaselineRepository.insert_scope_item_extracted(
                     db=thread_conn,
@@ -403,19 +464,22 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                     completion_status=completion_status
                 )
                 item["_db_id"] = item_id
-        
-        # Commit DB changes to release any locks on `documents` table 
-        # so `emit` (which gets a new connection) does not deadlock.
+            saved_scope_count += 1
+
         thread_conn.commit()
-        
-        # Process Milestones & Dependencies
+        step7_time = time.time() - t_step7
+        logger.output("Draft Baseline ID", baseline_id)
+        logger.output("Total Scope Items Stored in DB", saved_scope_count)
+        logger.step_end(7, "Title Normalization & Scope Items DB Persistence", step7_time)
+
+        # ── Step 8: Project Milestones & DAG Dependency Building ──
+        t_step8 = time.time()
         emit("Building Milestone Dependencies", 97)
-        # Clear existing draft milestones/mappings/dependencies (if any)
+        logger.step_start(8, "Project Milestones & DAG Dependency Building")
         cursor = thread_conn.cursor()
         cursor.execute("DELETE FROM project_milestones WHERE project_id = %s AND baseline_id = %s", (project_id, baseline_id))
-        
-        # 1. Extract distinct milestones
-        milestone_dict = {} # normalized_name -> dict
+
+        milestone_dict = {}
         for item in extracted_data.get("scope_items", []):
             m_norm = item.get("milestone_normalized")
             m_orig = item.get("milestone")
@@ -429,14 +493,12 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                     }
                 if item.get("_db_id"):
                     milestone_dict[m_norm]["scope_item_ids"].append(item["_db_id"])
-                    
-        # 2. Sort milestones chronologically and insert into project_milestones
+
         def get_date_val(item):
             d = item[1].get("planned_date")
             return d if d else "9999-12-31"
-            
+
         sorted_milestones = sorted(milestone_dict.items(), key=get_date_val)
-        
         seq = 1
         name_to_id = {}
         for m_norm, m_data in sorted_milestones:
@@ -447,45 +509,60 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             seq += 1
             for scope_id in m_data["scope_item_ids"]:
                 BaselineRepository.create_scope_milestone_mapping(thread_conn, scope_id, m_id)
-                
-        # 3. Extract dependencies
+
+        logger.input("Distinct Milestones Identified", len(milestone_dict))
+        for s_idx, (m_norm, m_data) in enumerate(sorted_milestones, 1):
+            logger.item(s_idx, m_data["name"], {"Seq": s_idx, "Planned Date": m_data["planned_date"] or "TBD", "Status": m_data["status"]})
+
+        logger.process("Running LLM dependency extractor across milestone deliverables...")
         extracted_deps = MilestoneDependencyExtractor.extract_dependencies(extracted_data.get("scope_items", []), doc["document_text"] if "document_text" in doc else "")
-        
+
         edges = []
         for dep in extracted_deps:
             parent_name = NormalizationService.normalize_milestone(dep["parent_milestone"], None)
             child_name = NormalizationService.normalize_milestone(dep["child_milestone"], None)
             if parent_name in name_to_id and child_name in name_to_id:
                 edges.append((name_to_id[parent_name], name_to_id[child_name]))
-                
-        # 4. Validate DAG
+
+        logger.process(f"Validating DAG acyclicity for {len(edges)} dependency edge(s)...")
         dag_valid = True
         try:
             if edges:
                 MilestoneDependencyService.validate_dag(edges)
         except ValueError:
             dag_valid = False
-            
+
         if dag_valid and edges:
+            logger.output("DAG Validation", "PASSED (No cyclic loops detected)")
             for p, c in edges:
                 cursor.execute(
                     "INSERT INTO milestone_dependencies (project_id, parent_milestone_id, child_milestone_id, dependency_type) VALUES (%s, %s, %s, 'FINISH_TO_START')",
                     (project_id, p, c)
                 )
+                logger.raw_log(f"    - Edge: Milestone ID {p} -> Milestone ID {c} (FINISH_TO_START)")
         else:
-            # FALLBACK: If LLM failed to extract a valid DAG, use sequential dependencies
+            if not edges:
+                logger.output("DAG Extraction", "No explicit dependency pairs extracted by LLM. Generating sequential fallback...")
+            else:
+                logger.output("DAG Validation", "FAILED (Circular loop detected). Generating sequential fallback...")
             MilestoneDependencyService.generate_sequential_dependencies(cursor, project_id)
+            logger.output("Sequential Fallback", "Applied successfully")
         cursor.close()
-        
-        # ── Step 6.5: Detect and expand recurring commitments ──
+        step8_time = time.time() - t_step8
+        logger.step_end(8, "Project Milestones & DAG Dependency Building", step8_time)
+
+        # ── Step 9: Recurring Commitments Detection & Expansion ──
+        t_step9 = time.time()
         emit("Detecting Recurring Commitments", 97)
+        logger.step_start(9, "Recurring Commitments Detection")
         try:
-            # Fetch the project record to get start/end dates
             proj_cursor = thread_conn.cursor(dictionary=True)
             proj_cursor.execute("SELECT id, start_date, end_date FROM projects WHERE id = %s", (project_id,))
             project_record = proj_cursor.fetchone() or {}
             proj_cursor.close()
 
+            logger.input("Project Schedule Window", f"Start: {project_record.get('start_date')} | End: {project_record.get('end_date')}")
+            logger.process("Scanning scope items for periodic recurrence keywords (monthly, quarterly, weekly)...")
             RecurringDeliverableService.process_recurring_commitments(
                 db=thread_conn,
                 baseline_id=baseline_id,
@@ -493,40 +570,15 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 scope_items=extracted_data.get("scope_items", []),
                 project=project_record,
             )
+            logger.output("Recurring Deliverables Check", "Completed successfully")
         except Exception as rec_err:
             import traceback
-            print(f"[Recurring] Non-fatal error during recurring commitment processing: {rec_err}")
+            logger.log(f"Non-fatal error during recurring commitment processing: {rec_err}", level="WARN")
             traceback.print_exc()
+        step9_time = time.time() - t_step9
+        logger.step_end(9, "Recurring Commitments Detection", step9_time)
 
-        # UPSERT deliverables
-        existing_deliverables = BaselineRepository.get_deliverables_for_diff(thread_conn, baseline_id)
-        for item in extracted_data.get("deliverables", []):
-            item_name = item.get("name", "Unknown")
-            deadline = item.get("deadline") if item.get("deadline") else None
-            
-            existing_deliv, best_ratio = find_best_match(item_name, existing_deliverables, key="name", threshold=0.8)
-            
-            if existing_deliv:
-                BaselineRepository.update_deliverable(
-                    db=thread_conn,
-                    item_id=existing_deliv["id"],
-                    description=item.get("description", ""),
-                    deadline=deadline,
-                    owner=item.get("owner"),
-                    source_document_id=document_id
-                )
-            else:
-                BaselineRepository.insert_deliverable(
-                    db=thread_conn,
-                    baseline_id=baseline_id,
-                    project_id=project_id,
-                    name=item_name,
-                    description=item.get("description", ""),
-                    deadline=deadline,
-                    owner=item.get("owner"),
-                    source_document_id=document_id
-                )
-                
+
         # Insert stakeholders
         for stakeholder in extracted_data.get("stakeholders", []):
             BaselineRepository.insert_stakeholder(
@@ -537,47 +589,178 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 role=stakeholder.get("role"),
                 responsibility=stakeholder.get("responsibility")
             )
-            
+
+        # ── Step 9.5: Project Planning & Schedule Estimation (NEW) ──
+        t_step_plan = time.time()
+        emit("Project Planning & Schedule Estimation", 98)
+        logger.step_start(10, "Project Planning & Schedule Estimation")
+        planning_conflicts = []
+        planning_summary = {}
+        try:
+            from datetime import datetime as dt_cls, date as d_cls
+            import json as _json
+
+            # Fetch project dates for planning
+            plan_cursor = thread_conn.cursor(dictionary=True)
+            plan_cursor.execute("SELECT start_date, end_date FROM projects WHERE id = %s", (project_id,))
+            proj_row = plan_cursor.fetchone() or {}
+            plan_cursor.close()
+
+            def _to_date(v):
+                if v is None:
+                    return None
+                if hasattr(v, 'date'):
+                    return v.date()
+                if isinstance(v, d_cls):
+                    return v
+                try:
+                    return dt_cls.strptime(str(v)[:10], "%Y-%m-%d").date()
+                except Exception:
+                    return None
+
+            plan_start = _to_date(proj_row.get("start_date"))
+            plan_end = _to_date(proj_row.get("end_date"))
+
+            # Build explicit milestones list for the conflict detector
+            explicit_milestones = [
+                {
+                    "name": m_data["name"],
+                    "date": m_data.get("planned_date"),
+                    "type": "MILESTONE",
+                }
+                for _, m_data in sorted_milestones
+                if m_data.get("planned_date")
+            ]
+
+            logger.input("Plan Start Date", str(plan_start or 'None (will use today)'))
+            logger.input("Plan End Date", str(plan_end or 'None'))
+            logger.input("Explicit Milestones for Conflict Check", len(explicit_milestones))
+            logger.input("IN_SCOPE Items to Estimate", sum(
+                1 for i in extracted_data.get("scope_items", []) if i.get("scope_type") == "IN_SCOPE"
+            ))
+            logger.process("Running ProjectPlanningService.plan_baseline()...")
+
+            planning_result = ProjectPlanningService.plan_baseline(
+                scope_items=extracted_data.get("scope_items", []),
+                project_start=plan_start,
+                project_end=plan_end,
+                explicit_milestones=explicit_milestones,
+                resource_headcount=5,   # default from EL; could be extracted from Resources section
+                use_llm=True,
+            )
+
+            planning_conflicts = planning_result.conflicts_as_dicts()
+            planning_summary = planning_result.summary_dict()
+
+            # Persist estimated planning fields back to scope_items in DB
+            plan_update_cursor = thread_conn.cursor()
+            persisted_plan_count = 0
+            for p_item in planning_result.estimated_items:
+                db_id = p_item.get("_db_id")
+                if not db_id:
+                    continue
+                plan_assumptions_json = _json.dumps(p_item.get("plan_assumptions") or [])
+                plan_update_cursor.execute("""
+                    UPDATE scope_items
+                    SET estimated_start_date = %s,
+                        estimated_deadline = %s,
+                        date_provenance = %s,
+                        estimation_confidence = %s,
+                        estimation_basis = %s,
+                        plan_assumptions = %s,
+                        estimated_effort_low = %s,
+                        estimated_effort_likely = %s,
+                        estimated_effort_high = %s,
+                        baseline_approval_status = 'PENDING_REVIEW'
+                    WHERE id = %s
+                """, (
+                    p_item.get("estimated_start_date"),
+                    p_item.get("estimated_deadline"),
+                    p_item.get("date_provenance", "AI_ESTIMATE"),
+                    p_item.get("estimation_confidence", "LOW"),
+                    (p_item.get("estimation_basis") or "")[:500],
+                    plan_assumptions_json[:2000],
+                    p_item.get("estimated_effort_low"),
+                    p_item.get("estimated_effort_likely"),
+                    p_item.get("estimated_effort_high"),
+                    db_id,
+                ))
+                persisted_plan_count += 1
+            thread_conn.commit()
+            plan_update_cursor.close()
+
+            step_plan_time = time.time() - t_step_plan
+            logger.output("Items Estimated", planning_result.plan_summary.get("estimated_item_count", 0))
+            logger.output("Schedule Conflicts Detected", len(planning_conflicts))
+            logger.output("Plan Fields Persisted", persisted_plan_count)
+            for idx, conflict in enumerate(planning_conflicts, 1):
+                logger.item(idx, conflict.get("title", ""), {
+                    "ID": conflict.get("conflict_id", ""),
+                    "Severity": conflict.get("severity", ""),
+                })
+            logger.step_end(10, "Project Planning & Schedule Estimation", step_plan_time)
+        except Exception as plan_err:
+            import traceback as _tb
+            step_plan_time = time.time() - t_step_plan
+            logger.log(
+                f"[WARN] Project Planning step failed (non-fatal): {plan_err}\n{_tb.format_exc()}",
+                level="WARN"
+            )
+            logger.step_end(10, "Project Planning & Schedule Estimation", step_plan_time)
+
         BaselineRepository.update_project_monitoring_status(thread_conn, project_id, 'BASELINE_PENDING_REVIEW')
-        
+
         # Mark as COMPLETED
         upd2 = thread_conn.cursor()
         upd2.execute(
-            "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, processing_step = 'Completed' WHERE id = %s",
+            "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, processing_step = 'Completed', processing_error = NULL WHERE id = %s",
             (document_id,)
         )
         thread_conn.commit()
         upd2.close()
 
-        step6_time = time.time() - t_step6
         total_time = time.time() - t_start
 
         in_scope_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "IN_SCOPE" or item.get("is_pure_milestone"))
         out_of_scope_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("scope_type") == "OUT_OF_SCOPE")
         assumptions_saved = sum(1 for item in extracted_data.get("scope_items", []) if item.get("section") == "Assumptions" or item.get("source_section") == "Assumptions")
 
-        print("\n" + "="*70)
-        print(f">> [BASELINE EXTRACTION COMPLETE] Project {project_id} | Baseline Draft #{baseline_id}")
-        print(f"   Total Processing Time: {total_time:.2f}s")
-        print(f"   Step Timings Breakdown:")
-        print(f"      - Step 1 (Parse & Section Detection): {step1_time:.2f}s")
-        print(f"      - Step 2 (Candidate Scope Extraction): {step2_time:.2f}s")
-        print(f"      - Step 3 (Candidate Classification): {step3_time:.2f}s")
-        print(f"      - Step 4 (Fuzzy Deduplication): {step4_time:.2f}s")
-        print(f"      - Step 5 (Milestones & Deadlines): {step5_time:.2f}s")
-        print(f"      - Step 6 (Normalization, DAG & Recurrence): {step6_time:.2f}s")
-        print(f"   Final Scope Baseline Summary:")
-        print(f"      - In-Scope Deliverables: {in_scope_saved}")
-        print(f"      - Out-of-Scope Items: {out_of_scope_saved}")
-        print(f"      - Assumptions: {assumptions_saved}")
-        print(f"      - Project Milestones Created: {len(milestone_dict)}")
-        print(f"      - Dependency Edges (DAG): {len(edges)}")
-        print("="*70 + "\n")
-        
+        # ── Step 11: Final Completion & Summary ──
+        logger.banner(">> [BASELINE EXTRACTION COMPLETE] Project Summary")
+        logger.output("Project ID", project_id)
+        logger.output("Document ID", document_id)
+        logger.output("Baseline Draft ID", f"#{baseline_id}")
+        logger.output("Total Pipeline Runtime", f"{total_time:.2f} seconds")
+        logger.raw_log("\n  [TIMINGS BREAKDOWN]")
+        logger.raw_log(f"    - Step 1  (Document Parsing & Text Extraction): {step1_time:.2f}s")
+        logger.raw_log(f"    - Step 2  (Scope Section Detection):            {step2_time:.2f}s")
+        logger.raw_log(f"    - Step 3  (Candidate Scope Extraction):         {step3_time:.2f}s")
+        logger.raw_log(f"    - Step 4  (Scope Item Classification):          {step4_time:.2f}s")
+        logger.raw_log(f"    - Step 5  (Fuzzy Deduplication):                {step5_time:.2f}s")
+        logger.raw_log(f"    - Step 6  (Milestone & Deadline Extraction):    {step6_time:.2f}s")
+        logger.raw_log(f"    - Step 7  (Title Normalization & DB Save):      {step7_time:.2f}s")
+        logger.raw_log(f"    - Step 8  (Milestones & DAG Dependencies):      {step8_time:.2f}s")
+        logger.raw_log(f"    - Step 9  (Recurring Commitments):              {step9_time:.2f}s")
+        logger.raw_log(f"    - Step 10 (Project Planning & Schedule Est.):   {step_plan_time:.2f}s")
+        logger.raw_log("\n  [SCOPE METRICS SUMMARY]")
+        logger.raw_log(f"    - In-Scope Deliverables:            {in_scope_saved}")
+        logger.raw_log(f"    - Out-of-Scope Exclusions:          {out_of_scope_saved}")
+        logger.raw_log(f"    - Document Assumptions:             {assumptions_saved}")
+        logger.raw_log(f"    - Project Milestones Created:       {len(milestone_dict)}")
+        logger.raw_log(f"    - Validated DAG Dependencies:       {len(edges)}")
+        logger.raw_log(f"    - Planning Estimates Generated:     {planning_summary.get('estimated_item_count', 0)}")
+        logger.raw_log(f"    - Schedule Conflicts Detected:      {len(planning_conflicts)}")
+        logger.raw_log(f"    - Monitoring Status:                BASELINE_PENDING_REVIEW")
+        logger.raw_log(f"    - Document Status:                  COMPLETED")
+        logger.raw_log("\n  [PERSISTENT LOG FILES]")
+        logger.raw_log(f"    - Unified Log File:   {log_paths['unified_log']}")
+        logger.raw_log(f"    - Run-Specific Log:   {log_paths['run_log']}")
+        logger.raw_log("=" * 80 + "\n")
+
     except Exception as e:
         import traceback
-        print("!!! Baseline pipeline execution failed !!!")
-        traceback.print_exc()
+        tb_str = traceback.format_exc()
+        logger.error("run_baseline_pipeline", str(e), tb_str)
         try:
             thread_conn.rollback()
         except Exception:
@@ -830,7 +1013,18 @@ def schedule_scope_item(
         raise HTTPException(status_code=404, detail="Scope item not found")
         
     baseline_id = scope_item["baseline_id"]
-    deadline_norm = data.deadline if (data.deadline and re.match(r'^\d{4}-\d{2}-\d{2}', str(data.deadline))) else None
+    # Parse date to ISO format YYYY-MM-DD
+    deadline_norm = None
+    if data.deadline:
+        s = str(data.deadline).strip()
+        if re.match(r'^\d{4}-\d{2}-\d{2}', s):
+            deadline_norm = s[:10]
+        else:
+            m = re.match(r'^(\d{1,2})[-/](\d{1,2})[-/](\d{4})', s)
+            if m:
+                d, mth, y = m.groups()
+                deadline_norm = f"{y}-{int(mth):02d}-{int(d):02d}"
+
     milestone_val = data.milestone.strip() if data.milestone else (scope_item.get("milestone") or scope_item["name"])
     scope_item_norm = scope_item.get("scope_item_normalized") or NormalizationService.normalize_scope_item(scope_item["name"])
     milestone_norm = NormalizationService.normalize_milestone(milestone_val, scope_item_norm)
@@ -891,10 +1085,16 @@ def schedule_scope_item(
         if prog_row:
             cursor.execute("UPDATE deliverable_progress SET dependencies = %s WHERE id = %s", (deps_json, prog_row["id"]))
         else:
+            cursor.execute("SELECT version FROM scope_baselines WHERE id = %s", (baseline_id,))
+            b_row = cursor.fetchone()
+            b_ver = b_row["version"] if b_row and b_row["version"] else 1
             cursor.execute("""
-                INSERT INTO deliverable_progress (scope_item_id, project_id, status_code, dependencies, progress_percentage)
-                VALUES (%s, %s, 'ACTIVE', %s, 0)
-            """, (item_id, project_id, deps_json))
+                INSERT INTO deliverable_progress (
+                    scope_item_id, project_id, status_code, dependencies, 
+                    progress_percentage, baseline_version, progress_source, risk_evaluation_id
+                )
+                VALUES (%s, %s, 'NOT_STARTED', %s, 0, %s, 'USER', NULL)
+            """, (item_id, project_id, deps_json, b_ver))
 
     db.commit()
     cursor.close()

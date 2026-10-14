@@ -382,13 +382,13 @@ def ingest_status_document(
 def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER", "PROJECT_LEAD"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
     verify_project_access(project_id, current_user, db)
     
-    # Auto-fail any document that has been in PROCESSING for more than 10 minutes (stuck/interrupted)
+    # Auto-fail any document that has been in PROCESSING for more than 30 minutes (stuck/interrupted)
     try:
         cleanup_cursor = db.cursor()
         cleanup_cursor.execute(
             """UPDATE documents 
                SET processing_status = 'FAILED', processing_error = 'Process timed out or server restarted', processing_progress = 0, processing_step = 'Failed'
-               WHERE project_id = %s AND processing_status = 'PROCESSING' AND processing_started_at < NOW() - INTERVAL 10 MINUTE""",
+               WHERE project_id = %s AND processing_status = 'PROCESSING' AND processing_started_at < NOW() - INTERVAL 30 MINUTE""",
             (project_id,)
         )
         db.commit()
@@ -411,7 +411,7 @@ def get_monitoring_progress(project_id: int, document_id: Optional[int] = None, 
         # Find any document that is currently PROCESSING in this project and compute elapsed seconds
         cursor = db.cursor(dictionary=True)
         cursor.execute(
-            "SELECT *, TIMESTAMPDIFF(SECOND, processing_started_at, NOW()) AS elapsed_seconds FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' AND (processing_started_at >= NOW() - INTERVAL 15 MINUTE OR processing_started_at IS NULL) ORDER BY id DESC LIMIT 1",
+            "SELECT *, TIMESTAMPDIFF(SECOND, processing_started_at, NOW()) AS elapsed_seconds FROM documents WHERE project_id = %s AND processing_status = 'PROCESSING' AND (processing_started_at >= NOW() - INTERVAL 35 MINUTE OR processing_started_at IS NULL) ORDER BY id DESC LIMIT 1",
             (project_id,)
         )
         doc = cursor.fetchone()

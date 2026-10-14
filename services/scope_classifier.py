@@ -8,7 +8,14 @@ class ScopeClassifier:
     and then uses a small LLM prompt to classify it.
     """
     
-    IN_SCOPE_SECTIONS = {"In Scope", "Scope of Work", "Deliverables", "Responsibilities", "Milestones", "Recurring Commitments"}
+    # Sections that are deterministically classified as IN_SCOPE or OUT_OF_SCOPE
+    # without needing an LLM call. Includes new sections for real-world ELs.
+    IN_SCOPE_SECTIONS = {
+        "In Scope", "Scope of Work", "Deliverables", "Responsibilities",
+        "Milestones", "Recurring Commitments",
+        # New sections added for narrative ELs (demo_EL type)
+        "Functional Scope", "Methodology", "Governance", "Support", "Acceptance",
+    }
     OUT_OF_SCOPE_SECTIONS = {"Out of Scope", "Assumptions", "Client Responsibilities", "Customer Responsibilities"}
     BAD_SECTIONS = OUT_OF_SCOPE_SECTIONS
 

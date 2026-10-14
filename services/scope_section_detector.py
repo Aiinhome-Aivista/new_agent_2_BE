@@ -11,11 +11,11 @@ class ScopeSectionDetector:
     # "Out of Scope" MUST come before any pattern containing "Scope"
     # to prevent "3. Out of Scope" from matching "Scope of Work".
     # Generic: patterns cover all common EL/IFA/SOW/MoM heading variations.
-    # No project-specific or industry-specific terms.
+    # No project-specific or industry-specific terms — only structural signals.
     SECTION_PATTERNS = [
         # ── OUT OF SCOPE — checked FIRST (contains word "Scope", must win) ──
         ('Out of Scope', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.\)]?\s)'
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
             r'(?:'
             r'out[\s\-_]*of[\s\-_]*scope'
             r'|exclusions?'
@@ -30,7 +30,7 @@ class ScopeSectionDetector:
 
         # ── IN SCOPE — checked AFTER Out of Scope ──
         ('In Scope', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.\)]?\s)'
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
             r'(?:'
             r'in[\s\-_]*scope'
             r'|scope\s+of\s+(?:work|services?|engagement)'
@@ -50,7 +50,7 @@ class ScopeSectionDetector:
 
         # ── ASSUMPTIONS / CLIENT RESPONSIBILITIES ──
         ('Assumptions', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.\)]?\s)'
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
             r'(?:'
             r'assumptions?'
             r'|client\s+responsibilities?'
@@ -64,9 +64,9 @@ class ScopeSectionDetector:
             re.MULTILINE
         )),
 
-        # ── MILESTONES / TIMELINE ──
+        # ── MILESTONES / TIMELINE / PAYMENT SCHEDULE ──
         ('Milestones', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.\)]?\s)'
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
             r'(?:'
             r'milestones?'
             r'|project\s+milestones?'
@@ -75,13 +75,15 @@ class ScopeSectionDetector:
             r'|phases?\s+(?:&|and)\s+(?:timeline|schedule|milestones?)'
             r'|delivery\s+schedule'
             r'|key\s+dates?'
+            r'|payment\s+(?:schedule|milestones?|terms?)'
+            r'|fee\s+schedule'
             r')',
             re.MULTILINE
         )),
 
         # ── RECURRING COMMITMENTS ──
         ('Recurring Commitments', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.\)]?\s)'
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
             r'(?:'
             r'recurring\s+(?:commitments?|deliverables?|services?|obligations?)'
             r'|ongoing\s+(?:commitments?|deliverables?|services?)'
@@ -91,7 +93,107 @@ class ScopeSectionDetector:
             r')',
             re.MULTILINE
         )),
+
+        # ── FUNCTIONAL SCOPE ──
+        # Detects module-level / user-role-level headings in a real EL so that
+        # feature bullets under "Employee Collaboration", "Internal Job Posting",
+        # "Manager View", "Admin View", "Employee View" etc. are tagged as
+        # functional scope items rather than falling through as "General".
+        ('Functional Scope', re.compile(
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
+            r'(?:'
+            r'employee\s+(?:collaboration|portal|landing|information|learning|news|suggestion|feedback|praising|onboarding)'
+            r'|internal\s+job\s+posting'
+            r'|(?:manager|admin(?:istrator)?|user|employee)\s+(?:view|portal|dashboard|module|features?|access|capabilities?)'
+            r'|job\s+(?:requisition|posting|applicant)'
+            r'|(?:functional|feature)\s+(?:scope|requirements?|specification)'
+            r'|(?:system|portal|application)\s+features?'
+            r'|vconnect'
+            r')',
+            re.MULTILINE
+        )),
+
+        # ── PROJECT METHODOLOGY / PHASES ──
+        # Captures work activities described inside a project-approach/methodology section.
+        ('Methodology', re.compile(
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
+            r'(?:'
+            r'methodology'
+            r'|project\s+(?:approach|methodology|plan|phases?)'
+            r'|implementation\s+(?:approach|methodology|phases?|plan)'
+            r'|delivery\s+(?:approach|methodology|phases?)'
+            r'|engagement\s+(?:approach|methodology|plan)'
+            r'|phases?\s+(?:plan|breakdown|description)'
+            r'|assessment\s+(?:phase|approach)'
+            r'|solution\s+(?:approach|design|architecture)'
+            r')',
+            re.MULTILINE
+        )),
+
+        # ── REPORTING / GOVERNANCE ──
+        # Recurring governance events: steering committees, status reports, fortnightly updates.
+        ('Governance', re.compile(
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
+            r'(?:'
+            r'governance'
+            r'|steering\s+committee'
+            r'|status\s+(?:report|update|meeting)'
+            r'|project\s+governance'
+            r'|reporting\s+(?:obligations?|requirements?|cadence)'
+            r'|stakeholder\s+(?:updates?|reporting|communication)'
+            r'|project\s+(?:oversight|management\s+approach)'
+            r')',
+            re.MULTILINE
+        )),
+
+        # ── RESOURCES / TEAM ──
+        ('Resources', re.compile(
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
+            r'(?:'
+            r'resource(?:s|\s+plan)?'
+            r'|team\s+(?:structure|composition|plan|allocation)'
+            r'|staffing\s+(?:plan|model)'
+            r'|project\s+(?:team|resources?|staffing)'
+            r'|personnel\s+(?:plan|allocation)'
+            r')',
+            re.MULTILINE
+        )),
+
+        # ── SUPPORT / HYPERCARE / PRODUCTION SUPPORT ──
+        ('Support', re.compile(
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
+            r'(?:'
+            r'hypercare'
+            r'|post[\s\-]go[\s\-]live'
+            r'|production\s+support'
+            r'|warranty\s+(?:period|support)'
+            r'|post[\s\-]deployment\s+support'
+            r'|defect\s+(?:support|resolution|warranty)'
+            r')',
+            re.MULTILINE
+        )),
+
+        # ── ACCEPTANCE / UAT ──
+        ('Acceptance', re.compile(
+            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
+            r'(?:'
+            r'acceptance\s+(?:criteria|testing|process)'
+            r'|user\s+acceptance\s+testing'
+            r'|\buat\b'
+            r'|sign[\s\-]off\s+(?:process|criteria|requirements?)'
+            r'|quality\s+assurance'
+            r')',
+            re.MULTILINE
+        )),
     ]
+
+    # Sections that the classifier treats as "In Scope" for the real EL.
+    # Kept as a class constant so downstream code can reference it.
+    FUNCTIONAL_SCOPE_SECTIONS = frozenset({
+        "In Scope", "Scope of Work", "Deliverables", "Responsibilities",
+        "Milestones", "Recurring Commitments", "Functional Scope",
+        "Methodology", "Governance", "Support", "Acceptance",
+    })
 
     @classmethod
     def detect_sections(cls, chunks: list[dict]) -> list[dict]:
@@ -129,7 +231,7 @@ class ScopeSectionDetector:
                 
                 # Check if this line is a section header
                 if 0 < len(clean_line) < 120:
-                    clean_header = re.sub(r'^[#\*\-\s\d\.\:]+', '', clean_line).strip()
+                    clean_header = re.sub(r'^[#\*\-\s\d\.\ :]+', '', clean_line).strip()
                     matched_section = None
                     for section_name, pattern in cls.SECTION_PATTERNS:
                         if pattern.search(clean_line) or (clean_header and pattern.search(clean_header)):
@@ -173,4 +275,3 @@ class ScopeSectionDetector:
                 })
                 
         return new_chunks
-

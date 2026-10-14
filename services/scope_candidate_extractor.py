@@ -46,18 +46,27 @@ class ScopeCandidateExtractor:
     Extracts candidate scope items from chunks using deterministic rules (bullets, numbering, short sentences).
     """
     
-    # Sections from which we want to extract candidates
+    # Sections from which we want to extract candidates.
+    # Includes new sections added to ScopeSectionDetector for real-world ELs.
     TARGET_SECTIONS = {
+        # Original structured-EL sections
         "In Scope",
-        "Scope of Work", 
-        "Deliverables", 
-        "Responsibilities", 
+        "Scope of Work",
+        "Deliverables",
+        "Responsibilities",
         "Client Responsibilities",
         "Out of Scope",
         "Assumptions",
         "Dependencies",
         "Milestones",
-        "Recurring Commitments"
+        "Recurring Commitments",
+        # New sections for narrative / unstructured ELs (demo_EL type)
+        "Functional Scope",    # Module/role-level headings (Employee Collaboration, IJP views)
+        "Methodology",         # Project phases and work-package descriptions
+        "Governance",          # Steering committee, status reports, fortnightly updates
+        "Support",             # Hypercare / production support obligations
+        "Acceptance",          # UAT / sign-off criteria
+        "Resources",           # Team/resource plan (role listings)
     }
 
     HEADING_BLACKLIST = {

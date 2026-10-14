@@ -31,6 +31,23 @@ def _clean_terminal_print(*args, **kwargs):
         "CRITICAL:",
         "Traceback",
         "[LLM",
+        "[BASELINE",
+        ">> [BASELINE",
+        "[*] STEP",
+        "[✓] STEP",
+        "[INPUT]",
+        "[OUTPUT]",
+        "[PROCESS]",
+        "[Scope",
+        "[ScopeSection",
+        "[Chunk",
+        "[SectionDetector",
+        "[DeepScan",
+        "[Milestone",
+        "[Recurring",
+        "[Document",
+        "[BulletExtractor]",
+        "[MilestoneRow]",
     )
     if any(sig in text for sig in allowed_signatures):
         _original_builtin_print(*args, **kwargs)

@@ -54,6 +54,24 @@ class DeepScanExtractor:
         "Milestones and Timeline",
         "Dependencies",
         "Recurring Commitments",
+        # New keywords for narrative ELs (demo_EL type)
+        "Employee Collaboration",
+        "Internal Job Posting",
+        "Manager View",
+        "Admin View",
+        "Employee View",
+        "Methodology",
+        "Project Approach",
+        "Governance",
+        "Steering Committee",
+        "Hypercare",
+        "Production Support",
+        "UAT",
+        "User Acceptance Testing",
+        "Resource Plan",
+        "Project Team",
+        "Fee Schedule",
+        "Payment Milestones",
     ]
 
     # Sections the LLM is allowed to attribute an item to (matches
@@ -69,6 +87,13 @@ class DeepScanExtractor:
         "Milestones",
         "Recurring Commitments",
         "General",
+        # New sections for narrative ELs
+        "Functional Scope",
+        "Methodology",
+        "Governance",
+        "Support",
+        "Acceptance",
+        "Resources",
     }
 
     # How many hits to pull per keyword from Chroma.
@@ -79,6 +104,13 @@ class DeepScanExtractor:
     MAX_WINDOWS = 60
     # Batch size for the Reduce phase.
     REDUCE_BATCH_SIZE = 50
+
+    @staticmethod
+    def _log(logger, message: str):
+        if logger and hasattr(logger, "raw_log"):
+            logger.raw_log(message)
+        else:
+            print(message)
 
     # ------------------------------------------------------------------ #
     # Public API
@@ -91,12 +123,13 @@ class DeepScanExtractor:
         document_type: str,
         parsed_chunks: list[dict],
         sectioned_chunks: list[dict] | None = None,
+        logger=None,
     ) -> list[dict]:
         """
         Main entry point. Returns candidates in ScopeCandidateExtractor format.
         """
         if not parsed_chunks:
-            print("[DeepScan] No parsed chunks provided; returning [].")
+            cls._log(logger, "[DeepScan] No parsed chunks provided; returning [].")
             return []
 
         # Map chunk_index -> full chunk text & page number (source of truth for text).
@@ -120,42 +153,48 @@ class DeepScanExtractor:
 
         # 1) Build the heatmap of "hot" chunk indices via the Vector DB.
         hot_indices = cls._build_heatmap(
-            project_id, document_id, document_type, index_to_chunk
+            project_id, document_id, document_type, index_to_chunk, logger=logger
         )
 
         used_fallback = False
         if not hot_indices:
-            print(
-                "[DeepScan] Heatmap produced 0 hot chunks. "
-                "Falling back to full-document Map-Reduce."
+            cls._log(
+                logger,
+                f"  [DeepScan][1/5: Vector Heatmap] Heatmap produced 0 hot chunks -> Falling back to all {len(index_to_chunk)} document chunks."
             )
             used_fallback = True
             hot_indices = sorted(index_to_chunk.keys())
+        else:
+            cls._log(
+                logger,
+                f"  [DeepScan][1/5: Vector Heatmap] Selected {len(hot_indices)} hot chunks for windowing: {hot_indices}"
+            )
 
         if not hot_indices:
-            print("[DeepScan] No chunks available at all; returning [].")
+            cls._log(logger, "[DeepScan] No chunks available at all; returning [].")
             return []
 
         # 2) Assemble Map windows from the hot chunks.
-        windows = cls._build_windows(hot_indices, index_to_chunk, index_to_section)
+        windows = cls._build_windows(hot_indices, index_to_chunk, index_to_section, logger=logger)
         if not windows:
             return []
 
         # 3) MAP: extract raw items from each window.
-        mapped_items = cls._map_phase(windows)
+        mapped_items = cls._map_phase(windows, logger=logger)
         if not mapped_items:
-            print("[DeepScan] Map phase yielded 0 items; returning [].")
+            cls._log(logger, "[DeepScan] Map phase yielded 0 items; returning [].")
             return []
 
         # 4) REDUCE: consolidate/deduplicate mapped items via the LLM.
-        reduced_items = cls._reduce_phase(mapped_items)
+        reduced_items = cls._reduce_phase(mapped_items, logger=logger)
 
         # 5) Convert to the canonical candidate dict format, restoring source
         #    references (chunk_index/page/section) from the mapped items.
-        candidates = cls._to_candidates(reduced_items, mapped_items, document_id)
+        candidates = cls._to_candidates(reduced_items, mapped_items, document_id, logger=logger)
 
-        print(
-            f"[DeepScan] Completed "
+        cls._log(
+            logger,
+            f"\n  [DeepScan] Completed "
             f"({'fallback/full-doc' if used_fallback else 'heatmap'}): "
             f"{len(candidates)} candidates from {len(windows)} windows."
         )
@@ -171,15 +210,16 @@ class DeepScanExtractor:
         document_id: int,
         document_type: str,
         index_to_chunk: dict,
+        logger=None,
     ) -> list[int]:
         """
         Query ChromaDB with each keyword, collect the chunk_indices belonging to
         THIS document, then expand to any sibling chunks on the same page.
         """
-        # Restrict to EL/IFA (the current doc's type is guaranteed to be one of
-        # these). Version-control has already purged old EL/IFA vectors, so the
-        # only EL/IFA vectors present belong to the current document. We still
-        # defensively filter by document_id below.
+        cls._log(
+            logger,
+            f"\n  [DeepScan][1/5: Vector Heatmap] Querying ChromaDB with {len(cls.HEATMAP_KEYWORDS)} scope keywords (top_k={cls.HEATMAP_TOP_K})..."
+        )
         doc_types = ["EL", "IFA"]
 
         hot = set()
@@ -195,7 +235,7 @@ class DeepScanExtractor:
                     top_k=cls.HEATMAP_TOP_K,
                 )
             except Exception as e:
-                print(f"[DeepScan] Heatmap query failed for '{keyword}': {e}")
+                cls._log(logger, f"  [DeepScan][1/5: Vector Heatmap] Query failed for '{keyword}': {e}")
                 continue
 
             metadatas = (results or {}).get("metadatas") or [[]]
@@ -218,6 +258,10 @@ class DeepScanExtractor:
                 if ch.get("page_number") in hot_pages:
                     hot.add(c_idx)
 
+        cls._log(
+            logger,
+            f"  [DeepScan][1/5: Vector Heatmap] ChromaDB query finished: Found {len(hot)} hot chunks across page(s) {sorted(list(hot_pages)) or ['N/A']}."
+        )
         return sorted(hot)
 
     # ------------------------------------------------------------------ #
@@ -229,12 +273,17 @@ class DeepScanExtractor:
         hot_indices: list[int],
         index_to_chunk: dict,
         index_to_section: dict,
+        logger=None,
     ) -> list[dict]:
         """
         Group consecutive hot chunks into windows under WINDOW_CHAR_BUDGET.
         Each window carries a representative chunk_index/page/section used later
         to re-attach source references to extracted items.
         """
+        cls._log(
+            logger,
+            f"\n  [DeepScan][2/5: Window Assembly] Assembling windows from {len(hot_indices)} hot chunks (Budget: {cls.WINDOW_CHAR_BUDGET} chars/window)..."
+        )
         windows = []
         cur_indices: list[int] = []
         cur_text_parts: list[str] = []
@@ -280,9 +329,9 @@ class DeepScanExtractor:
             if cur_len and (cur_len + len(text)) > cls.WINDOW_CHAR_BUDGET:
                 flush()
                 if len(windows) >= cls.MAX_WINDOWS:
-                    print(
-                        f"[DeepScan] Reached MAX_WINDOWS ({cls.MAX_WINDOWS}); "
-                        "truncating remaining chunks."
+                    cls._log(
+                        logger,
+                        f"  [DeepScan][2/5: Window Assembly] Reached MAX_WINDOWS ({cls.MAX_WINDOWS}); truncating remaining chunks."
                     )
                     return windows
             cur_indices.append(idx)
@@ -290,33 +339,51 @@ class DeepScanExtractor:
             cur_len += len(text)
 
         flush()
-        return windows[: cls.MAX_WINDOWS]
+        final_windows = windows[: cls.MAX_WINDOWS]
+        cls._log(
+            logger,
+            f"  [DeepScan][2/5: Window Assembly] Assembled {len(final_windows)} processing window(s):"
+        )
+        for w_idx, w in enumerate(final_windows, 1):
+            snippet = w["text"][:110].replace("\r", " ").replace("\n", " ").strip()
+            page_str = f"page={w['page_number']}" if w['page_number'] else "page=N/A"
+            cls._log(
+                logger,
+                f"    - Window {w_idx:02d}/{len(final_windows):02d}: Chunks={w['indices']} | Section: '{w['section']}' | {page_str} | length={len(w['text'])} chars\n"
+                f"        Text Preview: \"{snippet}...\""
+            )
+        return final_windows
 
     # ------------------------------------------------------------------ #
     # 3) Map
     # ------------------------------------------------------------------ #
     @classmethod
-    def _map_phase(cls, windows: list[dict]) -> list[dict]:
+    def _map_phase(cls, windows: list[dict], logger=None) -> list[dict]:
         """
         Run the LLM Map prompt over each window. Each returned item is annotated
         with the window's source references so we can restore them after Reduce.
         """
+        cls._log(
+            logger,
+            f"\n  [DeepScan][3/5: MAP Phase] Executing LLM Map Extraction across {len(windows)} window(s)..."
+        )
         mapped = []
-        for w_num, window in enumerate(windows):
+        for w_num, window in enumerate(windows, 1):
             if not window["text"].strip():
                 continue
-            print(
-                f"[DeepScan][Map] Window {w_num + 1}/{len(windows)} "
-                f"(chunks={window['indices']}, section={window['section']})"
+            cls._log(
+                logger,
+                f"  [DeepScan][3/5: MAP Phase] Calling LLM on Window {w_num:02d}/{len(windows):02d} (Chunks={window['indices']}, Section='{window['section']}')..."
             )
             prompt = get_deep_scan_map_prompt(window["text"])
             try:
                 result = LLMService.generate_json(prompt)
             except Exception as e:
-                print(f"[DeepScan][Map] LLM failed for window {w_num + 1}: {e}")
+                cls._log(logger, f"  [DeepScan][3/5: MAP Phase] LLM failed for window {w_num}: {e}")
                 continue
 
             items = result if isinstance(result, list) else [result]
+            window_extracted_items = []
             for it in items:
                 if not isinstance(it, dict):
                     continue
@@ -327,27 +394,44 @@ class DeepScanExtractor:
                 section = it.get("source_section") or window["section"]
                 if section not in cls.VALID_SECTIONS:
                     section = window["section"] if window["section"] in cls.VALID_SECTIONS else "General"
-                mapped.append(
-                    {
-                        "name": name,
-                        "description": description,
-                        "section": section,
-                        "chunk_index": window["chunk_index"],
-                        "page_number": window["page_number"],
-                        "is_pure_milestone": it.get("is_pure_milestone", False),
-                    }
-                )
+                item_dict = {
+                    "name": name,
+                    "description": description,
+                    "section": section,
+                    "chunk_index": window["chunk_index"],
+                    "page_number": window["page_number"],
+                    "is_pure_milestone": it.get("is_pure_milestone", False),
+                }
+                mapped.append(item_dict)
+                window_extracted_items.append(item_dict)
+
+            cls._log(
+                logger,
+                f"  [DeepScan][3/5: MAP Phase] Window {w_num:02d} extracted {len(window_extracted_items)} candidate(s):"
+            )
+            for it in window_extracted_items:
+                kind = "Milestone" if it["is_pure_milestone"] else "Clause"
+                cls._log(logger, f"      * [{kind}] \"{it['name']}\" (Section: '{it['section']}')")
+
+        cls._log(
+            logger,
+            f"  [DeepScan][3/5: MAP Phase] Completed. Extracted total {len(mapped)} raw candidates across all windows."
+        )
         return mapped
 
     # ------------------------------------------------------------------ #
     # 4) Reduce
     # ------------------------------------------------------------------ #
     @classmethod
-    def _reduce_phase(cls, mapped_items: list[dict]) -> list[dict]:
+    def _reduce_phase(cls, mapped_items: list[dict], logger=None) -> list[dict]:
         """
         Deduplicate/merge mapped items via the LLM. Batches large inputs and runs
         a final consolidation pass. Falls back to deterministic dedup on failure.
         """
+        cls._log(
+            logger,
+            f"\n  [DeepScan][4/5: REDUCE Phase] Deduplicating & consolidating {len(mapped_items)} candidate items across windows..."
+        )
         # Deterministic fallback list (used if the LLM reduce fails entirely).
         det_dedup = cls._deterministic_dedup(mapped_items)
 
@@ -367,24 +451,40 @@ class DeepScanExtractor:
             working = mapped_items
             # If very large, reduce in batches first, then a final pass.
             if len(working) > cls.REDUCE_BATCH_SIZE:
+                cls._log(
+                    logger,
+                    f"  [DeepScan][4/5: REDUCE Phase] Input exceeds batch size ({cls.REDUCE_BATCH_SIZE}); reducing in multiple batches..."
+                )
                 intermediate = []
                 for i in range(0, len(working), cls.REDUCE_BATCH_SIZE):
                     batch = working[i : i + cls.REDUCE_BATCH_SIZE]
-                    intermediate.extend(cls._reduce_once(to_payload(batch)))
+                    intermediate.extend(cls._reduce_once(to_payload(batch), logger=logger))
                 working_payload = to_payload(intermediate) if intermediate else to_payload(working)
             else:
                 working_payload = to_payload(working)
 
-            reduced = cls._reduce_once(working_payload)
+            cls._log(
+                logger,
+                f"  [DeepScan][4/5: REDUCE Phase] Sending {len(working_payload)} candidate items to LLM Reduce prompt..."
+            )
+            reduced = cls._reduce_once(working_payload, logger=logger)
             if reduced:
+                cls._log(
+                    logger,
+                    f"  [DeepScan][4/5: REDUCE Phase] Consolidation successful: Reduced from {len(mapped_items)} down to {len(reduced)} distinct candidates."
+                )
                 return reduced
         except Exception as e:
-            print(f"[DeepScan][Reduce] LLM reduce failed, using deterministic dedup: {e}")
+            cls._log(logger, f"  [DeepScan][4/5: REDUCE Phase] LLM reduce failed, using deterministic dedup: {e}")
 
+        cls._log(
+            logger,
+            f"  [DeepScan][4/5: REDUCE Phase] Applied deterministic deduplication: {len(det_dedup)} distinct candidates."
+        )
         return det_dedup
 
     @classmethod
-    def _reduce_once(cls, items_payload: list[dict]) -> list[dict]:
+    def _reduce_once(cls, items_payload: list[dict], logger=None) -> list[dict]:
         """Single LLM reduce call. Returns list of {name, description, source_section}."""
         if not items_payload:
             return []
@@ -450,34 +550,50 @@ class DeepScanExtractor:
         reduced_items: list[dict],
         mapped_items: list[dict],
         document_id: int,
+        logger=None,
     ) -> list[dict]:
         """
         Rehydrate source references (chunk_index/page_number) onto the reduced
         items by matching them back to the best mapped item, then emit dicts in
         the exact ScopeCandidateExtractor shape.
         """
+        cls._log(
+            logger,
+            f"\n  [DeepScan][5/5: Candidate Rehydration] Rehydrating source metadata (chunk_index, page, section) for {len(reduced_items)} candidates..."
+        )
         default_ref = mapped_items[0] if mapped_items else {}
         candidates = []
 
-        for item in reduced_items:
+        for idx, item in enumerate(reduced_items, 1):
             name = item["name"]
             src = cls._best_source(name, mapped_items) or default_ref
             section = item.get("section") or src.get("section") or "General"
             if section not in cls.VALID_SECTIONS:
                 section = "General"
 
-            candidates.append(
-                {
-                    "name": name,
-                    "description": item.get("description", name),
-                    "page_number": src.get("page_number"),
-                    "section": section,
-                    "chunk_index": src.get("chunk_index"),
-                    "raw_text": item.get("description", name),
-                    "document_id": document_id,
-                    "is_pure_milestone": item.get("is_pure_milestone", False) or src.get("is_pure_milestone", False),
-                }
+            candidate_dict = {
+                "name": name,
+                "description": item.get("description", name),
+                "page_number": src.get("page_number"),
+                "section": section,
+                "chunk_index": src.get("chunk_index"),
+                "raw_text": item.get("description", name),
+                "document_id": document_id,
+                "is_pure_milestone": item.get("is_pure_milestone", False) or src.get("is_pure_milestone", False),
+            }
+            candidates.append(candidate_dict)
+
+            kind = "Milestone" if candidate_dict["is_pure_milestone"] else "Clause"
+            page_val = src.get('page_number') if src.get('page_number') is not None else "N/A"
+            cls._log(
+                logger,
+                f"    [{idx:02d}] [{kind}] \"{name}\" -> Section: '{section}' | chunk_index={src.get('chunk_index')} | page={page_val}"
             )
+
+        cls._log(
+            logger,
+            f"  [DeepScan][5/5: Candidate Rehydration] Successfully rehydrated {len(candidates)} canonical scope candidates for Step 4 classification.\n"
+        )
         return candidates
 
     @staticmethod

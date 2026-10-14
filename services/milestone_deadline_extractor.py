@@ -3,41 +3,47 @@ from datetime import datetime, date, timedelta
 from services.llm_service import LLMService
 
 
-# B4 FIX: Regex for "Weeks N–M" or "Week N" relative deadline patterns
+# Regex for relative week deadline patterns (e.g. "Weeks 1–4", "Week 3", "9 Weeks", "3 weeks")
 _WEEKS_RANGE_RE = re.compile(
-    r'\bweeks?\s*([0-9]+)\s*(?:[\u2013\u2014\u2012\-]\s*([0-9]+))?',
+    r'\b(?:weeks?\s*([0-9]+)\s*(?:[\u2013\u2014\u2012\-]\s*([0-9]+))?|([0-9]+)\s*weeks?)\b',
     re.IGNORECASE,
 )
 
 
-def resolve_relative_week_deadline(deadline_text: str, project_start: date) -> str | None:
+def resolve_relative_week_deadline(deadline_text: str, project_start: date, prior_cumulative_weeks: int = 0) -> tuple[str | None, int]:
     """
-    B4 FIX: Convert a relative week range string to an ISO date.
+    Convert a relative week range or duration to an ISO date.
 
-    Examples (project_start = 2026-10-05):
-      "Weeks 1–4"  →  project_start + 4 weeks - 1 day = 2026-11-01
-      "Week 3"     →  project_start + 3 weeks - 1 day = 2026-10-25
-      "Weeks 9–12" →  project_start + 12 weeks - 1 day = 2026-12-27
+    Examples (project_start = 2026-10-08):
+      "Weeks 1–4"  →  project_start + 4 weeks - 1 day = 2026-11-04 (cum = 4)
+      "Week 3"     →  project_start + 3 weeks - 1 day = 2026-10-28 (cum = 3)
+      "9 Weeks"    →  project_start + 9 weeks - 1 day = 2026-12-09 (cum = 9)
+      Subsequent "3 Weeks" → project_start + (9 + 3) weeks - 1 day = 2026-12-30 (cum = 12)
 
-    Returns None if the text does not contain a week range pattern.
-    Generic: uses only regex + arithmetic, no hardcoded milestone names.
+    Returns (deadline_iso, new_cumulative_weeks).
     """
     if not deadline_text or not project_start:
-        return None
+        return None, prior_cumulative_weeks
     m = _WEEKS_RANGE_RE.search(deadline_text)
     if not m:
-        return None
-    start_week = int(m.group(1))
-    end_week = int(m.group(2)) if m.group(2) else start_week
-    # Deadline = last day of the ending week
-    deadline = project_start + timedelta(weeks=end_week) - timedelta(days=1)
-    return deadline.isoformat()
+        return None, prior_cumulative_weeks
+    if m.group(1):
+        start_week = int(m.group(1))
+        end_week = int(m.group(2)) if m.group(2) else start_week
+        new_cum = end_week
+    elif m.group(3):
+        dur = int(m.group(3))
+        new_cum = prior_cumulative_weeks + dur
+    else:
+        return None, prior_cumulative_weeks
+    deadline = project_start + timedelta(weeks=new_cum) - timedelta(days=1)
+    return deadline.isoformat(), new_cum
 
 class MilestoneDeadlineExtractor:
     
-    # Use a more robust date regex that restricts months to actual month prefixes and optionally allows 'of ' before the date.
+    # Robust date regex that matches common prefixes including valid through, through, until
     DATE_PATTERNS = [
-        r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date(?:\s+of)?|acceptance\s+date|\bby\b|\bon\b)\s+([0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4}|[0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of \s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)"
+        r"(?i)(?:completed\s+by|before|after|scheduled\s+for|due\s+on|delivery\s+date|target\s+date|completion\s+date(?:\s+of)?|acceptance\s+date|valid\s+through|valid\s+to|through|until|\bby\b|\bon\b)\s+([0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4}|[0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{1,2}(?:,\s+[0-9]{4})?|[0-9]{4}-[0-9]{2}-[0-9]{2}|[0-9]{1,2}/[0-9]{1,2}/[0-9]{2,4}|Q[1-4]\s+[0-9]{4}|End of \s*(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*)"
     ]
 
     MILESTONE_KEYWORDS = ["UAT", "Deployment", "Go Live", "Training", "Knowledge Transfer"]
@@ -52,14 +58,15 @@ class MilestoneDeadlineExtractor:
         like "Weeks 1–4" → absolute date. Defaults to today if not provided.
         """
         _proj_start = project_start or date.today()
+        cumulative_weeks = 0
         llm_batch = []
         for candidate in candidates:
             # 0. Preserve existing timeline metadata if already extracted from table or prior step
             if candidate.get("deadline_text"):
                 existing_dt = candidate.get("deadline_text", "")
-                # B4 FIX: if existing deadline_text is a relative week range, resolve it
                 if not candidate.get("deadline") and _WEEKS_RANGE_RE.search(existing_dt):
-                    candidate["deadline"] = resolve_relative_week_deadline(existing_dt, _proj_start)
+                    res_date, cumulative_weeks = resolve_relative_week_deadline(existing_dt, _proj_start, cumulative_weeks)
+                    candidate["deadline"] = res_date
                     candidate["extraction_method"] = candidate.get("extraction_method") or "Deterministic_WeekOffset"
                     candidate["extraction_confidence"] = candidate.get("extraction_confidence") or 0.85
                 else:
@@ -85,12 +92,13 @@ class MilestoneDeadlineExtractor:
             found_milestone = None
             candidate_name_lower = candidate.get("name", "").lower()
 
-            # B4 FIX: Check for relative week range (e.g. "Weeks 1–4", "Weeks 5–8")
+            # Check for relative week range / duration (e.g. "Weeks 1–4", "9 Weeks")
             week_m = _WEEKS_RANGE_RE.search(candidate.get("name", "")) or _WEEKS_RANGE_RE.search(combined_text)
             if week_m:
                 found_date_text = week_m.group(0).strip()
                 candidate["deadline_text"] = found_date_text
-                candidate["deadline"] = resolve_relative_week_deadline(found_date_text, _proj_start)
+                res_date, cumulative_weeks = resolve_relative_week_deadline(found_date_text, _proj_start, cumulative_weeks)
+                candidate["deadline"] = res_date
                 candidate["milestone"] = candidate.get("milestone") or candidate.get("name")
                 candidate["extraction_method"] = "Deterministic_WeekOffset"
                 candidate["extraction_confidence"] = 0.90
@@ -176,9 +184,9 @@ class MilestoneDeadlineExtractor:
                     if res.get("has_schedule"):
                         candidate_ref["deadline_text"] = res.get("deadline_text")
                         dl_text = candidate_ref.get("deadline_text") or ""
-                        # B4 FIX: resolve relative week deadline if present
                         if _WEEKS_RANGE_RE.search(dl_text):
-                            candidate_ref["deadline"] = resolve_relative_week_deadline(dl_text, _proj_start)
+                            res_date, cumulative_weeks = resolve_relative_week_deadline(dl_text, _proj_start, cumulative_weeks)
+                            candidate_ref["deadline"] = res_date
                         else:
                             candidate_ref["deadline"] = cls._normalize_date(dl_text)
                         candidate_ref["milestone"] = res.get("milestone")
@@ -246,7 +254,27 @@ class MilestoneDeadlineExtractor:
                         
             if month_idx != -1:
                 return f"{year}-{month_idx:02d}-{int(day):02d}"
-                
+
+        # December 30, 2026 or Dec 30, 2026 or December 30 2026
+        match = re.search(r"(?i)\b([a-z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b", text)
+        if match:
+            months = ["january", "february", "march", "april", "may", "june", "july", "august", "september", "october", "november", "december",
+                      "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+            month_str, day, year = match.groups()
+            month_str_lower = month_str.lower()
+            month_idx = -1
+            for i, m in enumerate(months[:12]):
+                if m.startswith(month_str_lower):
+                    month_idx = i + 1
+                    break
+            if month_idx == -1:
+                for i, m in enumerate(months[12:]):
+                    if month_str_lower.startswith(m):
+                        month_idx = i + 1
+                        break
+            if month_idx != -1:
+                return f"{year}-{month_idx:02d}-{int(day):02d}"
+
         return None
 
     @classmethod

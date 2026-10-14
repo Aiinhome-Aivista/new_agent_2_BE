@@ -930,7 +930,7 @@ Rules:
 4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST be extracted as its own distinct item.
 5. "name" MUST be a short label (<= 60 characters). Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the name.
 6. "description" MUST be the faithful sentence or clause the item was taken from.
-7. "source_section" MUST be exactly one of: "Scope of Work", "Deliverables", "Responsibilities", "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies", "Milestones", "General".
+7. "source_section" MUST be exactly one of: "Functional Scope", "Methodology", "Governance", "Support", "Acceptance", "Resources", "Scope of Work", "Deliverables", "Responsibilities", "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies", "Milestones", "Recurring Commitments", "General".
 8. If the excerpt contains no scope-related content, return an empty array [].
 9. Do NOT invent items that are not present in the excerpt.
 10. "is_pure_milestone" MUST be true if the item is purely a project phase, timeline event, or deadline (e.g., 'Kickoff', 'UAT', 'Go-Live'). Otherwise false.

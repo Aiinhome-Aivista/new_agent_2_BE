@@ -19,49 +19,23 @@ def get_project_registers(
     """
     cursor = db.cursor(dictionary=True)
     try:
-        # 1. Milestones
-        cursor.execute("SELECT * FROM milestones WHERE project_id = %s", (project_id,))
+        # 1. Milestones (from active project_milestones table)
+        cursor.execute("SELECT * FROM project_milestones WHERE project_id = %s", (project_id,))
         milestones = cursor.fetchall()
 
-        # 1. Risks (Fallback to tracker_items for risks)
+        # 2. Tracker items (Actions, Risks, Dependencies, Changes, Issues from active tracker_items table)
         cursor.execute("SELECT * FROM tracker_items WHERE project_id = %s", (project_id,))
         tracker_items = cursor.fetchall()
-        risks = [t for t in tracker_items if t.get('item_type') == 'RISK']
         
-        # 2. Actions
-        cursor.execute("SELECT * FROM action_items WHERE project_id = %s", (project_id,))
-        actions = cursor.fetchall()
+        risks = [t for t in tracker_items if t.get('item_type') == 'RISK' or (t.get('risk_score') or 0) > 0]
+        actions = [t for t in tracker_items if t.get('item_type') == 'ACTION_ITEM']
+        dependencies = [t for t in tracker_items if t.get('item_type') == 'DEPENDENCY']
+        changes = [t for t in tracker_items if t.get('item_type') in ('CHANGE_REQUEST', 'NEW_REQUEST')]
+        issues = [t for t in tracker_items if t.get('item_type') == 'BLOCKER']
         
-        # 3. Dependencies
-        cursor.execute("SELECT * FROM dependencies WHERE project_id = %s", (project_id,))
-        dependencies = cursor.fetchall()
-        
-        # 4. Changes
-        cursor.execute("SELECT * FROM change_requests WHERE project_id = %s", (project_id,))
-        changes = cursor.fetchall()
-        
-        # 5. Issues
-        cursor.execute("SELECT * FROM issues WHERE project_id = %s", (project_id,))
-        issues = cursor.fetchall()
-        
-        # 6. Entity Links
+        # 3. Entity Links
         cursor.execute("SELECT * FROM entity_links WHERE project_id = %s AND is_active = TRUE", (project_id,))
         links = cursor.fetchall()
-        
-        # Helper to parse metadata
-        def _parse_meta(items):
-            for i in items:
-                if 'metadata' in i and isinstance(i['metadata'], str):
-                    try:
-                        i['metadata'] = json.loads(i['metadata'])
-                    except Exception:
-                        pass
-                
-        _parse_meta(milestones)
-        _parse_meta(actions)
-        _parse_meta(dependencies)
-        _parse_meta(changes)
-        _parse_meta(issues)
         
         return {
             "registers": {

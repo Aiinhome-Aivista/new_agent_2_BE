@@ -57,9 +57,7 @@ class BaselineRepository:
 
     @staticmethod
     def delete_deliverables_by_baseline(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> None:
-        cursor = db.cursor()
-        cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s", (baseline_id,))
-        cursor.close()
+        pass
 
     @staticmethod
     def get_max_baseline_version(db: mysql.connector.connection.MySQLConnection, project_id: int) -> int:
@@ -97,13 +95,7 @@ class BaselineRepository:
 
     @staticmethod
     def copy_deliverables(db: mysql.connector.connection.MySQLConnection, source_baseline_id: int, target_baseline_id: int) -> None:
-        cursor = db.cursor()
-        cursor.execute("""
-            INSERT INTO deliverables (baseline_id, project_id, name, description, deadline, owner, source_document_id)
-            SELECT %s, project_id, name, description, deadline, owner, source_document_id
-            FROM deliverables WHERE baseline_id = %s
-        """, (target_baseline_id, source_baseline_id))
-        cursor.close()
+        pass
 
 
     @staticmethod
@@ -135,33 +127,67 @@ class BaselineRepository:
         return items
 
     @staticmethod
-    def update_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, status_change_tag: Optional[str], deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None, completion_status: Optional[str] = None) -> None:
+    def update_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, status_change_tag: Optional[str], deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None, completion_status: Optional[str] = None,
+        # Planning / date-provenance fields (new — all optional for backward compat)
+        estimated_start_date: Optional[str] = None, estimated_deadline: Optional[str] = None,
+        date_provenance: Optional[str] = None, estimation_confidence: Optional[str] = None,
+        estimation_basis: Optional[str] = None, plan_assumptions: Optional[str] = None,
+        estimated_effort_low: Optional[float] = None, estimated_effort_likely: Optional[float] = None,
+        estimated_effort_high: Optional[float] = None, baseline_approval_status: Optional[str] = None,
+    ) -> None:
         cursor = db.cursor()
         sql = """UPDATE scope_items 
                  SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
                      source_section = %s, evidence_text = %s, confidence = %s, status_change_tag = %s, deadline = %s,
                      milestone = %s, deadline_text = %s, extraction_confidence = %s, extraction_method = %s,
-                     scope_item_normalized = %s, milestone_normalized = %s, deadline_original = %s, deadline_normalized = %s, category = %s, completion_status = COALESCE(%s, completion_status)
+                     scope_item_normalized = %s, milestone_normalized = %s, deadline_original = %s, deadline_normalized = %s, category = %s, completion_status = COALESCE(%s, completion_status),
+                     estimated_start_date = COALESCE(%s, estimated_start_date),
+                     estimated_deadline = COALESCE(%s, estimated_deadline),
+                     date_provenance = COALESCE(%s, date_provenance),
+                     estimation_confidence = COALESCE(%s, estimation_confidence),
+                     estimation_basis = COALESCE(%s, estimation_basis),
+                     plan_assumptions = COALESCE(%s, plan_assumptions),
+                     estimated_effort_low = COALESCE(%s, estimated_effort_low),
+                     estimated_effort_likely = COALESCE(%s, estimated_effort_likely),
+                     estimated_effort_high = COALESCE(%s, estimated_effort_high),
+                     baseline_approval_status = COALESCE(%s, baseline_approval_status)
                  WHERE id = %s"""
         cursor.execute(sql, (
             description, scope_type, source_document_id, source_page,
             source_section, evidence_text, confidence, status_change_tag, deadline,
             milestone, deadline_text, extraction_confidence, extraction_method,
-            scope_item_normalized, milestone_normalized, deadline_original, deadline_normalized, category, completion_status, item_id
+            scope_item_normalized, milestone_normalized, deadline_original, deadline_normalized,
+            category, completion_status,
+            estimated_start_date, estimated_deadline, date_provenance, estimation_confidence,
+            estimation_basis, plan_assumptions,
+            estimated_effort_low, estimated_effort_likely, estimated_effort_high,
+            baseline_approval_status,
+            item_id
         ))
         cursor.close()
 
     @staticmethod
-    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None, completion_status: str = 'ACTIVE') -> int:
+    def insert_scope_item_extracted(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, scope_type: str, source_document_id: int, source_page: Optional[int], source_section: Optional[str], evidence_text: str, confidence: float, deadline: Optional[str], milestone: Optional[str] = None, deadline_text: Optional[str] = None, extraction_confidence: Optional[float] = None, extraction_method: Optional[str] = None, scope_item_normalized: Optional[str] = None, milestone_normalized: Optional[str] = None, deadline_original: Optional[str] = None, deadline_normalized: Optional[str] = None, category: Optional[str] = None, completion_status: str = 'ACTIVE',
+        # Planning / date-provenance fields (new — all optional for backward compat)
+        estimated_start_date: Optional[str] = None, estimated_deadline: Optional[str] = None,
+        date_provenance: Optional[str] = None, estimation_confidence: Optional[str] = None,
+        estimation_basis: Optional[str] = None, plan_assumptions: Optional[str] = None,
+        estimated_effort_low: Optional[float] = None, estimated_effort_likely: Optional[float] = None,
+        estimated_effort_high: Optional[float] = None, baseline_approval_status: Optional[str] = 'PENDING_REVIEW',
+    ) -> int:
         cursor = db.cursor()
         sql = """INSERT INTO scope_items 
-                 (baseline_id, project_id, name, scope_item_normalized, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized, milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
+                 (baseline_id, project_id, name, scope_item_normalized, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized, milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status,
+                  estimated_start_date, estimated_deadline, date_provenance, estimation_confidence, estimation_basis, plan_assumptions, estimated_effort_low, estimated_effort_likely, estimated_effort_high, baseline_approval_status)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)"""
         cursor.execute(sql, (
             baseline_id, project_id, name, scope_item_normalized, description,
             scope_type, source_document_id, source_page,
             source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized,
-            milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status
+            milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status,
+            estimated_start_date, estimated_deadline, date_provenance, estimation_confidence,
+            estimation_basis, plan_assumptions,
+            estimated_effort_low, estimated_effort_likely, estimated_effort_high, baseline_approval_status
         ))
         item_id = cursor.lastrowid
         cursor.close()
@@ -169,34 +195,15 @@ class BaselineRepository:
 
     @staticmethod
     def get_deliverables_for_diff(db: mysql.connector.connection.MySQLConnection, baseline_id: int) -> List[Dict[str, Any]]:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT id, name FROM deliverables WHERE baseline_id = %s", (baseline_id,))
-        items = cursor.fetchall()
-        cursor.close()
-        return items
+        return []
 
     @staticmethod
     def update_deliverable(db: mysql.connector.connection.MySQLConnection, item_id: int, description: str, deadline: Optional[str], owner: Optional[str], source_document_id: int) -> None:
-        cursor = db.cursor()
-        sql = """UPDATE deliverables
-                 SET description = %s, deadline = %s, owner = %s, source_document_id = %s
-                 WHERE id = %s"""
-        cursor.execute(sql, (
-            description, deadline, owner, source_document_id, item_id
-        ))
-        cursor.close()
+        pass
 
     @staticmethod
     def insert_deliverable(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int, name: str, description: str, deadline: Optional[str], owner: Optional[str], source_document_id: int) -> None:
-        cursor = db.cursor()
-        sql = """INSERT INTO deliverables
-                 (baseline_id, project_id, name, description, deadline, owner, source_document_id)
-                 VALUES (%s, %s, %s, %s, %s, %s, %s)"""
-        cursor.execute(sql, (
-            baseline_id, project_id, name, description,
-            deadline, owner, source_document_id
-        ))
-        cursor.close()
+        pass
 
     @staticmethod
     def insert_stakeholder(db: mysql.connector.connection.MySQLConnection, project_id: int, name: str, email: Optional[str], role: Optional[str], responsibility: Optional[str]) -> None:
@@ -237,15 +244,6 @@ class BaselineRepository:
             item["latest_progress"] = cursor.fetchone()
             # Attach recurring occurrences to parent items
             is_rec = item.get("is_recurring")
-            if not is_rec and not item.get("parent_scope_item_id"):
-                from services.recurring_deliverable_service import _detect_recurrence_cadence
-                cadence = _detect_recurrence_cadence(item.get("name", "") + " " + item.get("description", ""))
-                if cadence:
-                    is_rec = True
-                    cursor.execute("UPDATE scope_items SET is_recurring=1, recurrence_cadence=%s WHERE id=%s", (cadence, item["id"]))
-                    item["is_recurring"] = 1
-                    item["recurrence_cadence"] = cadence
-
             if is_rec and not item.get("parent_scope_item_id"):
                 cursor.execute("""
                     SELECT * FROM scope_items
@@ -253,30 +251,6 @@ class BaselineRepository:
                     ORDER BY deadline ASC
                 """, (item["id"],))
                 occurrences = cursor.fetchall()
-                if not occurrences:
-                    try:
-                        from services.recurring_deliverable_service import RecurringDeliverableService
-                        cursor.execute("SELECT * FROM projects WHERE id = %s", (project_id,))
-                        proj_rec = cursor.fetchone() or {}
-                        items_copy = list(items)
-                        for ic in items_copy:
-                            ic["_db_id"] = ic["id"]
-                        RecurringDeliverableService.process_recurring_commitments(
-                            db=db,
-                            baseline_id=baseline["id"],
-                            project_id=project_id,
-                            scope_items=items_copy,
-                            project=proj_rec,
-                        )
-                        cursor.execute("""
-                            SELECT * FROM scope_items
-                            WHERE parent_scope_item_id = %s
-                            ORDER BY deadline ASC
-                        """, (item["id"],))
-                        occurrences = cursor.fetchall()
-                    except Exception as _e:
-                        print(f"  [BaselineRepository] Warning: auto-generating occurrences failed: {_e}")
-
                 for occ in occurrences:
                     cursor.execute("""
                         SELECT dp.*, psc.label as status_label
@@ -289,8 +263,7 @@ class BaselineRepository:
             else:
                 item["recurring_occurrences"] = []
             
-        cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (baseline["id"],))
-        deliverables = cursor.fetchall()
+        deliverables = []
         
         cursor.execute("""
             SELECT pm.*, 
@@ -333,8 +306,7 @@ class BaselineRepository:
         for b in baselines:
             cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (b["id"],))
             b["scope_items"] = cursor.fetchall()
-            cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (b["id"],))
-            b["deliverables"] = cursor.fetchall()
+            b["deliverables"] = []
         cursor.close()
         return baselines
 
@@ -418,7 +390,6 @@ class BaselineRepository:
     @staticmethod
     def delete_baseline(db: mysql.connector.connection.MySQLConnection, baseline_id: int, project_id: int) -> None:
         cursor = db.cursor()
-        cursor.execute("DELETE FROM deliverables WHERE baseline_id = %s AND project_id = %s", (baseline_id, project_id))
         cursor.execute("DELETE FROM scope_items WHERE baseline_id = %s AND project_id = %s", (baseline_id, project_id))
         sql = "DELETE FROM scope_baselines WHERE id = %s AND project_id = %s AND status = 'DRAFT'"
         cursor.execute(sql, (baseline_id, project_id))

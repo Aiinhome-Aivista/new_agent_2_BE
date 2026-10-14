@@ -37,7 +37,16 @@ def truncate_all_except_users():
             'impact_matrix',
             'alert_rule_config',
             'progress_status_config',
-            'progress_source_config'
+            'progress_source_config',
+            'category_assignment_rules',
+            'execution_priority_band_config',
+            'risk_category_priority',
+            'scope_category_config',
+            'entity_types',
+            'milestone_type_config',
+            'schema_version',
+            'drive_accounts',
+            'onedrive_accounts'
         ]
         for table in tables:
             if table.lower() not in preserve_tables:
@@ -45,7 +54,7 @@ def truncate_all_except_users():
                 cursor.execute(f"TRUNCATE TABLE {table}")
         cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
         db.commit()
-        print("MySQL tables truncated successfully (preserving 'users' and 'master_document_types').")
+        print("MySQL tables truncated successfully (preserving users, master document types, configurations, rules, and integration accounts).")
     except Exception as e:
         print(f"Error truncating tables: {e}")
         
