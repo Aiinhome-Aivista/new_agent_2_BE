@@ -162,10 +162,18 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         logger.log(f"Log File (Cumulative): {log_paths['unified_log']}")
         logger.log(f"Log File (Run Specific): {log_paths['run_log']}")
 
-        # Automatic VectorDB version control: remove vector chunks of any
-        # previous, superseded EL/IFA documents for this project.
-        logger.process("Purging VectorDB chunks of superseded EL/IFA documents for this project...")
-        _supersede_previous_vector_versions(thread_conn, project_id, document_id)
+        # ── Detect inspection mode BEFORE any destructive operation ──
+        # Inspection mode must not delete or alter previously persisted project data
+        # or production vector records.
+        INSPECTION_MODE = os.getenv("BASELINE_INSPECTION_MODE", "true").lower() in ("true", "1", "yes")
+        if INSPECTION_MODE:
+            logger.banner("INSPECTION MODE ENABLED — Destructive cleanup and production persistence SKIPPED")
+            logger.process("Inspection mode: skipping VectorDB supersede cleanup to protect existing vector data.")
+        else:
+            # Automatic VectorDB version control: remove vector chunks of any
+            # previous, superseded EL/IFA documents for this project.
+            logger.process("Purging VectorDB chunks of superseded EL/IFA documents for this project...")
+            _supersede_previous_vector_versions(thread_conn, project_id, document_id)
 
         ext = os.path.splitext(doc["storage_key"])[1].lower()
         temp_path = os.path.join(tempfile.gettempdir(), f"temp_{uuid.uuid4()}{ext}")
@@ -291,60 +299,91 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         logger.step_end(3, "Candidate Scope Extraction", step3_time)
 
         # ── [INSPECTION MODE: CLEAN STOP AFTER STEP 3] ──
-        # When inspection mode is enabled, stop immediately after Step 3.
+        # Inspection mode was detected above. Stop immediately after Step 3.
         # Generate diagnostic artifact, log full coverage audit, and DO NOT
         # write unclassified candidates to production baseline tables.
-        INSPECTION_MODE = os.getenv("BASELINE_INSPECTION_MODE", "true").lower() in ("true", "1", "yes")
 
         if INSPECTION_MODE:
             import json
+            from datetime import datetime, timezone
             logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs"))
             os.makedirs(logs_dir, exist_ok=True)
+            timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             inspection_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}.json")
+            run_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}_{timestamp_str}.json")
 
+            prov_stats = coverage_audit.get("provenance", {}) if coverage_audit else {}
             diagnostic_artifact = {
                 "project_id": project_id,
                 "document_id": document_id,
                 "document_name": doc.get("document_name", "demo_EL.docx"),
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(),
                 "extraction_mode": mode,
-                "step1_raw_chunks_sample": [
-                    {
-                        "chunk_index": c.get("chunk_index"),
-                        "page_number": c.get("page_number"),
-                        "length": len(c.get("text", "")),
-                        "snippet": c.get("text", "")[:200],
-                    }
-                    for c in chunks[:20]
-                ],
+                "inspection_mode_safety": {
+                    "early_termination_after": "Step 3 (Deep Scan Extraction)",
+                    "steps_executed": ["Step 1: Document Parsing", "Step 2: Section Detection", "Step 3: Deep Scan Extraction"],
+                    "steps_skipped": ["Step 4: Classification", "Step 5-10: Baseline Persistence & Scheduling"],
+                    "vector_supersede_purged": False,
+                    "production_baseline_mutated": False,
+                },
+                "step1_document_parsing": {
+                    "total_chunks_extracted": len(chunks),
+                    "total_characters_extracted": total_chars,
+                    "sample_preview": chunks[0].get("text", "")[:200] if chunks else "",
+                    "chunks_sample": [
+                        {
+                            "chunk_index": c.get("chunk_index"),
+                            "page_number": c.get("page_number"),
+                            "length": len(c.get("text", "")),
+                            "snippet": c.get("text", "")[:180],
+                        }
+                        for c in chunks[:15]
+                    ],
+                },
                 "step2_section_detection": {
                     "categories_defined": section_stats.get("categories_defined", 16),
                     "categories_detected": section_stats.get("categories_detected", len(section_stats.get("detected_sections", []))),
                     "detected_sections": section_stats.get("detected_sections", []),
-                    "first_20_segments": [
+                    "total_segments": len(chunks_with_sections),
+                    "all_segments": [
                         {
                             "chunk_index": c.get("chunk_index"),
                             "segment_index": c.get("segment_index", 0),
                             "section": c.get("section"),
                             "confidence": c.get("section_confidence", 1.0),
                             "is_inferred": c.get("is_inferred", False),
-                            "snippet": c.get("text", "")[:180],
+                            "snippet": c.get("text", "")[:150],
                         }
-                        for c in chunks_with_sections[:20]
+                        for c in chunks_with_sections
                     ],
                 },
                 "step3_candidate_extraction": {
                     "canonical_candidates_count": len(raw_candidates),
                     "coverage_audit": coverage_audit,
+                    "provenance_summary": {
+                        "verified_count": prov_stats.get("verified_count", 0),
+                        "partially_verified_count": prov_stats.get("partially_verified_count", 0),
+                        "unresolved_count": prov_stats.get("unresolved_count", 0),
+                        "verified_percentage": prov_stats.get("verified_percentage", 100.0),
+                    },
                     "canonical_candidates": raw_candidates,
                 },
             }
+            # Save latest document-scoped artifact and historical run artifact
             with open(inspection_artifact_path, "w", encoding="utf-8") as f_art:
                 json.dump(diagnostic_artifact, f_art, indent=2, default=str)
+            try:
+                with open(run_artifact_path, "w", encoding="utf-8") as f_run:
+                    json.dump(diagnostic_artifact, f_run, indent=2, default=str)
+            except Exception:
+                pass
 
             logger.banner("INSPECTION MODE COMPLETE — PIPELINE STOPPED AFTER STEP 3")
             logger.process(f"Diagnostic inspection artifact saved to: {inspection_artifact_path}")
+            logger.process(f"Historical run artifact saved to: {run_artifact_path}")
             logger.output("Step 3 Canonical Candidates Verified", len(raw_candidates))
             logger.output("MAP-to-REDUCE Coverage", f"{coverage_audit.get('coverage_percentage', 100.0)}%")
+            logger.output("Provenance Verification Rate", f"{prov_stats.get('verified_percentage', 100.0)}%")
 
             conn = get_valid_db_conn()
             if conn:

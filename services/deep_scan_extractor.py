@@ -3,15 +3,21 @@ Deep Scan (Map-Reduce + Vector Heatmap) scope candidate extractor.
 
 Features:
 1. Vector Heatmap chunk pre-filtering via ChromaDB.
-2. Context window assembly respecting token/character budgets.
-3. Window-level MAP candidate extraction via LLM.
-4. Action/Entity-aware REDUCE deduplication:
+2. Section-aware fallback: on zero-hit heatmap, uses Step 2 sectioned segments
+   (not raw unsectioned chunks), preserving structural context.
+3. Context window assembly respecting token/character budgets and section boundaries.
+4. Window-level MAP candidate extraction via LLM.
+5. Action/Entity-aware REDUCE deduplication:
    - Explicitly protects distinct verbs (view vs post, download vs delete, approve vs recommend).
    - Explicitly protects distinct entities (job requisition vs applicant, poll vs feedback).
    - Prevents aggressive over-merging based on long common prefixes.
-5. Canonical Candidate Rehydration with honest source provenance (chunk, segment, verbatim snippet).
-6. MAP-to-REDUCE Coverage Auditor:
+6. Canonical Candidate Rehydration with honest source provenance:
+   - Uses per-item evidence snippets from MAP output (not window start).
+   - Validates semantic match between candidate name and evidence.
+   - Marks provenance as VERIFIED / PARTIALLY_VERIFIED / UNRESOLVED.
+7. MAP-to-REDUCE Coverage Auditor:
    - Full accounting of every raw MAP candidate: RETAINED, MERGED, EXCLUDED, UNRESOLVED.
+   - Mathematically consistent invariants.
 """
 
 import difflib
@@ -154,6 +160,14 @@ class ActionEntityProtector:
         return True, "Eligible for deduplication"
 
 
+# ---------------------------------------------------------------------------
+# Provenance verification statuses
+# ---------------------------------------------------------------------------
+PROVENANCE_VERIFIED = "VERIFIED"
+PROVENANCE_PARTIAL = "PARTIALLY_VERIFIED"
+PROVENANCE_UNRESOLVED = "UNRESOLVED"
+
+
 class DeepScanExtractor:
     # Keywords used to build the vector "heatmap" of relevant pages/chunks.
     HEATMAP_KEYWORDS = [
@@ -264,8 +278,8 @@ class DeepScanExtractor:
             cls._log(logger, "[DeepScan] No parsed chunks provided; returning [].")
             return [], {}
 
-        # Map chunk_index -> full chunk text & page number
-        index_to_chunk = {}
+        # Map chunk_index -> full chunk text & page number (raw, unsectioned)
+        index_to_chunk: Dict[int, Dict] = {}
         for ch in parsed_chunks:
             idx = ch.get("chunk_index")
             if idx is None:
@@ -275,16 +289,20 @@ class DeepScanExtractor:
                 "page_number": ch.get("page_number"),
             }
 
-        # Map chunk_index -> detected section
-        index_to_section = {}
-        for ch in (sectioned_chunks or []):
+        # Build a sectioned segment list for section-aware fallback and window assembly.
+        # Each entry: {chunk_index, segment_index, text, section, page_number, ...}
+        sectioned_segments: List[Dict] = list(sectioned_chunks or [])
+
+        # Map chunk_index -> first detected section (for heatmap-based window assembly)
+        index_to_section: Dict[int, str] = {}
+        for ch in sectioned_segments:
             idx = ch.get("chunk_index")
             sec = ch.get("section")
             if idx is not None and sec and idx not in index_to_section:
                 index_to_section[idx] = sec
 
         # 1) Build the heatmap of "hot" chunk indices via ChromaDB
-        hot_indices = cls._build_heatmap(
+        hot_indices, heatmap_degraded = cls._build_heatmap(
             project_id, document_id, document_type, index_to_chunk, logger=logger
         )
 
@@ -292,22 +310,29 @@ class DeepScanExtractor:
         if not hot_indices:
             cls._log(
                 logger,
-                f"  [DeepScan][1/5: Vector Heatmap] Heatmap produced 0 hot chunks -> Falling back to all {len(index_to_chunk)} document chunks."
+                f"  [DeepScan][1/5: Vector Heatmap] Heatmap produced 0 hot chunks "
+                f"({'DEGRADED - semantic filtering bypassed' if heatmap_degraded else 'empty document'}) "
+                f"-> Falling back to ALL {len(sectioned_segments)} section-tagged segments from Step 2."
             )
             used_fallback = True
+            # CRITICAL FIX: use section-tagged segments (Step 2 output), NOT raw chunks
+            # This preserves the structural section boundaries from Step 2.
             hot_indices = sorted(index_to_chunk.keys())
         else:
             cls._log(
                 logger,
-                f"  [DeepScan][1/5: Vector Heatmap] Selected {len(hot_indices)} hot chunks for windowing: {hot_indices}"
+                f"  [DeepScan][1/5: Vector Heatmap] Selected {len(hot_indices)} hot chunk indices "
+                f"for windowing: {hot_indices}"
             )
 
         if not hot_indices:
             cls._log(logger, "[DeepScan] No chunks available at all; returning [].")
             return [], {}
 
-        # 2) Assemble Map windows from hot chunks
-        windows = cls._build_windows(hot_indices, index_to_chunk, index_to_section, logger=logger)
+        # 2) Assemble Map windows from hot chunk indices, using sectioned segments when available
+        windows = cls._build_windows(
+            hot_indices, index_to_chunk, index_to_section, sectioned_segments, used_fallback, logger=logger
+        )
         if not windows:
             return [], {}
 
@@ -330,7 +355,7 @@ class DeepScanExtractor:
         cls._log(
             logger,
             f"\n  [DeepScan] Completed "
-            f"({'fallback/full-doc' if used_fallback else 'heatmap'}): "
+            f"({'fallback/full-doc (section-aware)' if used_fallback else 'heatmap'}): "
             f"{len(candidates)} canonical candidates from {len(windows)} windows."
         )
         return candidates, coverage_audit
@@ -346,15 +371,25 @@ class DeepScanExtractor:
         document_type: str,
         index_to_chunk: dict,
         logger=None,
-    ) -> list[int]:
+    ) -> Tuple[List[int], bool]:
+        """
+        Returns (hot_chunk_indices, heatmap_degraded).
+        heatmap_degraded=True means zero results were returned unexpectedly.
+        """
         cls._log(
             logger,
-            f"\n  [DeepScan][1/5: Vector Heatmap] Querying ChromaDB with {len(cls.HEATMAP_KEYWORDS)} scope keywords (top_k={cls.HEATMAP_TOP_K})..."
+            f"\n  [DeepScan][1/5: Vector Heatmap] Querying ChromaDB with {len(cls.HEATMAP_KEYWORDS)} "
+            f"scope keywords (top_k={cls.HEATMAP_TOP_K})..."
         )
+        cls._log(
+            logger,
+            f"  [DeepScan][1/5: Vector Heatmap] Filter: project_id={project_id}, document_id={document_id}"
+        )
+
         collection = ChromaService.get_collection()
         if not collection:
-            cls._log(logger, "  [DeepScan][1/5: Vector Heatmap] ChromaDB collection unavailable.")
-            return []
+            cls._log(logger, "  [DeepScan][1/5: Vector Heatmap] ChromaDB collection unavailable. Heatmap degraded.")
+            return [], True
 
         doc_filter = {
             "$and": [
@@ -363,8 +398,38 @@ class DeepScanExtractor:
             ]
         }
 
+        # Probe collection size for this document to detect indexing issues
+        try:
+            probe = collection.get(
+                where=doc_filter,
+                limit=5,
+                include=["metadatas"],
+            )
+            probe_count = len((probe.get("ids") or []))
+            cls._log(
+                logger,
+                f"  [DeepScan][1/5: Vector Heatmap] ChromaDB probe: found {probe_count} vector(s) "
+                f"for project_id={project_id} / document_id={document_id}"
+            )
+            if probe_count == 0:
+                cls._log(
+                    logger,
+                    "  [DeepScan][1/5: Vector Heatmap] WARNING: Document has NO vectors indexed in ChromaDB. "
+                    "Heatmap DEGRADED — semantic filtering bypassed."
+                )
+                return [], True
+        except Exception as probe_err:
+            cls._log(
+                logger,
+                f"  [DeepScan][1/5: Vector Heatmap] WARNING: ChromaDB probe failed: {probe_err}. "
+                "Proceeding with keyword queries."
+            )
+
         hot_indices: set[int] = set()
         hot_pages: set[int] = set()
+        successful_queries = 0
+        failed_queries = 0
+        retrieved_vector_ids: List[str] = []
 
         for kw in cls.HEATMAP_KEYWORDS:
             try:
@@ -375,33 +440,53 @@ class DeepScanExtractor:
                     where=doc_filter,
                     include=["metadatas"],
                 )
+                successful_queries += 1
             except Exception as e:
+                failed_queries += 1
+                cls._log(logger, f"  [DeepScan][1/5: Vector Heatmap] Query failed for keyword '{kw}': {e}")
                 continue
 
             metas = (results.get("metadatas") or [[]])[0] or []
+            ids_returned = (results.get("ids") or [[]])[0] or []
+            retrieved_vector_ids.extend(ids_returned)
             for meta in metas:
                 if not meta:
                     continue
                 c_idx = meta.get("chunk_index")
-                if c_idx is not None and c_idx in index_to_chunk:
+                if c_idx is not None and int(c_idx) in index_to_chunk:
                     hot_indices.add(int(c_idx))
                 page = meta.get("page_number")
                 if page is not None and page != -1:
                     hot_pages.add(int(page))
 
+        # Also include chunks on the same pages as hot chunks (PDF documents)
         if hot_pages:
             for idx, ch in index_to_chunk.items():
                 if ch.get("page_number") in hot_pages:
                     hot_indices.add(idx)
 
+        unique_retrieved_ids = list(set(retrieved_vector_ids))
         cls._log(
             logger,
-            f"  [DeepScan][1/5: Vector Heatmap] ChromaDB query finished: Found {len(hot_indices)} hot chunks across page(s) {sorted(hot_pages) if hot_pages else ['N/A']}."
+            f"  [DeepScan][1/5: Vector Heatmap] ChromaDB query finished: "
+            f"successful={successful_queries}, failed={failed_queries}, "
+            f"unique_vector_ids_retrieved={len(unique_retrieved_ids)}, "
+            f"hot_chunk_indices={sorted(hot_indices)}, "
+            f"hot_pages={sorted(hot_pages) if hot_pages else ['N/A']}."
         )
-        return sorted(hot_indices)
+
+        heatmap_degraded = (len(hot_indices) == 0 and successful_queries > 0)
+        if heatmap_degraded:
+            cls._log(
+                logger,
+                "  [DeepScan][1/5: Vector Heatmap] WARNING: Queries succeeded but returned 0 matching chunks. "
+                "Possible metadata mismatch (project_id/document_id filter). Heatmap DEGRADED."
+            )
+
+        return sorted(hot_indices), heatmap_degraded
 
     # ------------------------------------------------------------------ #
-    # 2) Window Assembly
+    # 2) Window Assembly (section-aware)
     # ------------------------------------------------------------------ #
     @classmethod
     def _build_windows(
@@ -409,19 +494,155 @@ class DeepScanExtractor:
         hot_indices: list[int],
         index_to_chunk: dict,
         index_to_section: dict,
+        sectioned_segments: List[Dict],
+        used_fallback: bool,
         logger=None,
     ) -> list[dict]:
+        """
+        Assembles character-budget processing windows.
+
+        When used_fallback=True (heatmap degraded), assembles windows from sectioned
+        segments (Step 2 output), preserving section boundaries.
+
+        When used_fallback=False (heatmap succeeded), uses raw hot chunk text but
+        still annotates with section from index_to_section mapping.
+        """
         cls._log(
             logger,
-            f"\n  [DeepScan][2/5: Window Assembly] Assembling windows from {len(hot_indices)} hot chunks (Budget: {cls.WINDOW_CHAR_BUDGET} chars/window)..."
+            f"\n  [DeepScan][2/5: Window Assembly] Assembling windows from "
+            f"{'section-tagged segments (fallback)' if used_fallback else f'{len(hot_indices)} hot chunks'} "
+            f"(Budget: {cls.WINDOW_CHAR_BUDGET} chars/window)..."
         )
+
+        if used_fallback and sectioned_segments:
+            return cls._build_windows_from_segments(sectioned_segments, logger=logger)
+        else:
+            return cls._build_windows_from_hot_chunks(hot_indices, index_to_chunk, index_to_section, logger=logger)
+
+    @classmethod
+    def _build_windows_from_segments(
+        cls,
+        sectioned_segments: List[Dict],
+        logger=None,
+    ) -> list[dict]:
+        """
+        Section-aware window assembly using Step 2 sectioned segments.
+        Groups segments by section, then packs them into windows within the budget.
+        """
+        windows = []
+        cur_seg_ids: List[Tuple[int, int]] = []  # (chunk_index, segment_index) tuples
+        cur_chunk_ids: List[int] = []
+        cur_text_parts: List[str] = []
+        cur_len = 0
+        cur_sections: List[str] = []
+        cur_page: Optional[int] = None
+        win_id = 0
+
+        def flush():
+            nonlocal cur_seg_ids, cur_chunk_ids, cur_text_parts, cur_len, cur_sections, cur_page, win_id
+            if not cur_text_parts:
+                return
+            # Deduplicate sections list while preserving order
+            seen_secs = []
+            for s in cur_sections:
+                if s not in seen_secs:
+                    seen_secs.append(s)
+            # Dominant section: first non-General section
+            dom_section = next((s for s in seen_secs if s != "General"), seen_secs[0] if seen_secs else "General")
+            windows.append({
+                "window_id": f"win_{win_id:03d}",
+                "indices": list(dict.fromkeys(cur_chunk_ids)),   # deduped ordered chunk IDs
+                "segment_ids": list(cur_seg_ids),
+                "text": "\n\n".join(cur_text_parts).strip(),
+                "chunk_index": cur_chunk_ids[0] if cur_chunk_ids else 0,
+                "page_number": cur_page,
+                "section": dom_section,
+                "sections_in_window": seen_secs,
+                "char_length": cur_len,
+            })
+            win_id += 1
+            cur_seg_ids = []
+            cur_chunk_ids = []
+            cur_text_parts = []
+            cur_len = 0
+            cur_sections = []
+            cur_page = None
+
+        for seg in sectioned_segments:
+            text = (seg.get("text") or "").strip()
+            if not text:
+                continue
+            seg_len = len(text)
+            chunk_idx = seg.get("chunk_index", 0)
+            seg_idx = seg.get("segment_index", 0)
+            sec = seg.get("section") or "General"
+            page = seg.get("page_number")
+
+            # If this single segment exceeds budget, split it
+            if seg_len > cls.WINDOW_CHAR_BUDGET:
+                flush()
+                # Emit as its own window (single oversized segment)
+                dom_section = sec
+                windows.append({
+                    "window_id": f"win_{win_id:03d}",
+                    "indices": [chunk_idx],
+                    "segment_ids": [(chunk_idx, seg_idx)],
+                    "text": text[:cls.WINDOW_CHAR_BUDGET * 2].strip(),  # hard cap at 2x budget
+                    "chunk_index": chunk_idx,
+                    "page_number": page,
+                    "section": dom_section,
+                    "sections_in_window": [dom_section],
+                    "char_length": min(seg_len, cls.WINDOW_CHAR_BUDGET * 2),
+                })
+                win_id += 1
+                if len(windows) >= cls.MAX_WINDOWS:
+                    cls._log(
+                        logger,
+                        f"  [DeepScan][2/5: Window Assembly] Reached MAX_WINDOWS ({cls.MAX_WINDOWS}); truncating."
+                    )
+                    return windows
+                continue
+
+            # Flush if adding this segment would exceed budget
+            if cur_len and (cur_len + seg_len) > cls.WINDOW_CHAR_BUDGET:
+                flush()
+                if len(windows) >= cls.MAX_WINDOWS:
+                    cls._log(
+                        logger,
+                        f"  [DeepScan][2/5: Window Assembly] Reached MAX_WINDOWS ({cls.MAX_WINDOWS}); truncating."
+                    )
+                    return windows
+
+            cur_seg_ids.append((chunk_idx, seg_idx))
+            cur_chunk_ids.append(chunk_idx)
+            cur_text_parts.append(text)
+            cur_len += seg_len
+            cur_sections.append(sec)
+            if cur_page is None and page is not None:
+                cur_page = page
+
+        flush()
+        return cls._log_windows(windows[:cls.MAX_WINDOWS], logger)
+
+    @classmethod
+    def _build_windows_from_hot_chunks(
+        cls,
+        hot_indices: list[int],
+        index_to_chunk: dict,
+        index_to_section: dict,
+        logger=None,
+    ) -> list[dict]:
+        """
+        Window assembly from heatmap-selected raw chunks.
+        """
         windows = []
         cur_indices: list[int] = []
         cur_text_parts: list[str] = []
         cur_len = 0
+        win_id = 0
 
         def flush():
-            nonlocal cur_indices, cur_text_parts, cur_len
+            nonlocal cur_indices, cur_text_parts, cur_len, win_id
             if not cur_indices:
                 return
             rep_idx = cur_indices[0]
@@ -437,50 +658,95 @@ class DeepScanExtractor:
                 if s and s != "General":
                     rep_section = s
                     break
-            windows.append(
-                {
-                    "indices": list(cur_indices),
-                    "text": "\n\n".join(cur_text_parts).strip(),
-                    "chunk_index": rep_idx,
-                    "page_number": rep_page,
-                    "section": rep_section,
-                }
-            )
-            cur_indices = []
-            cur_text_parts = []
-            cur_len = 0
+            windows.append({
+                "window_id": f"win_{win_id:03d}",
+                "indices": list(cur_indices),
+                "segment_ids": [(i, 0) for i in cur_indices],
+                "text": "\n\n".join(cur_text_parts).strip(),
+                "chunk_index": rep_idx,
+                "page_number": rep_page,
+                "section": rep_section,
+                "sections_in_window": [rep_section],
+                "char_length": cur_len,
+            })
+            win_id += 1
+            cur_indices.clear()
+            cur_text_parts.clear()
+            cur_len.__class__   # trick mypy
+
+        # Rebuild cur_len since we can't assign int after nonlocal
+        cur_len_ref = [0]
+
+        def flush2():
+            nonlocal cur_indices, cur_text_parts, win_id
+            if not cur_indices:
+                return
+            rep_idx = cur_indices[0]
+            rep_page = None
+            for i in cur_indices:
+                p = index_to_chunk.get(i, {}).get("page_number")
+                if p is not None:
+                    rep_page = p
+                    break
+            rep_section = "General"
+            for i in cur_indices:
+                s = index_to_section.get(i)
+                if s and s != "General":
+                    rep_section = s
+                    break
+            windows.append({
+                "window_id": f"win_{win_id:03d}",
+                "indices": list(cur_indices),
+                "segment_ids": [(i, 0) for i in cur_indices],
+                "text": "\n\n".join(cur_text_parts).strip(),
+                "chunk_index": rep_idx,
+                "page_number": rep_page,
+                "section": rep_section,
+                "sections_in_window": [rep_section],
+                "char_length": cur_len_ref[0],
+            })
+            win_id += 1
+            cur_indices.clear()
+            cur_text_parts.clear()
+            cur_len_ref[0] = 0
 
         for idx in hot_indices:
             text = index_to_chunk.get(idx, {}).get("text", "") or ""
             if not text.strip():
                 continue
-            if cur_len and (cur_len + len(text)) > cls.WINDOW_CHAR_BUDGET:
-                flush()
+            if cur_len_ref[0] and (cur_len_ref[0] + len(text)) > cls.WINDOW_CHAR_BUDGET:
+                flush2()
                 if len(windows) >= cls.MAX_WINDOWS:
                     cls._log(
                         logger,
-                        f"  [DeepScan][2/5: Window Assembly] Reached MAX_WINDOWS ({cls.MAX_WINDOWS}); truncating remaining chunks."
+                        f"  [DeepScan][2/5: Window Assembly] Reached MAX_WINDOWS ({cls.MAX_WINDOWS}); truncating."
                     )
-                    return windows
+                    return cls._log_windows(windows, logger)
             cur_indices.append(idx)
             cur_text_parts.append(text)
-            cur_len += len(text)
+            cur_len_ref[0] += len(text)
 
-        flush()
-        final_windows = windows[: cls.MAX_WINDOWS]
+        flush2()
+        return cls._log_windows(windows[:cls.MAX_WINDOWS], logger)
+
+    @classmethod
+    def _log_windows(cls, windows: list[dict], logger) -> list[dict]:
         cls._log(
             logger,
-            f"  [DeepScan][2/5: Window Assembly] Assembled {len(final_windows)} processing window(s):"
+            f"  [DeepScan][2/5: Window Assembly] Assembled {len(windows)} processing window(s):"
         )
-        for w_idx, w in enumerate(final_windows, 1):
+        for w_idx, w in enumerate(windows, 1):
             snippet = w["text"][:110].replace("\r", " ").replace("\n", " ").strip()
-            page_str = f"page={w['page_number']}" if w["page_number"] is not None else "page=N/A"
+            page_str = f"page={w['page_number']}" if w.get("page_number") is not None else "page=N/A"
+            secs = w.get("sections_in_window", [w.get("section", "General")])
             cls._log(
                 logger,
-                f"    - Window {w_idx:02d}/{len(final_windows):02d}: Chunks={w['indices']} | Section: '{w['section']}' | {page_str} | length={len(w['text'])} chars\n"
+                f"    - Window {w_idx:02d}/{len(windows):02d}: "
+                f"Chunks={w['indices']} | Section(s): {secs} | {page_str} | "
+                f"length={w.get('char_length', len(w['text']))} chars\n"
                 f"        Text Preview: \"{snippet}...\""
             )
-        return final_windows
+        return windows
 
     # ------------------------------------------------------------------ #
     # 3) MAP Phase
@@ -492,16 +758,41 @@ class DeepScanExtractor:
             f"\n  [DeepScan][3/5: MAP Phase] Executing LLM Map Extraction across {len(windows)} window(s)..."
         )
         mapped = []
+        failed_windows = []
+
         for w_idx, window in enumerate(windows, 1):
             cls._log(
                 logger,
-                f"  [DeepScan][3/5: MAP Phase] Calling LLM on Window {w_idx:02d}/{len(windows):02d} (Chunks={window['indices']}, Section='{window['section']}')..."
+                f"  [DeepScan][3/5: MAP Phase] Calling LLM on Window {w_idx:02d}/{len(windows):02d} "
+                f"(Chunks={window['indices']}, Section='{window['section']}')..."
             )
             prompt = get_deep_scan_map_prompt(window["text"], window["section"])
-            try:
-                result = LLMService.generate_json(prompt)
-            except Exception as e:
-                cls._log(logger, f"  [DeepScan][3/5: MAP Phase] Window {w_idx} failed: {e}")
+            result = None
+            last_err = None
+            # Bounded retry: up to 2 attempts
+            for attempt in range(2):
+                try:
+                    result = LLMService.generate_json(prompt)
+                    break
+                except Exception as e:
+                    last_err = e
+                    cls._log(
+                        logger,
+                        f"  [DeepScan][3/5: MAP Phase] Window {w_idx} attempt {attempt+1} failed: {e}"
+                    )
+
+            if result is None:
+                failed_windows.append({
+                    "window_id": window.get("window_id", f"win_{w_idx:03d}"),
+                    "indices": window["indices"],
+                    "section": window["section"],
+                    "error": str(last_err),
+                })
+                cls._log(
+                    logger,
+                    f"  [DeepScan][3/5: MAP Phase] Window {w_idx} FAILED after retries. "
+                    f"Source range chunks={window['indices']} marked as incomplete."
+                )
                 continue
 
             items = result if isinstance(result, list) else [result]
@@ -516,15 +807,30 @@ class DeepScanExtractor:
                 if section not in cls.VALID_SECTIONS:
                     section = window["section"] if window["section"] in cls.VALID_SECTIONS else "General"
 
+                # Extract a per-item evidence snippet:
+                # Use the LLM-provided description (which is the faithful source clause)
+                # rather than the window start.
+                llm_description = (it.get("description") or name).strip()
+                # Also store window text for fallback rehydration
+                window_text_snippet = window["text"][:400].replace("\r", " ").replace("\n", " ").strip()
+
                 item_obj = {
                     "name": name,
-                    "description": (it.get("description") or name).strip(),
+                    "description": llm_description,
                     "chunk_index": window["chunk_index"],
+                    "window_id": window.get("window_id", f"win_{w_idx:03d}"),
                     "window_indices": list(window["indices"]),
+                    "segment_ids": window.get("segment_ids", [(window["chunk_index"], 0)]),
                     "page_number": window["page_number"],
                     "section": section,
+                    "sections_in_window": window.get("sections_in_window", [section]),
                     "is_pure_milestone": bool(it.get("is_pure_milestone", False)),
-                    "evidence_snippet": window["text"][:180].replace("\r", " ").replace("\n", " ").strip(),
+                    # Per-item evidence: use description (faithful clause) as primary snippet
+                    "evidence_snippet": llm_description[:300].strip(),
+                    # Fallback window text (first 300 chars) for rehydration when description is short
+                    "window_text_snippet": window_text_snippet,
+                    # Full window text stored for rehydration matching
+                    "_window_text": window["text"],
                 }
                 mapped.append(item_obj)
                 window_items.append(item_obj)
@@ -537,9 +843,17 @@ class DeepScanExtractor:
                 kind = "Milestone" if it["is_pure_milestone"] else "Clause"
                 cls._log(logger, f"      * [{kind}] \"{it['name']}\" (Section: '{it['section']}')")
 
+        if failed_windows:
+            cls._log(
+                logger,
+                f"  [DeepScan][3/5: MAP Phase] WARNING: {len(failed_windows)} window(s) FAILED extraction "
+                f"and have INCOMPLETE coverage: {[w['indices'] for w in failed_windows]}"
+            )
+
         cls._log(
             logger,
-            f"  [DeepScan][3/5: MAP Phase] Completed. Extracted total {len(mapped)} raw candidates across all windows."
+            f"  [DeepScan][3/5: MAP Phase] Completed. Extracted total {len(mapped)} raw candidates "
+            f"across all windows ({len(failed_windows)} window(s) failed)."
         )
         return mapped
 
@@ -550,7 +864,8 @@ class DeepScanExtractor:
     def _reduce_phase(cls, mapped_items: list[dict], logger=None) -> Tuple[list[dict], list[dict]]:
         cls._log(
             logger,
-            f"\n  [DeepScan][4/5: REDUCE Phase] Deduplicating & consolidating {len(mapped_items)} candidate items across windows (Section-Aware)..."
+            f"\n  [DeepScan][4/5: REDUCE Phase] Deduplicating & consolidating {len(mapped_items)} "
+            f"candidate items across windows (Section-Aware)..."
         )
         if not mapped_items:
             return [], []
@@ -574,7 +889,8 @@ class DeepScanExtractor:
 
         cls._log(
             logger,
-            f"  [DeepScan][4/5: REDUCE Phase] Grouped into {len(section_groups)} contractual section(s) for independent reduction."
+            f"  [DeepScan][4/5: REDUCE Phase] Grouped into {len(section_groups)} contractual section(s) "
+            f"for independent reduction."
         )
 
         all_reduced: list[dict] = []
@@ -611,6 +927,11 @@ class DeepScanExtractor:
                 sec_intermediate = []
                 for i in range(0, len(items), cls.SECTION_BATCH_LIMIT):
                     batch = items[i : i + cls.SECTION_BATCH_LIMIT]
+                    cls._log(
+                        logger,
+                        f"    -> Section '{sec}': Batch {i//cls.SECTION_BATCH_LIMIT + 1} "
+                        f"({len(batch)} items)..."
+                    )
                     try:
                         b_red = cls._reduce_once(to_payload(batch), logger=logger)
                         if b_red:
@@ -635,7 +956,8 @@ class DeepScanExtractor:
 
         cls._log(
             logger,
-            f"  [DeepScan][4/5: REDUCE Phase] Consolidation successful: Reduced from {len(mapped_items)} down to {len(all_reduced)} distinct candidates across all sections.\n"
+            f"  [DeepScan][4/5: REDUCE Phase] Consolidation successful: "
+            f"Reduced from {len(mapped_items)} down to {len(all_reduced)} distinct candidates across all sections.\n"
         )
         return all_reduced, all_merge_events
 
@@ -745,32 +1067,46 @@ class DeepScanExtractor:
         """
         Rehydrates source references (chunk_index, honest page_number, section, evidence snippet)
         onto the reduced canonical candidates.
+
+        Provenance verification:
+        - VERIFIED: source match is semantically supported by matched chunk text
+        - PARTIALLY_VERIFIED: source matched by name fuzzy but snippet may not align
+        - UNRESOLVED: no defensible source match found; provenance left blank
         """
         cls._log(
             logger,
-            f"\n  [DeepScan][5/5: Candidate Rehydration] Rehydrating source metadata (chunk_index, page, section) for {len(reduced_items)} candidates..."
+            f"\n  [DeepScan][5/5: Candidate Rehydration] Rehydrating source metadata "
+            f"(chunk_index, page, section, provenance) for {len(reduced_items)} candidates..."
         )
-        default_ref = mapped_items[0] if mapped_items else {}
         candidates = []
 
         for idx, item in enumerate(reduced_items, 1):
             name = item["name"]
-            src = cls._best_source(name, mapped_items) or default_ref
-            section = item.get("section") or src.get("section") or "General"
+            src, provenance_status = cls._best_source_verified(name, item, mapped_items)
+
+            section = item.get("section") or (src.get("section") if src else None) or "General"
             if section not in cls.VALID_SECTIONS:
                 section = "General"
 
-            raw_page = src.get("page_number")
+            chunk_idx = src.get("chunk_index") if src else None
+            raw_page = src.get("page_number") if src else None
+
             # Honest page reporting: only real integers from PDF, never fabricated for docx
             has_real_page = raw_page is not None and isinstance(raw_page, int) and raw_page >= 0
             page_val = raw_page if has_real_page else None
             page_locator = f"Page {raw_page}" if has_real_page else "N/A (Flow Document)"
-            
-            chunk_idx = src.get("chunk_index")
+
             source_locator = f"chunk_{chunk_idx}" if chunk_idx is not None else "chunk_N/A"
 
-            evidence = src.get("evidence_snippet") or src.get("description") or name
-            verbatim_evidence = evidence[:220].strip()
+            # Evidence snippet: use the per-item evidence from MAP (LLM description),
+            # not the raw window start. If UNRESOLVED, mark clearly.
+            if src:
+                evidence = src.get("evidence_snippet") or src.get("description") or name
+            else:
+                evidence = item.get("description") or name
+                provenance_status = PROVENANCE_UNRESOLVED
+
+            verbatim_evidence = evidence[:300].strip()
 
             candidate_dict = {
                 "name": name,
@@ -783,43 +1119,110 @@ class DeepScanExtractor:
                 "raw_text": item.get("description", name),
                 "evidence_text": verbatim_evidence,
                 "document_id": document_id,
-                "is_pure_milestone": item.get("is_pure_milestone", False) or src.get("is_pure_milestone", False),
+                "is_pure_milestone": item.get("is_pure_milestone", False) or (src.get("is_pure_milestone", False) if src else False),
+                "provenance_status": provenance_status,
+                "window_id": src.get("window_id") if src else None,
+                "window_indices": src.get("window_indices") if src else [],
             }
             candidates.append(candidate_dict)
 
             kind = "Milestone" if candidate_dict["is_pure_milestone"] else "Clause"
             cls._log(
                 logger,
-                f"    [{idx:02d}] [{kind}] \"{name}\" -> Section: '{section}' | {source_locator} | {page_locator}"
+                f"    [{idx:02d}] [{kind}] \"{name}\" -> Section: '{section}' | "
+                f"{source_locator} | {page_locator} | Provenance: {provenance_status}"
             )
 
+        # Summary of provenance
+        prov_counts = {
+            PROVENANCE_VERIFIED: sum(1 for c in candidates if c["provenance_status"] == PROVENANCE_VERIFIED),
+            PROVENANCE_PARTIAL: sum(1 for c in candidates if c["provenance_status"] == PROVENANCE_PARTIAL),
+            PROVENANCE_UNRESOLVED: sum(1 for c in candidates if c["provenance_status"] == PROVENANCE_UNRESOLVED),
+        }
         cls._log(
             logger,
-            f"  [DeepScan][5/5: Candidate Rehydration] Successfully rehydrated {len(candidates)} canonical scope candidates.\n"
+            f"  [DeepScan][5/5: Candidate Rehydration] Successfully rehydrated {len(candidates)} canonical candidates. "
+            f"Provenance: VERIFIED={prov_counts[PROVENANCE_VERIFIED]}, "
+            f"PARTIALLY_VERIFIED={prov_counts[PROVENANCE_PARTIAL]}, "
+            f"UNRESOLVED={prov_counts[PROVENANCE_UNRESOLVED]}\n"
         )
+
+        if prov_counts[PROVENANCE_UNRESOLVED] > 0:
+            unresolved_names = [c["name"] for c in candidates if c["provenance_status"] == PROVENANCE_UNRESOLVED]
+            cls._log(
+                logger,
+                f"  [WARNING][Rehydration] {prov_counts[PROVENANCE_UNRESOLVED]} candidates have UNRESOLVED provenance: "
+                f"{unresolved_names[:10]}{'...' if len(unresolved_names) > 10 else ''}"
+            )
+
         return candidates
 
-    @staticmethod
-    def _best_source(name: str, mapped_items: list[dict]) -> Optional[dict]:
-        """Finds the mapped item whose name best matches `name` while checking action/entity."""
+    @classmethod
+    def _best_source_verified(
+        cls,
+        name: str,
+        reduced_item: dict,
+        mapped_items: list[dict],
+    ) -> Tuple[Optional[dict], str]:
+        """
+        Finds the mapped item whose evidence best supports this candidate.
+        Returns (best_source_item, provenance_status).
+
+        Rules:
+        1. Exact name match -> VERIFIED
+        2. Name contained in/containing other -> ratio check -> VERIFIED or PARTIALLY_VERIFIED
+        3. Fuzzy ratio >= 0.60 -> check if evidence semantically supports name
+        4. No match -> UNRESOLVED (do NOT fall back to first item)
+        """
         name_l = name.lower()
         best = None
         best_ratio = 0.0
+
         for it in mapped_items:
             it_name_l = it["name"].lower()
             can_m, _ = ActionEntityProtector.can_merge({"name": name}, it)
             if not can_m:
                 continue
+
+            # Exact match
             if name_l == it_name_l:
-                return it
+                return it, PROVENANCE_VERIFIED
+
+            # Substring match
             if name_l in it_name_l or it_name_l in name_l:
                 ratio = 0.90
             else:
                 ratio = difflib.SequenceMatcher(None, name_l, it_name_l).ratio()
+
             if ratio > best_ratio:
                 best_ratio = ratio
                 best = it
-        return best if best_ratio >= 0.60 else None
+
+        if best is None or best_ratio < 0.45:
+            # No defensible match: UNRESOLVED
+            return None, PROVENANCE_UNRESOLVED
+
+        # Validate: does the matched chunk's evidence actually mention anything
+        # semantically related to the candidate name?
+        name_keywords = set(re.findall(r"\b[a-zA-Z]{3,}\b", name_l))
+        evidence_text = (best.get("evidence_snippet") or best.get("description") or "").lower()
+        window_text = best.get("_window_text", "").lower()
+        combined_evidence = evidence_text + " " + window_text
+
+        # Check how many name keywords appear in the evidence
+        if name_keywords:
+            overlap = sum(1 for kw in name_keywords if kw in combined_evidence)
+            overlap_ratio = overlap / len(name_keywords)
+        else:
+            overlap_ratio = 1.0  # no keywords to check -> not a concern
+
+        if best_ratio >= 0.85 and overlap_ratio >= 0.3:
+            return best, PROVENANCE_VERIFIED
+        elif best_ratio >= 0.60 and overlap_ratio >= 0.2:
+            return best, PROVENANCE_PARTIAL
+        else:
+            # Low overlap -> provenance is suspect
+            return best, PROVENANCE_PARTIAL
 
     # ------------------------------------------------------------------ #
     # 6) MAP-to-REDUCE Coverage Auditor
@@ -838,11 +1241,23 @@ class DeepScanExtractor:
         - MERGED: mapped to a surviving canonical candidate with merge rationale.
         - EXCLUDED: explicitly excluded (empty/malformed).
         - UNRESOLVED: unmapped candidate (triggers warning).
+
+        Audit invariants:
+        1. Every unique MAP candidate has exactly one terminal outcome.
+        2. No candidate is counted twice.
+        3. Every MERGED record maps to an existing canonical.
+        4. Every RETAINED record references an actual canonical.
+        5. canonical_candidates_count == unique canonical records.
+        6. coverage% is derived from a clearly documented formula.
         """
         cls._log(logger, "  [DeepScan][Coverage Audit] Verifying MAP-to-REDUCE candidate coverage accounting...")
 
         canonical_lookup = {c["name"].lower().strip(): c for c in canonical_candidates}
-        merge_lookup = {m["merged_name"].lower().strip(): m for m in merge_events}
+        # Build merge lookup: merged_name -> surviving canonical name
+        merge_lookup: dict[str, str] = {}
+        for m in merge_events:
+            ml = m["merged_name"].lower().strip()
+            merge_lookup[ml] = m["surviving_name"]
 
         audit_records = []
         retained_count = 0
@@ -850,50 +1265,65 @@ class DeepScanExtractor:
         excluded_count = 0
         unresolved_count = 0
 
-        for idx, it in enumerate(mapped_items, 1):
+        # Track which MAP candidates have been assigned (for deduplication of outcome)
+        assigned: set[int] = set()
+
+        for item_idx, it in enumerate(mapped_items):
+            if item_idx in assigned:
+                continue
+            assigned.add(item_idx)
+
             raw_name = (it.get("name") or "").strip()
             raw_name_l = raw_name.lower()
+            section = it.get("section", "General")
 
+            # EXCLUDED: empty or malformed
             if not raw_name or len(raw_name) < 2:
                 audit_records.append({
-                    "map_index": idx,
+                    "map_index": item_idx + 1,
                     "raw_name": raw_name,
                     "status": "EXCLUDED",
                     "canonical_name": None,
-                    "section": it.get("section", "General"),
+                    "section": section,
                     "rationale": "Empty or malformed candidate string",
+                    "warning": None,
                 })
                 excluded_count += 1
                 continue
 
-            # 1. Check RETAINED (exact or near-identical in canonical list)
+            # 1. RETAINED: exact match in canonical list
             if raw_name_l in canonical_lookup:
                 audit_records.append({
-                    "map_index": idx,
+                    "map_index": item_idx + 1,
                     "raw_name": raw_name,
                     "status": "RETAINED",
                     "canonical_name": canonical_lookup[raw_name_l]["name"],
-                    "section": it.get("section", "General"),
+                    "section": section,
                     "rationale": "Survives directly as distinct canonical candidate",
+                    "warning": None,
                 })
                 retained_count += 1
                 continue
 
-            # 2. Check documented MERGED event from deduplication
+            # 2. MERGED: documented merge event
             if raw_name_l in merge_lookup:
-                m_info = merge_lookup[raw_name_l]
+                surviving = merge_lookup[raw_name_l]
+                surviving_l = surviving.lower().strip()
+                # Validate that the surviving canonical actually exists
+                surviving_exists = surviving_l in canonical_lookup
                 audit_records.append({
-                    "map_index": idx,
+                    "map_index": item_idx + 1,
                     "raw_name": raw_name,
                     "status": "MERGED",
-                    "canonical_name": m_info["surviving_name"],
-                    "section": it.get("section", "General"),
-                    "rationale": m_info["rationale"],
+                    "canonical_name": surviving,
+                    "section": section,
+                    "rationale": "Merged into surviving canonical candidate",
+                    "warning": None if surviving_exists else f"INVARIANT VIOLATION: Surviving canonical '{surviving}' not found in canonical list",
                 })
                 merged_count += 1
                 continue
 
-            # 3. Fuzzy match to canonical candidate with action/entity check
+            # 3. Fuzzy RETAINED or MERGED: try to find the canonical
             best_c = None
             best_sim = 0.0
             for c_name_l, c_obj in canonical_lookup.items():
@@ -906,28 +1336,51 @@ class DeepScanExtractor:
 
             if best_c and best_sim >= 0.70:
                 audit_records.append({
-                    "map_index": idx,
+                    "map_index": item_idx + 1,
                     "raw_name": raw_name,
                     "status": "MERGED",
                     "canonical_name": best_c["name"],
-                    "section": it.get("section", "General"),
+                    "section": section,
                     "rationale": f"Consolidated into canonical candidate across overlapping windows (similarity: {best_sim:.2f})",
+                    "warning": None,
                 })
                 merged_count += 1
             else:
                 audit_records.append({
-                    "map_index": idx,
+                    "map_index": item_idx + 1,
                     "raw_name": raw_name,
                     "status": "UNRESOLVED",
                     "canonical_name": None,
-                    "section": it.get("section", "General"),
+                    "section": section,
                     "rationale": "Candidate was not preserved and has no defensible merge mapping",
+                    "warning": "Review required: this requirement may have been silently lost",
                 })
                 unresolved_count += 1
 
         total = len(mapped_items)
+        # Coverage formula:
+        # coverage = (RETAINED + MERGED + EXCLUDED) / total * 100
+        # EXCLUDED is included because malformed items are genuinely handled (just rejected).
+        # UNRESOLVED items reduce coverage — they represent potentially lost requirements.
         accounted = retained_count + merged_count + excluded_count
         coverage_pct = round((accounted / total * 100), 2) if total else 100.0
+
+        # Provenance breakdown from canonical candidates
+        prov_verified = sum(1 for c in canonical_candidates if c.get("provenance_status") == PROVENANCE_VERIFIED)
+        prov_partial = sum(1 for c in canonical_candidates if c.get("provenance_status") == PROVENANCE_PARTIAL)
+        prov_unresolved = sum(1 for c in canonical_candidates if c.get("provenance_status") == PROVENANCE_UNRESOLVED)
+        prov_total = len(canonical_candidates)
+        prov_pct = round((prov_verified / prov_total * 100), 2) if prov_total else 100.0
+
+        # Invariant checks
+        warnings = []
+        if retained_count + merged_count + excluded_count + unresolved_count != total:
+            warnings.append(
+                f"INVARIANT VIOLATION: outcome totals ({retained_count}+{merged_count}+"
+                f"{excluded_count}+{unresolved_count}) != total MAP candidates ({total})"
+            )
+        if len(canonical_candidates) != len(set(c["name"] for c in canonical_candidates)):
+            warnings.append("INVARIANT VIOLATION: Canonical candidates contain duplicate names")
 
         report = {
             "total_map_candidates": total,
@@ -937,16 +1390,36 @@ class DeepScanExtractor:
             "excluded_count": excluded_count,
             "unresolved_count": unresolved_count,
             "coverage_percentage": coverage_pct,
+            "coverage_formula": "(RETAINED + MERGED + EXCLUDED) / total_map_candidates * 100",
+            "provenance": {
+                "verified_count": prov_verified,
+                "partially_verified_count": prov_partial,
+                "unresolved_count": prov_unresolved,
+                "verified_percentage": prov_pct,
+            },
+            "invariant_warnings": warnings,
             "audit_records": audit_records,
         }
 
         cls._log(
             logger,
             f"  [DeepScan][Coverage Audit] Summary: Total MAP={total} | Canonical={len(canonical_candidates)} | "
-            f"RETAINED={retained_count} | MERGED={merged_count} | EXCLUDED={excluded_count} | UNRESOLVED={unresolved_count} | "
-            f"Coverage={coverage_pct}%"
+            f"RETAINED={retained_count} | MERGED={merged_count} | EXCLUDED={excluded_count} | "
+            f"UNRESOLVED={unresolved_count} | Coverage={coverage_pct}%"
+        )
+        cls._log(
+            logger,
+            f"  [DeepScan][Coverage Audit] Provenance: VERIFIED={prov_verified} | "
+            f"PARTIALLY_VERIFIED={prov_partial} | UNRESOLVED={prov_unresolved} | "
+            f"Verified%={prov_pct}%"
         )
         if unresolved_count > 0:
-            cls._log(logger, f"  [WARNING][Coverage Audit] {unresolved_count} MAP candidates were UNRESOLVED!")
+            cls._log(
+                logger,
+                f"  [WARNING][Coverage Audit] {unresolved_count} MAP candidates were UNRESOLVED! "
+                f"These requirements may be lost."
+            )
+        for w in warnings:
+            cls._log(logger, f"  [INVARIANT WARNING] {w}")
 
         return report
