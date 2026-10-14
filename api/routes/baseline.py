@@ -99,15 +99,35 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 
     logger = BaselineLogger(project_id, document_id)
 
+    def get_valid_db_conn():
+        nonlocal thread_conn
+        try:
+            if thread_conn and thread_conn.is_connected():
+                thread_conn.ping(reconnect=True, attempts=3, delay=1)
+                return thread_conn
+        except Exception:
+            pass
+        try:
+            new_conn = get_db_connection()
+            if new_conn:
+                thread_conn = new_conn
+                logger.log("Successfully refreshed MySQL connection.", level="INFO")
+        except Exception as conn_err:
+            logger.log(f"Failed to reconnect to database: {conn_err}", level="ERROR")
+        return thread_conn
+
     def emit(step: str, progress: int):
         logger.log(f"[PROGRESS {progress}%] {step}")
+        conn = get_valid_db_conn()
+        if not conn:
+            return
         try:
-            upd_cursor = thread_conn.cursor()
+            upd_cursor = conn.cursor()
             upd_cursor.execute(
                 "UPDATE documents SET processing_progress = %s, processing_step = %s WHERE id = %s",
                 (progress, step, document_id)
             )
-            thread_conn.commit()
+            conn.commit()
             upd_cursor.close()
         except Exception as ex:
             logger.log(f"Failed to update baseline progress in DB for {step}: {ex}", level="WARN")
@@ -194,19 +214,16 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         emit("Detecting Scope Sections", 15)
         logger.step_start(2, "Scope Section Detection")
         logger.input("Input Chunks Count", len(chunks))
-        logger.process("Executing deterministic regex matching on chunk headings and body text...")
-        chunks_with_sections = ScopeSectionDetector.detect_sections(chunks)
+        logger.process("Executing deterministic structural heading detection on chunk boundaries...")
+        chunks_with_sections, section_stats = ScopeSectionDetector.detect_sections_with_stats(chunks)
         step2_time = time.time() - t_step2
 
-        sec_counts = {}
-        for c in chunks_with_sections:
-            sec = c.get("section", "General")
-            sec_counts[sec] = sec_counts.get(sec, 0) + 1
-
-        logger.output("Total Sectioned Chunks", len(chunks_with_sections))
-        logger.output("Distinct Sections Found", len(sec_counts))
-        for sec, cnt in sorted(sec_counts.items(), key=lambda x: x[1], reverse=True):
-            logger.raw_log(f"    - Section '{sec}': {cnt} chunk(s)")
+        logger.output("Categories Defined in Taxonomy", section_stats["categories_defined"])
+        logger.output("Distinct Categories Detected in Document", section_stats["categories_detected"])
+        logger.output("Total Sectioned Segments Created", len(chunks_with_sections))
+        for sec in section_stats["detected_sections"]:
+            cnt = sum(1 for c in chunks_with_sections if c.get("section") == sec)
+            logger.raw_log(f"    - Section '{sec}': {cnt} segment(s)")
 
         # ── Terminal Log: First 20 Section-Tagged Chunks (Step 2) ──
         preview_count_s2 = min(20, len(chunks_with_sections))
@@ -214,11 +231,14 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         for i in range(preview_count_s2):
             c = chunks_with_sections[i]
             c_idx = c.get("chunk_index", i)
+            seg_idx = c.get("segment_index", 0)
             sec_name = c.get("section", "General")
+            conf_val = c.get("section_confidence", 1.0)
+            inferred_str = "(Inferred)" if c.get("is_inferred") else "(Structural Heading)"
             c_text = (c.get("text") or "").strip()
             c_len = len(c_text)
             snippet = c_text[:160].replace("\r", " ").replace("\n", " ").strip()
-            logger.raw_log(f"    [ScopeSection] chunk_index={c_idx} belongs to Section: '{sec_name}' | length={c_len} chars")
+            logger.raw_log(f"    [ScopeSection] chunk_index={c_idx} seg={seg_idx} belongs to Section: '{sec_name}' [{inferred_str}, conf={conf_val:.2f}] | length={c_len} chars")
             logger.raw_log(f"      Text: \"{snippet}...\"")
         logger.raw_log("")
         logger.step_end(2, "Scope Section Detection", step2_time)
@@ -229,10 +249,11 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         logger.step_start(3, "Candidate Scope Extraction")
         logger.input("Sectioned Chunks Count", len(chunks_with_sections))
         logger.input("Extraction Mode", mode)
+        coverage_audit = {}
         if mode == DEEP_SCAN:
-            logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap) candidate extractor...")
+            logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap + Action/Entity Protection)...")
             from services.deep_scan_extractor import DeepScanExtractor
-            raw_candidates = DeepScanExtractor.extract_candidates(
+            raw_candidates, coverage_audit = DeepScanExtractor.extract_candidates_with_coverage(
                 project_id=project_id,
                 document_id=document_id,
                 document_type=doc.get("document_type", "EL"),
@@ -245,87 +266,178 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
         step3_time = time.time() - t_step3
 
-        logger.output("Raw Candidates Extracted", len(raw_candidates))
+        logger.output("Canonical Candidates Extracted", len(raw_candidates))
+        if coverage_audit:
+            logger.output("MAP-to-REDUCE Candidate Coverage Audit", {
+                "Total MAP Raw Candidates": coverage_audit.get("total_map_candidates", 0),
+                "Canonical Candidates Produced": coverage_audit.get("total_canonical_candidates", 0),
+                "Retained Distinct Count": coverage_audit.get("retained_count", 0),
+                "Consolidated Merged Count": coverage_audit.get("merged_count", 0),
+                "Excluded Count": coverage_audit.get("excluded_count", 0),
+                "Unresolved Count": coverage_audit.get("unresolved_count", 0),
+                "Coverage Accounting": f"{coverage_audit.get('coverage_percentage', 100.0)}%",
+            })
+
         for idx, cand in enumerate(raw_candidates, 1):
-            logger.item(idx, cand.get('name', ''), {"Section": cand.get('section', 'General'), "Type": "Pure Milestone" if cand.get("is_pure_milestone") else "Clause"})
+            logger.item(
+                idx,
+                cand.get("name", ""),
+                {
+                    "Section": cand.get("section", "General"),
+                    "Type": "Pure Milestone" if cand.get("is_pure_milestone") else "Clause",
+                    "Locator": cand.get("source_locator", "N/A"),
+                },
+            )
         logger.step_end(3, "Candidate Scope Extraction", step3_time)
 
-        # ── Step 4: Candidate Scope Classification ──
-        t_step4 = time.time()
-        emit("Classifying Scope Items", 50)
-        logger.step_start(4, "Candidate Scope Classification")
-        logger.input("Raw Candidates Count", len(raw_candidates))
-        logger.process("Applying deterministic section heading pre-filter (confidence=1.0) and LLM batch classifier...")
-        classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
-        step4_time = time.time() - t_step4
+        # ── [INSPECTION MODE: CLEAN STOP AFTER STEP 3] ──
+        # When inspection mode is enabled, stop immediately after Step 3.
+        # Generate diagnostic artifact, log full coverage audit, and DO NOT
+        # write unclassified candidates to production baseline tables.
+        INSPECTION_MODE = os.getenv("BASELINE_INSPECTION_MODE", "true").lower() in ("true", "1", "yes")
 
-        class_counts = {}
-        for c in classified_candidates:
-            st = c.get("scope_type", "UNCERTAIN")
-            class_counts[st] = class_counts.get(st, 0) + 1
+        if INSPECTION_MODE:
+            import json
+            logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs"))
+            os.makedirs(logs_dir, exist_ok=True)
+            inspection_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}.json")
 
-        logger.output("Classified Items Breakdown", class_counts)
-        for idx, c in enumerate(classified_candidates, 1):
-            conf_pct = int((c.get("confidence") or 0.5) * 100)
-            ev = (c.get("evidence_text") or "")[:80].replace("\n", " ")
-            logger.item(idx, c.get('name', ''), {"Class": c.get("scope_type"), "Conf": f"{conf_pct}%", "Evidence": f'"{ev}..."' if ev else "None"})
-        logger.step_end(4, "Candidate Scope Classification", step4_time)
+            diagnostic_artifact = {
+                "project_id": project_id,
+                "document_id": document_id,
+                "document_name": doc.get("document_name", "demo_EL.docx"),
+                "extraction_mode": mode,
+                "step1_raw_chunks_sample": [
+                    {
+                        "chunk_index": c.get("chunk_index"),
+                        "page_number": c.get("page_number"),
+                        "length": len(c.get("text", "")),
+                        "snippet": c.get("text", "")[:200],
+                    }
+                    for c in chunks[:20]
+                ],
+                "step2_section_detection": {
+                    "categories_defined": section_stats.get("categories_defined", 16),
+                    "categories_detected": section_stats.get("categories_detected", len(section_stats.get("detected_sections", []))),
+                    "detected_sections": section_stats.get("detected_sections", []),
+                    "first_20_segments": [
+                        {
+                            "chunk_index": c.get("chunk_index"),
+                            "segment_index": c.get("segment_index", 0),
+                            "section": c.get("section"),
+                            "confidence": c.get("section_confidence", 1.0),
+                            "is_inferred": c.get("is_inferred", False),
+                            "snippet": c.get("text", "")[:180],
+                        }
+                        for c in chunks_with_sections[:20]
+                    ],
+                },
+                "step3_candidate_extraction": {
+                    "canonical_candidates_count": len(raw_candidates),
+                    "coverage_audit": coverage_audit,
+                    "canonical_candidates": raw_candidates,
+                },
+            }
+            with open(inspection_artifact_path, "w", encoding="utf-8") as f_art:
+                json.dump(diagnostic_artifact, f_art, indent=2, default=str)
 
-        # ── Step 5: Fuzzy Deduplication & Scope Consolidation ──
-        t_step5 = time.time()
-        emit("Deduplicating Candidates", 70)
-        logger.step_start(5, "Fuzzy Deduplication & Scope Consolidation")
-        logger.input("Candidates Before Dedup", len(classified_candidates))
-        logger.process("Applying difflib SequenceMatcher fuzzy consolidation (threshold=0.80)...")
-        deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
-        step5_time = time.time() - t_step5
+            logger.banner("INSPECTION MODE COMPLETE — PIPELINE STOPPED AFTER STEP 3")
+            logger.process(f"Diagnostic inspection artifact saved to: {inspection_artifact_path}")
+            logger.output("Step 3 Canonical Candidates Verified", len(raw_candidates))
+            logger.output("MAP-to-REDUCE Coverage", f"{coverage_audit.get('coverage_percentage', 100.0)}%")
 
-        merged_count = len(classified_candidates) - len(deduped_candidates)
-        logger.output("Consolidated Candidates Count", len(deduped_candidates))
-        logger.output("Duplicate Items Merged", merged_count)
-        for idx, c in enumerate(deduped_candidates, 1):
-            logger.item(idx, c.get('name', ''), {"Class": c.get("scope_type"), "Section": c.get("section")})
-        logger.step_end(5, "Fuzzy Deduplication & Scope Consolidation", step5_time)
+            conn = get_valid_db_conn()
+            if conn:
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, "
+                            "processing_step = 'Inspection Complete (Step 3)', processing_error = NULL WHERE id = %s",
+                            (document_id,),
+                        )
+                        conn.commit()
+                except Exception as db_err:
+                    logger.log(f"Notice updating document inspection status: {db_err}", level="WARN")
 
-        # ── Step 6: Milestone & Deadline Extraction ──
-        t_step6 = time.time()
-        emit("Extracting Milestones & Deadlines", 85)
-        logger.step_start(6, "Milestone & Deadline Extraction")
-        logger.input("Input Candidates Count", len(deduped_candidates))
+            emit("Inspection Complete (Step 3)", 100)
+            return
+        else:
+            # ── Step 4: Candidate Scope Classification ──
+            t_step4 = time.time()
+            emit("Classifying Scope Items", 50)
+            logger.step_start(4, "Candidate Scope Classification")
+            logger.input("Raw Candidates Count", len(raw_candidates))
+            logger.process("Applying deterministic section heading pre-filter (confidence=1.0) and LLM batch classifier...")
+            classified_candidates = ScopeClassifier.classify_candidates_batch(project_id, raw_candidates)
+            step4_time = time.time() - t_step4
 
-        proj_start_date = None
-        try:
-            from datetime import datetime as dt_cls, date as d_cls
-            p_cur = thread_conn.cursor(dictionary=True)
-            p_cur.execute("SELECT start_date FROM projects WHERE id = %s", (project_id,))
-            p_row = p_cur.fetchone()
-            p_cur.close()
-            if p_row and p_row.get("start_date"):
-                sd = p_row["start_date"]
-                if hasattr(sd, "date"):
-                    proj_start_date = sd.date()
-                elif isinstance(sd, d_cls):
-                    proj_start_date = sd
-                elif isinstance(sd, str):
-                    proj_start_date = dt_cls.strptime(sd[:10], "%Y-%m-%d").date()
-        except Exception as e:
-            logger.log(f"Could not fetch project start date for relative deadlines: {e}", level="WARN")
+            class_counts = {}
+            for c in classified_candidates:
+                st = c.get("scope_type", "UNCERTAIN")
+                class_counts[st] = class_counts.get(st, 0) + 1
 
-        logger.input("Project Start Date", str(proj_start_date or 'None'))
-        logger.process("Matching absolute dates and calculating relative week intervals (Weeks 1-N)...")
-        enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates, project_start=proj_start_date)
-        step6_time = time.time() - t_step6
+            logger.output("Classified Items Breakdown", class_counts)
+            for idx, c in enumerate(classified_candidates, 1):
+                conf_pct = int((c.get("confidence") or 0.5) * 100)
+                ev = (c.get("evidence_text") or "")[:80].replace("\n", " ")
+                logger.item(idx, c.get('name', ''), {"Class": c.get("scope_type"), "Conf": f"{conf_pct}%", "Evidence": f'"{ev}..."' if ev else "None"})
+            logger.step_end(4, "Candidate Scope Classification", step4_time)
 
-        timeline_items = [c for c in enriched_candidates if c.get("milestone") or c.get("deadline_text") or c.get("deadline")]
-        logger.output("Candidates Enriched", len(enriched_candidates))
-        logger.output("Items with Timeline / Deadline", len(timeline_items))
-        for idx, c in enumerate(timeline_items, 1):
-            d_text = c.get("deadline_text") or "N/A"
-            d_norm = c.get("deadline") or "N/A"
-            m_val = c.get("milestone") or c.get("name")
-            method = c.get("extraction_method", "N/A")
-            logger.item(idx, m_val, {"Raw Date": d_text, "Normalized ISO": d_norm, "Method": method})
-        logger.step_end(6, "Milestone & Deadline Extraction", step6_time)
+            # ── Step 5: Fuzzy Deduplication & Scope Consolidation ──
+            t_step5 = time.time()
+            emit("Deduplicating Candidates", 70)
+            logger.step_start(5, "Fuzzy Deduplication & Scope Consolidation")
+            logger.input("Candidates Before Dedup", len(classified_candidates))
+            logger.process("Applying difflib SequenceMatcher fuzzy consolidation (threshold=0.80)...")
+            deduped_candidates = ScopeDeduplicator.deduplicate(classified_candidates)
+            step5_time = time.time() - t_step5
+
+            merged_count = len(classified_candidates) - len(deduped_candidates)
+            logger.output("Consolidated Candidates Count", len(deduped_candidates))
+            logger.output("Duplicate Items Merged", merged_count)
+            for idx, c in enumerate(deduped_candidates, 1):
+                logger.item(idx, c.get('name', ''), {"Class": c.get("scope_type"), "Section": c.get("section")})
+            logger.step_end(5, "Fuzzy Deduplication & Scope Consolidation", step5_time)
+
+            # ── Step 6: Milestone & Deadline Extraction ──
+            t_step6 = time.time()
+            emit("Extracting Milestones & Deadlines", 85)
+            logger.step_start(6, "Milestone & Deadline Extraction")
+            logger.input("Input Candidates Count", len(deduped_candidates))
+
+            proj_start_date = None
+            try:
+                from datetime import datetime as dt_cls, date as d_cls
+                p_cur = thread_conn.cursor(dictionary=True)
+                p_cur.execute("SELECT start_date FROM projects WHERE id = %s", (project_id,))
+                p_row = p_cur.fetchone()
+                p_cur.close()
+                if p_row and p_row.get("start_date"):
+                    sd = p_row["start_date"]
+                    if hasattr(sd, "date"):
+                        proj_start_date = sd.date()
+                    elif isinstance(sd, d_cls):
+                        proj_start_date = sd
+                    elif isinstance(sd, str):
+                        proj_start_date = dt_cls.strptime(sd[:10], "%Y-%m-%d").date()
+            except Exception as e:
+                logger.log(f"Could not fetch project start date for relative deadlines: {e}", level="WARN")
+
+            logger.input("Project Start Date", str(proj_start_date or 'None'))
+            logger.process("Matching absolute dates and calculating relative week intervals (Weeks 1-N)...")
+            enriched_candidates = MilestoneDeadlineExtractor.extract(deduped_candidates, project_start=proj_start_date)
+            step6_time = time.time() - t_step6
+
+            timeline_items = [c for c in enriched_candidates if c.get("milestone") or c.get("deadline_text") or c.get("deadline")]
+            logger.output("Candidates Enriched", len(enriched_candidates))
+            logger.output("Items with Timeline / Deadline", len(timeline_items))
+            for idx, c in enumerate(timeline_items, 1):
+                d_text = c.get("deadline_text") or "N/A"
+                d_norm = c.get("deadline") or "N/A"
+                m_val = c.get("milestone") or c.get("name")
+                method = c.get("extraction_method", "N/A")
+                logger.item(idx, m_val, {"Raw Date": d_text, "Normalized ISO": d_norm, "Method": method})
+            logger.step_end(6, "Milestone & Deadline Extraction", step6_time)
 
         # ── Step 7: Title Normalization & Scope Items DB Persistence ──
         t_step7 = time.time()
@@ -345,6 +457,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             "stakeholders": []
         }
 
+        thread_conn = get_valid_db_conn()
         existing_draft = BaselineRepository.get_draft_baseline(thread_conn, project_id)
         latest_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id)
 
@@ -370,23 +483,46 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         has_approved = BaselineRepository.get_latest_approved_baseline(thread_conn, project_id) is not None
         existing_scope_items = BaselineRepository.get_scope_items_for_diff(thread_conn, baseline_id)
 
+        valid_scope_types = {"IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"}
+        valid_categories = {"FUNCTIONAL", "TECHNICAL", "DELIVERABLE", "OUT_OF_SCOPE", "MILESTONE"}
+        valid_completion_statuses = {"ACTIVE", "COMPLETED", "CANCELLED"}
+
         saved_scope_count = 0
         for item in extracted_data.get("scope_items", []):
-            item_name = item.get("name", "Unknown")
-            item_type = item.get("scope_type", "UNCERTAIN")
-            item_category = item.get("category")
-            if item.get("is_pure_milestone", False):
+            item_name = (item.get("name") or "Unknown")[:490]
+            raw_type = str(item.get("scope_type", "UNCERTAIN")).upper().strip()
+            if raw_type in valid_scope_types:
+                item_type = raw_type
+            elif "OUT" in raw_type or "RESPONSIBILITY" in raw_type or "ASSUMPTION" in raw_type:
+                item_type = "OUT_OF_SCOPE"
+            elif "IN" in raw_type or "SCOPE" in raw_type:
+                item_type = "IN_SCOPE"
+            else:
+                item_type = "UNCERTAIN"
+
+            raw_cat = str(item.get("category", "")).upper().strip()
+            if raw_cat in valid_categories:
+                item_category = raw_cat
+            elif item.get("is_pure_milestone", False) or item.get("section") == "Milestones" or "MILESTONE" in raw_cat:
                 item_type = "IN_SCOPE"
                 item_category = "MILESTONE"
-            if not item_category:
+            elif item_type == "OUT_OF_SCOPE":
+                item_category = "OUT_OF_SCOPE"
+            elif item.get("section") == "Deliverables" or "DELIVERABLE" in raw_cat:
+                item_category = "DELIVERABLE"
+            elif "TECH" in raw_cat:
+                item_category = "TECHNICAL"
+            else:
                 item_category = "FUNCTIONAL"
 
-            raw_status = item.get("milestone_status", "").upper()
+            raw_status = str(item.get("milestone_status", "")).upper().strip()
             completion_status = "ACTIVE"
             if "COMPLETED" in raw_status or "DONE" in raw_status:
                 completion_status = "COMPLETED"
             elif "CANCEL" in raw_status:
                 completion_status = "CANCELLED"
+            if completion_status not in valid_completion_statuses:
+                completion_status = "ACTIVE"
 
             existing_item, best_ratio = find_best_match(item_name, existing_scope_items, key="name", threshold=0.8)
             if existing_item:

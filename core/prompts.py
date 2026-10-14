@@ -916,10 +916,12 @@ Return JSON format with schema:
 # The Map phase extracts every distinct scope-related item from a page/chunk
 # window WITHOUT classifying it (a later stage classifies IN/OUT of scope).
 # The Reduce phase merges and deduplicates the mapped items into a clean list.
-def get_deep_scan_map_prompt(chunk_text: str) -> str:
+def get_deep_scan_map_prompt(chunk_text: str, context_section: str = None) -> str:
+    section_hint = f"\nContext Section (from document structural headings): {context_section}" if context_section else ""
     return f"""
 You are an expert contract analyst performing the MAP phase of a Map-Reduce scope extraction.
 Read the following excerpt from an Engagement Letter (EL) or Inter-Firm Approval (IFA) document and extract EVERY distinct scope-related item you can find: services or deliverables the vendor will provide, items that are explicitly excluded, client responsibilities, assumptions, dependencies, and milestones.
+{section_hint}
 
 Do NOT decide whether an item is in-scope or out-of-scope — a later stage does that. Your job is only to faithfully capture each distinct item.
 
@@ -967,8 +969,15 @@ Candidate items:
 {json.dumps(items_for_prompt, indent=2)}
 
 Task:
-1. Merge duplicates and near-duplicates that refer to the SAME underlying item into a single entry. Keep the clearest "name" and the most complete "description".
-2. Do NOT merge genuinely distinct items (for example, keep SIT, UAT, and Production Deployment as separate items).
+1. Merge duplicates and near-duplicates that refer to the EXACT SAME underlying item across overlapping excerpts into a single entry. Keep the clearest "name" and the most complete "description".
+2. Do NOT merge genuinely distinct items, even if they share a long common prefix or general feature area:
+   - ACTION CONTRASTS MUST BE PRESERVED:
+     * Posting access control vs Viewing access control (e.g. "Job Requisition Access Control - Post" and "Job Requisition Access Control - View" are distinct permissions; KEEP BOTH).
+     * Downloading job requisition lists vs Downloading applicant lists (different datasets; KEEP BOTH).
+     * Approving/rejecting a job requisition vs Recommending/rejecting an applicant (different operations; KEEP BOTH).
+     * UAT Execution vs UAT Sign-off (different workflow milestones; KEEP BOTH).
+     * Production Deployment vs Production Cutover (different activities; KEEP BOTH).
+     * Training Creation vs Training Assignment (different administrative functions; KEEP BOTH).
 3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one 'Out of Scope Exclusions' item, and do not group distinct features like "audit logs" and "user management" into one "Security" item). Every distinct line item from the contract must remain a distinct item.
 4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST remain a distinct item.
 5. Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the "name".

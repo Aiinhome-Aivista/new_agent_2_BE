@@ -135,6 +135,32 @@ class BaselineRepository:
         estimated_effort_low: Optional[float] = None, estimated_effort_likely: Optional[float] = None,
         estimated_effort_high: Optional[float] = None, baseline_approval_status: Optional[str] = None,
     ) -> None:
+        valid_scope_types = {"IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"}
+        valid_categories = {"FUNCTIONAL", "TECHNICAL", "DELIVERABLE", "OUT_OF_SCOPE", "MILESTONE"}
+        valid_completion_statuses = {"ACTIVE", "COMPLETED", "CANCELLED"}
+
+        scope_type = str(scope_type).upper().strip()
+        if scope_type not in valid_scope_types:
+            scope_type = "OUT_OF_SCOPE" if ("OUT" in scope_type or "RESPONSIBILITY" in scope_type or "ASSUMPTION" in scope_type) else "IN_SCOPE"
+
+        category = str(category).upper().strip() if category else "FUNCTIONAL"
+        if category not in valid_categories:
+            category = "OUT_OF_SCOPE" if scope_type == "OUT_OF_SCOPE" else "FUNCTIONAL"
+
+        if completion_status:
+            completion_status = str(completion_status).upper().strip()
+            if completion_status not in valid_completion_statuses:
+                completion_status = "ACTIVE"
+
+        source_section = str(source_section)[:250] if source_section else None
+        status_change_tag = str(status_change_tag)[:250] if status_change_tag else None
+        milestone = str(milestone)[:250] if milestone else None
+        milestone_normalized = str(milestone_normalized)[:250] if milestone_normalized else None
+        deadline_text = str(deadline_text)[:250] if deadline_text else None
+        deadline_original = str(deadline_original)[:250] if deadline_original else None
+        scope_item_normalized = str(scope_item_normalized)[:490] if scope_item_normalized else None
+        extraction_method = str(extraction_method)[:50] if extraction_method else None
+
         cursor = db.cursor()
         sql = """UPDATE scope_items 
                  SET description = %s, scope_type = %s, source_document_id = %s, source_page = %s, 
@@ -175,6 +201,31 @@ class BaselineRepository:
         estimated_effort_low: Optional[float] = None, estimated_effort_likely: Optional[float] = None,
         estimated_effort_high: Optional[float] = None, baseline_approval_status: Optional[str] = 'PENDING_REVIEW',
     ) -> int:
+        valid_scope_types = {"IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"}
+        valid_categories = {"FUNCTIONAL", "TECHNICAL", "DELIVERABLE", "OUT_OF_SCOPE", "MILESTONE"}
+        valid_completion_statuses = {"ACTIVE", "COMPLETED", "CANCELLED"}
+
+        scope_type = str(scope_type).upper().strip()
+        if scope_type not in valid_scope_types:
+            scope_type = "OUT_OF_SCOPE" if ("OUT" in scope_type or "RESPONSIBILITY" in scope_type or "ASSUMPTION" in scope_type) else "IN_SCOPE"
+
+        category = str(category).upper().strip() if category else "FUNCTIONAL"
+        if category not in valid_categories:
+            category = "OUT_OF_SCOPE" if scope_type == "OUT_OF_SCOPE" else "FUNCTIONAL"
+
+        completion_status = str(completion_status).upper().strip() if completion_status else "ACTIVE"
+        if completion_status not in valid_completion_statuses:
+            completion_status = "ACTIVE"
+
+        name = str(name)[:490] if name else "Unknown"
+        scope_item_normalized = str(scope_item_normalized)[:490] if scope_item_normalized else None
+        source_section = str(source_section)[:250] if source_section else None
+        milestone = str(milestone)[:250] if milestone else None
+        milestone_normalized = str(milestone_normalized)[:250] if milestone_normalized else None
+        deadline_text = str(deadline_text)[:250] if deadline_text else None
+        deadline_original = str(deadline_original)[:250] if deadline_original else None
+        extraction_method = str(extraction_method)[:50] if extraction_method else None
+
         cursor = db.cursor()
         sql = """INSERT INTO scope_items 
                  (baseline_id, project_id, name, scope_item_normalized, description, scope_type, source_document_id, source_page, source_section, evidence_text, confidence, deadline, deadline_original, deadline_normalized, milestone, milestone_normalized, deadline_text, extraction_confidence, extraction_method, category, completion_status,

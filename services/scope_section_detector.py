@@ -1,194 +1,300 @@
 import re
+from typing import List, Dict, Any, Tuple, Optional
+
 
 class ScopeSectionDetector:
     """
-    Deterministically identifies sections in document chunks.
-    Avoids using LLMs for section detection to save tokens and ensure consistency.
+    Deterministically identifies structural sections in document chunks.
+    Maintains the active section based on actual structural headings
+    rather than ordinary body-text keywords.
     """
-    
-    # List of (section_name, compiled_pattern) tuples.
-    # ORDER IS CRITICAL: checked top-to-bottom, first match wins.
-    # "Out of Scope" MUST come before any pattern containing "Scope"
-    # to prevent "3. Out of Scope" from matching "Scope of Work".
-    # Generic: patterns cover all common EL/IFA/SOW/MoM heading variations.
-    # No project-specific or industry-specific terms — only structural signals.
-    SECTION_PATTERNS = [
-        # ── OUT OF SCOPE — checked FIRST (contains word "Scope", must win) ──
-        ('Out of Scope', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'out[\s\-_]*of[\s\-_]*scope'
-            r'|exclusions?'
-            r'|not\s+in[\s\-_]*scope'
-            r'|items?\s+not\s+(?:covered|included)'
-            r'|services?\s+not\s+(?:covered|included|provided)'
-            r'|beyond[\s\-_]*scope'
-            r'|what\s+(?:is\s+)?not\s+included'
-            r')',
-            re.MULTILINE
-        )),
 
-        # ── IN SCOPE — checked AFTER Out of Scope ──
-        ('In Scope', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'in[\s\-_]*scope'
-            r'|scope\s+of\s+(?:work|services?|engagement)'
-            r'|project\s+scope'
-            r'|engagement\s+scope'
-            r'|what\s+(?:is\s+)?included'
-            r'|included\s+services?'
-            r'|inclusions?'
-            r'|deliverables?(?!\s+not)'
-            r'|services?\s+(?:to\s+be\s+)?(?:provided|delivered|included)'
-            r'|work\s+to\s+be\s+(?:performed|done|delivered)'
-            r'|scope\s+confirmed'
-            r'|reaffirmed\s+scope'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── ASSUMPTIONS / CLIENT RESPONSIBILITIES ──
-        ('Assumptions', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'assumptions?'
-            r'|client\s+responsibilities?'
-            r'|customer\s+(?:responsibilities?|obligations?)'
-            r'|our\s+responsibilities?'
-            r'|prerequisites?'
-            r'|dependencies?'
-            r'|client\s+(?:will\s+)?provide'
-            r'|(?:vendor|supplier)\s+responsibilities?'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── MILESTONES / TIMELINE / PAYMENT SCHEDULE ──
-        ('Milestones', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'milestones?'
-            r'|project\s+milestones?'
-            r'|(?:project\s+)?timeline'
-            r'|(?:project\s+)?schedule'
-            r'|phases?\s+(?:&|and)\s+(?:timeline|schedule|milestones?)'
-            r'|delivery\s+schedule'
-            r'|key\s+dates?'
-            r'|payment\s+(?:schedule|milestones?|terms?)'
-            r'|fee\s+schedule'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── RECURRING COMMITMENTS ──
-        ('Recurring Commitments', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'recurring\s+(?:commitments?|deliverables?|services?|obligations?)'
-            r'|ongoing\s+(?:commitments?|deliverables?|services?)'
-            r'|continuous\s+(?:service|improvement|delivery)'
-            r'|managed\s+services?\s+commitments?'
-            r'|periodic\s+(?:commitments?|deliverables?)'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── FUNCTIONAL SCOPE ──
-        # Detects module-level / user-role-level headings in a real EL so that
-        # feature bullets under "Employee Collaboration", "Internal Job Posting",
-        # "Manager View", "Admin View", "Employee View" etc. are tagged as
-        # functional scope items rather than falling through as "General".
-        ('Functional Scope', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'employee\s+(?:collaboration|portal|landing|information|learning|news|suggestion|feedback|praising|onboarding)'
-            r'|internal\s+job\s+posting'
-            r'|(?:manager|admin(?:istrator)?|user|employee)\s+(?:view|portal|dashboard|module|features?|access|capabilities?)'
-            r'|job\s+(?:requisition|posting|applicant)'
-            r'|(?:functional|feature)\s+(?:scope|requirements?|specification)'
-            r'|(?:system|portal|application)\s+features?'
-            r'|vconnect'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── PROJECT METHODOLOGY / PHASES ──
-        # Captures work activities described inside a project-approach/methodology section.
-        ('Methodology', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'methodology'
-            r'|project\s+(?:approach|methodology|plan|phases?)'
-            r'|implementation\s+(?:approach|methodology|phases?|plan)'
-            r'|delivery\s+(?:approach|methodology|phases?)'
-            r'|engagement\s+(?:approach|methodology|plan)'
-            r'|phases?\s+(?:plan|breakdown|description)'
-            r'|assessment\s+(?:phase|approach)'
-            r'|solution\s+(?:approach|design|architecture)'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── REPORTING / GOVERNANCE ──
-        # Recurring governance events: steering committees, status reports, fortnightly updates.
-        ('Governance', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'governance'
-            r'|steering\s+committee'
-            r'|status\s+(?:report|update|meeting)'
-            r'|project\s+governance'
-            r'|reporting\s+(?:obligations?|requirements?|cadence)'
-            r'|stakeholder\s+(?:updates?|reporting|communication)'
-            r'|project\s+(?:oversight|management\s+approach)'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── RESOURCES / TEAM ──
-        ('Resources', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'resource(?:s|\s+plan)?'
-            r'|team\s+(?:structure|composition|plan|allocation)'
-            r'|staffing\s+(?:plan|model)'
-            r'|project\s+(?:team|resources?|staffing)'
-            r'|personnel\s+(?:plan|allocation)'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── SUPPORT / HYPERCARE / PRODUCTION SUPPORT ──
-        ('Support', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'hypercare'
-            r'|post[\s\-]go[\s\-]live'
-            r'|production\s+support'
-            r'|warranty\s+(?:period|support)'
-            r'|post[\s\-]deployment\s+support'
-            r'|defect\s+(?:support|resolution|warranty)'
-            r')',
-            re.MULTILINE
-        )),
-
-        # ── ACCEPTANCE / UAT ──
-        ('Acceptance', re.compile(
-            r'(?i)(?:^|\s|#|\*|\-|\d+[\.)]?\s)'
-            r'(?:'
-            r'acceptance\s+(?:criteria|testing|process)'
-            r'|user\s+acceptance\s+testing'
-            r'|\buat\b'
-            r'|sign[\s\-]off\s+(?:process|criteria|requirements?)'
-            r'|quality\s+assurance'
-            r')',
-            re.MULTILINE
-        )),
+    # All 16 intended contractual target sections (Taxonomy)
+    DEFINED_SECTIONS = [
+        "Scope of Work",
+        "Deliverables",
+        "Responsibilities",
+        "Client Responsibilities",
+        "Out of Scope",
+        "Assumptions",
+        "Dependencies",
+        "Milestones",
+        "Recurring Commitments",
+        "General",
+        "Functional Scope",
+        "Methodology",
+        "Governance",
+        "Support",
+        "Acceptance",
+        "Resources",
     ]
 
-    # Sections that the classifier treats as "In Scope" for the real EL.
-    # Kept as a class constant so downstream code can reference it.
+    # Ordered list of (section_name, compiled_pattern) tuples.
+    # Order is critical: more specific and negative sections are matched before broad ones.
+    SECTION_PATTERNS = [
+        # 1. OUT OF SCOPE — checked FIRST (contains word "Scope", must win)
+        (
+            "Out of Scope",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"out[\s\-_]*of[\s\-_]*scope"
+                r"|exclusions?"
+                r"|not\s+in[\s\-_]*scope"
+                r"|items?\s+not\s+(?:covered|included)"
+                r"|services?\s+not\s+(?:covered|included|provided)"
+                r"|beyond[\s\-_]*scope"
+                r"|what\s+(?:is\s+)?not\s+included"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 2. CLIENT RESPONSIBILITIES — checked before generic Responsibilities
+        (
+            "Client Responsibilities",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"client\s+(?:responsibilit(?:y|ies)|obligations?|prerequisites?)"
+                r"|customer\s+(?:responsibilit(?:y|ies)|obligations?)"
+                r"|gl\s+responsibilit(?:y|ies)"
+                r"|client\s+(?:inputs?|dependencies|will\s+provide)"
+                r"|client\s+obligations"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 3. RESPONSIBILITIES / ROLES
+        (
+            "Responsibilities",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"responsibilit(?:y|ies)\s+matrix"
+                r"|roles?\s+(?:&|and)\s+responsibilit(?:y|ies)"
+                r"|project\s+roles?"
+                r"|team\s+responsibilit(?:y|ies)"
+                r"|our\s+responsibilit(?:y|ies)"
+                r"|vendor\s+responsibilit(?:y|ies)"
+                r"|description\s+of\s+responsibilities"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 4. DEPENDENCIES
+        (
+            "Dependencies",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"dependencies"
+                r"|project\s+dependencies"
+                r"|external\s+dependencies"
+                r"|technical\s+dependencies"
+                r"|assumptions?\s+(?:&|and)\s+dependencies"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 5. ASSUMPTIONS
+        (
+            "Assumptions",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"assumptions?"
+                r"|key\s+assumptions?"
+                r"|key\s+assgptions?"
+                r"|general\s+assumptions?"
+                r"|engagement\s+assumptions?"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 6. DELIVERABLES
+        (
+            "Deliverables",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"list\s+of\s+deliverables"
+                r"|project\s+deliverables?"
+                r"|key\s+deliverables?"
+                r"|expected\s+deliverables?"
+                r"|documentation\s+deliverables?"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 7. MILESTONES / TIMELINE / FEES
+        (
+            "Milestones",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"milestones?(?:\s+table|\s+schedule|\s+list)?"
+                r"|project\s+overall\s+timeline"
+                r"|project\s+timeline"
+                r"|project\s+phases?"
+                r"|delivery\s+milestones?"
+                r"|billing\s+milestones?"
+                r"|invoices?\s+for\s+fees\s+shall\s+be\s+raised"
+                r"|fees?,?\s+expenses?,?\s+(?:and|&)\s+billing\s+milestones?"
+                r"|payment\s+(?:milestones?|terms?|schedule)"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 8. RECURRING COMMITMENTS
+        (
+            "Recurring Commitments",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"recurring\s+(?:commitments?|deliverables?|services?|obligations?)"
+                r"|ongoing\s+(?:commitments?|deliverables?|services?)"
+                r"|continuous\s+(?:service|improvement|delivery)"
+                r"|managed\s+services?\s+commitments?"
+                r"|periodic\s+(?:commitments?|deliverables?)"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 9. FUNCTIONAL SCOPE / MODULE VIEWS
+        (
+            "Functional Scope",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"functional\s+scope"
+                r"|employee\s+collaboration(?:\s+portal)?"
+                r"|internal\s+job\s+posting"
+                r"|admin(?:istrator)?\s+view"
+                r"|user\s+(?:or|and)\s+employee\s+view"
+                r"|manager\s+view"
+                r"|application\s+features?"
+                r"|system\s+features?"
+                r"|portal\s+features?"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 10. SCOPE OF WORK (and In Scope)
+        (
+            "Scope of Work",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"scope\s+of\s+(?:our\s+)?services?"
+                r"|scope\s+of\s+work"
+                r"|in[\s\-_]*scope"
+                r"|project\s+scope"
+                r"|engagement\s+scope"
+                r"|scope\s+of\s+engagement"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 11. METHODOLOGY / APPROACH
+        (
+            "Methodology",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"project\s+approach\s+(?:and|&)\s+methodology"
+                r"|approach\s+(?:and|&)\s+methodology"
+                r"|project\s+methodology"
+                r"|implementation\s+(?:approach|methodology)"
+                r"|delivery\s+(?:approach|methodology)"
+                r"|transform\s+methodology"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 12. GOVERNANCE / REPORTING
+        (
+            "Governance",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"progress\s+reporting\s+(?:and|&)\s+issue\s+resolution"
+                r"|project\s+status\s+report"
+                r"|escalation\s+matrix"
+                r"|project\s+governance"
+                r"|steering\s+committee"
+                r"|governance\s+structure"
+                r"|project\s+organisation\s+structure"
+                r"|reporting\s+cadence"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 13. RESOURCES / TEAM / EXPENSES
+        (
+            "Resources",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"resource\s+planning(?:\s+for\s+development\s+team)?"
+                r"|staffing\s+plan"
+                r"|team\s+structure"
+                r"|project\s+team\s+structure"
+                r"|reimbursement\s+of\s+out[\s\-]of[\s\-]pocket\s+expenses"
+                r"|travel\s+(?:and|&)\s+living\s+expenses"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 14. SUPPORT / HYPERCARE
+        (
+            "Support",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"hyper[\s\-_]*care(?:\s+support)?"
+                r"|post[\s\-]go[\s\-]live\s+support"
+                r"|production\s+support"
+                r"|warranty\s+(?:period|support)"
+                r"|defect\s+support"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 15. ACCEPTANCE / UAT
+        (
+            "Acceptance",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"project\s+acceptance\s+criteria"
+                r"|acceptance\s+criteria"
+                r"|user\s+acceptance\s+testing(?:\s+sign[\s\-]off)?"
+                r"|acceptance\s+(?:and|&)\s+sign[\s\-]off"
+                r"|acknowledgement\s+(?:and|&)\s+acceptance"
+                r"|terms\s+of\s+business"
+                r"|confirmation\s+of\s+agreement"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 16. GENERAL / PREAMBLE
+        (
+            "General",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"letter\s+of\s+engagement"
+                r"|engagement\s+letter"
+                r"|executive\s+summary"
+                r"|introduction"
+                r"|background"
+                r"|preamble"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+    ]
+
     FUNCTIONAL_SCOPE_SECTIONS = frozenset({
         "In Scope", "Scope of Work", "Deliverables", "Responsibilities",
         "Milestones", "Recurring Commitments", "Functional Scope",
@@ -196,82 +302,220 @@ class ScopeSectionDetector:
     })
 
     @classmethod
-    def detect_sections(cls, chunks: list[dict]) -> list[dict]:
+    def get_defined_sections(cls) -> List[str]:
+        """Returns the full list of all 16 supported section categories."""
+        return list(cls.DEFINED_SECTIONS)
+
+    @classmethod
+    def is_structural_heading(cls, line: str) -> Tuple[bool, str, float]:
+        """
+        Determines whether a given raw line represents a legitimate document structural heading.
+        Returns:
+            (is_heading: bool, clean_heading_text: str, confidence: float)
+            Confidence:
+                1.00: Explicit markdown header (#) or numbered bold heading (1. **Heading**)
+                0.95: Standalone bold title (**Title**) or recognized table header row
+                0.90: Subsection module divider (* Functional Scope:, * **Admin View:**)
+                0.00: Ordinary body text, bullet, or sentence (never a heading)
+        """
+        clean = line.strip()
+        if not clean:
+            return False, "", 0.0
+
+        # 1. Markdown headings (# Heading, ## Heading, ### Heading)
+        if clean.startswith("#"):
+            h_text = clean.lstrip("#").strip()
+            if h_text and len(h_text) < 140:
+                return True, h_text, 1.0
+
+        # 2. Table header rows with bold title cells: | **Role** | **Description** |
+        if clean.startswith("|") and "**" in clean:
+            cells = [c.strip().replace("*", "") for c in clean.split("|") if c.strip()]
+            structural_table_headers = {
+                "project phases", "deliverables", "role", "description of responsibilities",
+                "milestones as per which invoices for fees shall be raised",
+                "level of escalation", "sl. no", "milestones"
+            }
+            if any(any(hdr in c.lower() for hdr in structural_table_headers) for c in cells):
+                return True, clean, 0.95
+
+        # 3. Explicit module view division markers (e.g., * Functional Scope:, * **Admin View:**)
+        if re.match(r"^\*\s+(?:\*{2}[^*:]+\*{2}:?|Functional Scope:?)$", clean, re.IGNORECASE):
+            h_text = re.sub(r"^\*\s+", "", clean).replace("*", "").strip(":").strip()
+            return True, h_text, 0.90
+
+        # 4. Numbered bold headings (e.g., 1. **Scope of Work**, * 1. **Key Assumptions**)
+        m_num_bold = re.match(r"^(?:\*\s*)?(?:\d+[\.\)]|\*{1,2}\d+[\.\)])\s*\*{2}([^*]+)\*{2}:?$", clean)
+        if m_num_bold:
+            h_text = m_num_bold.group(1).strip()
+            if 2 < len(h_text) < 140:
+                return True, h_text, 1.0
+
+        # 4b. Prefix bold numbered headings (e.g., **2 Scope of our services**, **4. Progress reporting...**)
+        m_bold_num = re.match(r"^\*{2}\s*\d+[\.\d\)]*\s*([^*]+)\*{2}:?$", clean)
+        if m_bold_num:
+            h_text = m_bold_num.group(1).strip()
+            if 2 < len(h_text) < 140:
+                return True, h_text, 1.0
+
+        # 5. Standalone bold headings (e.g., **Letter of Engagement**, **Steering Committee**)
+        m_bold = re.match(r"^\*{2}([^*]{3,90})\*{2}:?$", clean)
+        if m_bold:
+            h_text = m_bold.group(1).strip()
+            if 2 < len(h_text) < 90:
+                return True, h_text, 0.95
+
+        # 6. Appendix / Section titles
+        if re.match(r"^(?:Appendix|Schedule|Annexure|Exhibit)\s*[\d\w\-_]+", clean, re.IGNORECASE):
+            return True, clean, 0.90
+
+        # Reject any ordinary bullet point or numbered item as body text
+        # (e.g. "* Display the organizational resource links...", "- Allow user...", "1. Ordinary body step")
+        if re.match(r"^(?:[\*\-\+\•]\s+|\d+\.\s+)", clean):
+            return False, "", 0.0
+
+        return False, "", 0.0
+
+    @classmethod
+    def match_heading_to_section(cls, heading_text: str) -> Optional[Tuple[str, float]]:
+        """
+        Matches a verified structural heading against the 16 target sections.
+        Returns (section_name, confidence) or None.
+        """
+        clean_header = re.sub(r"^[#\*\-\s\d\.\ :]+", "", heading_text).strip()
+        
+        for section_name, pattern in cls.SECTION_PATTERNS:
+            if pattern.search(heading_text) or (clean_header and pattern.search(clean_header)):
+                return section_name, 1.0
+
+        # Structural fallback: out vs in scope heuristics
+        h_lower = heading_text.lower()
+        out_idx = h_lower.find("out")
+        scope_idx = h_lower.find("scope")
+        if out_idx != -1 and scope_idx != -1 and out_idx < scope_idx:
+            return "Out of Scope", 0.95
+        if "in scope" in h_lower or "in-scope" in h_lower:
+            return "Scope of Work", 0.95
+
+        return None
+
+    @classmethod
+    def detect_sections_with_stats(cls, chunks: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """
         Iterates over document chunks and tags them with the currently active section.
-        If a chunk contains multiple sections, it splits the chunk into multiple sub-chunks.
+        Maintains structural section hierarchy and only switches section on genuine structural headings.
+        Returns:
+            (new_chunks, stats)
         """
         current_section = "General"
+        current_confidence = 0.50
+        current_inferred = True
+        section_hierarchy: List[str] = ["General"]
+
         new_chunks = []
-        
-        for chunk in chunks:
+        detected_sections_set = set()
+
+        for chunk_idx, chunk in enumerate(chunks):
             text = chunk.get("text", "")
+            chunk_page = chunk.get("page_number")
             metadata = chunk.get("metadata") or {}
-            
-            # Check metadata first if present
+
+            # Check markdown metadata first if present
             meta_section = None
             for meta_val in metadata.values():
                 if meta_val and isinstance(meta_val, str):
                     clean_meta = meta_val.strip()
-                    for section_name, pattern in cls.SECTION_PATTERNS:
-                        if pattern.search(clean_meta):
-                            meta_section = section_name
-                            break
-                if meta_section:
-                    break
-            
+                    matched = cls.match_heading_to_section(clean_meta)
+                    if matched:
+                        meta_section, current_confidence = matched
+                        current_inferred = False
+                        break
             if meta_section:
                 current_section = meta_section
+                section_hierarchy = [current_section]
+                detected_sections_set.add(current_section)
 
             lines = text.split("\n")
             current_subchunk_lines = []
-            
-            for line in lines:
-                clean_line = line.strip()
-                
-                # Check if this line is a section header
-                if 0 < len(clean_line) < 120:
-                    clean_header = re.sub(r'^[#\*\-\s\d\.\ :]+', '', clean_line).strip()
-                    matched_section = None
-                    for section_name, pattern in cls.SECTION_PATTERNS:
-                        if pattern.search(clean_line) or (clean_header and pattern.search(clean_header)):
-                            matched_section = section_name
-                            break
+            subchunk_idx = 0
 
-                    # Generic fallback: if no pattern matched and heading contains
-                    # "out" before "scope", classify as Out of Scope.
-                    # This covers edge cases like "3b. Out-of-Scope Clarifications"
-                    if matched_section is None:
-                        heading_lower = clean_line.lower()
-                        out_idx = heading_lower.find('out')
-                        scope_idx = heading_lower.find('scope')
-                        if out_idx != -1 and scope_idx != -1 and out_idx < scope_idx:
-                            matched_section = 'Out of Scope'
-                        elif 'in scope' in heading_lower or 'in-scope' in heading_lower:
-                            matched_section = 'In Scope'
+            for line in lines:
+                is_heading, heading_text, heading_conf = cls.is_structural_heading(line)
+                
+                if is_heading:
+                    matched = cls.match_heading_to_section(heading_text)
+                    if matched:
+                        matched_section, match_conf = matched
+                        
+                        # Only transition if section actually changes
+                        if matched_section != current_section:
+                            # Save previous subchunk before transition
+                            if current_subchunk_lines:
+                                sub_text = "\n".join(current_subchunk_lines).strip()
+                                if sub_text:
+                                    new_chunks.append({
+                                        "chunk_index": chunk.get("chunk_index", chunk_idx),
+                                        "segment_index": subchunk_idx,
+                                        "page_number": chunk_page,
+                                        "text": sub_text,
+                                        "section": current_section,
+                                        "section_confidence": current_confidence,
+                                        "is_inferred": current_inferred,
+                                        "section_hierarchy": list(section_hierarchy),
+                                    })
+                                    subchunk_idx += 1
+                                    current_subchunk_lines = []
+
+                            # Update section state
+                            current_section = matched_section
+                            current_confidence = min(heading_conf, match_conf)
+                            current_inferred = False
                             
-                    if matched_section and matched_section != current_section:
-                        print(f'[SectionDetector] "{clean_line[:60]}" -> {matched_section} (was {current_section})')
-                        # Save the previous subchunk if it has content
-                        if current_subchunk_lines:
-                            new_chunks.append({
-                                "chunk_index": chunk.get("chunk_index"),
-                                "page_number": chunk.get("page_number"),
-                                "text": "\n".join(current_subchunk_lines),
-                                "section": current_section
-                            })
-                            current_subchunk_lines = []
-                        current_section = matched_section
-                
+                            # Update hierarchy
+                            if matched_section == "Functional Scope" and "Scope of Work" in section_hierarchy:
+                                section_hierarchy = ["Scope of Work", "Functional Scope"]
+                            elif matched_section in ("Client Responsibilities", "Responsibilities") and "Responsibilities" in section_hierarchy:
+                                section_hierarchy = ["Responsibilities", matched_section]
+                            else:
+                                section_hierarchy = [matched_section]
+
+                            detected_sections_set.add(current_section)
+
                 current_subchunk_lines.append(line)
-                
+
             # Append the remainder of the chunk
             if current_subchunk_lines:
-                new_chunks.append({
-                    "chunk_index": chunk.get("chunk_index"),
-                    "page_number": chunk.get("page_number"),
-                    "text": "\n".join(current_subchunk_lines),
-                    "section": current_section
-                })
-                
+                sub_text = "\n".join(current_subchunk_lines).strip()
+                if sub_text:
+                    new_chunks.append({
+                        "chunk_index": chunk.get("chunk_index", chunk_idx),
+                        "segment_index": subchunk_idx,
+                        "page_number": chunk_page,
+                        "text": sub_text,
+                        "section": current_section,
+                        "section_confidence": current_confidence,
+                        "is_inferred": current_inferred,
+                        "section_hierarchy": list(section_hierarchy),
+                    })
+                    subchunk_idx += 1
+
+        detected_sections_set.add(current_section)
+        # Always count General if any chunk remained General
+        if any(c.get("section") == "General" for c in new_chunks):
+            detected_sections_set.add("General")
+
+        stats = {
+            "categories_defined": len(cls.DEFINED_SECTIONS),
+            "categories_detected": len(detected_sections_set),
+            "detected_sections": sorted(list(detected_sections_set)),
+            "all_defined_sections": list(cls.DEFINED_SECTIONS),
+        }
+        return new_chunks, stats
+
+    @classmethod
+    def detect_sections(cls, chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Backward-compatible detect_sections returning list of tagged chunk segments.
+        """
+        new_chunks, _ = cls.detect_sections_with_stats(chunks)
         return new_chunks
