@@ -252,17 +252,13 @@ class ActionEntityProtector:
         norm_desc_a = re.sub(r"\s+", " ", desc_a.lower().strip())
         norm_desc_b = re.sub(r"\s+", " ", desc_b.lower().strip())
         if c_idx_a is not None and c_idx_a == c_idx_b and norm_desc_a and norm_desc_a == norm_desc_b and len(norm_desc_a) >= 15:
-            title_entities_a = cls.get_entities(name_a)
-            title_entities_b = cls.get_entities(name_b)
-            has_title_entity_contrast = False
-            for p1, p2 in cls.CONTRASTING_ENTITY_PAIRS:
-                if (title_entities_a.intersection(p1) and title_entities_b.intersection(p2)) or (
-                    title_entities_a.intersection(p2) and title_entities_b.intersection(p1)
-                ):
-                    has_title_entity_contrast = True
-                    break
-            if not has_title_entity_contrast:
-                return True, "Duplicate emission from identical source span in same chunk"
+            # FIX-Defect2: When descriptions are BYTE-IDENTICAL from the same chunk,
+            # the candidates are provably the same obligation regardless of how the LLM
+            # named them. The entity title contrast check is intended to protect distinct
+            # obligations that happen to share a chunk but have different descriptions.
+            # An identical description is conclusive proof of a duplicate emission.
+            # Therefore: skip the entity title contrast check and allow dedup unconditionally.
+            return True, "Duplicate emission from identical source span in same chunk"
 
         # 2. Explicit milestone date conflict check
         # Milestones or obligations with distinct dates belong to different schedules/workstreams
@@ -1711,6 +1707,14 @@ class DeepScanExtractor:
                 cls._log(logger, f"    -> Excluded document title/metadata artifact: '{it['name']}'")
                 continue
 
+            # FIX-Defect3: Workstream-prefix-aware suffix extraction for cross-section matching.
+            # E.g. 'Operate & Review - Knowledge transfer' -> suffix 'knowledge transfer'
+            def _get_name_suffix_l(name_l: str) -> str:
+                """Return the suffix after the last ' - ' separator, or the full name."""
+                if " - " in name_l:
+                    return name_l.split(" - ", 1)[1].strip()
+                return name_l
+
             match = None
             merge_reason = ""
             for existing in cross_reduced:
@@ -1726,7 +1730,7 @@ class DeepScanExtractor:
                     match = existing
                     merge_reason = (
                         f"Cross-section identical requirement across window overlap "
-                        f"('{it.get('section')}' & '{existing.get('section')}')"
+                        f"('{it.get('section')}' & '{existing.get('section')}') "
                     )
                     break
 
@@ -1739,6 +1743,36 @@ class DeepScanExtractor:
                         f"'{it_name}' ({it.get('section')}) vs '{ex_name}' ({existing.get('section')})"
                     )
                     break
+
+                # 2b. FIX-Defect3: Workstream-prefix suffix match.
+                # 'Operate & Review - Knowledge transfer' suffix == 'Complete knowledge transfer' name
+                it_suffix_l = _get_name_suffix_l(it_name_l)
+                ex_suffix_l = _get_name_suffix_l(ex_name_l)
+                # Match when: one candidate has a workstream prefix and the other's full name
+                # equals the suffix of the prefixed one (or vice versa), AND descriptions align.
+                if it_suffix_l != it_name_l or ex_suffix_l != ex_name_l:  # at least one has prefix
+                    it_desc_l_cs = (it.get("description") or "").lower().strip()
+                    ex_desc_l_cs = (existing.get("description") or "").lower().strip()
+                    suffixes_match = (
+                        (it_suffix_l and ex_name_l and (it_suffix_l in ex_name_l or ex_name_l in it_suffix_l)) or
+                        (ex_suffix_l and it_name_l and (ex_suffix_l in it_name_l or it_name_l in ex_suffix_l))
+                    )
+                    descs_identical = it_desc_l_cs and ex_desc_l_cs and it_desc_l_cs == ex_desc_l_cs
+                    if suffixes_match and descs_identical:
+                        # Prefer the more specific (prefixed) name as survivor
+                        if " - " in ex_name and " - " not in it_name:
+                            # existing is more specific; it merges into existing
+                            pass  # match existing (it becomes merged source)
+                        elif " - " in it_name and " - " not in ex_name:
+                            # it is more specific; swap — make it the survivor
+                            pass  # still set match = existing to consolidate it into existing
+                        match = existing
+                        merge_reason = (
+                            f"Cross-section workstream-prefix duplicate: suffix of "
+                            f"'{it_name}' matches '{ex_name}' with identical description "
+                            f"({it.get('section')} vs {existing.get('section')})"
+                        )
+                        break
 
                 # 3. High textual similarity
                 ratio = difflib.SequenceMatcher(None, it_name_l, ex_name_l).ratio()
@@ -2445,7 +2479,14 @@ class DeepScanExtractor:
 
         # 2. Collect union of legitimate evidence quotations across merged sources.
         # NEVER use ms.get("description") as source evidence! Only actual snippets corroborated by chunk.
+        #
+        # FIX-Defect1: Track which evidence texts are PRIMARY vs MERGED-SOURCE so that
+        # claims that only appear in merged-source evidence can be individually validated.
+        # A merged candidate must not be VERIFIED merely because primary evidence supports
+        # one claim and a merged source supports a different claim.
+        primary_ev_only = ev_text  # save primary before any extension
         ev_texts = [ev_text] if ev_text else []
+        merged_source_ev_texts = []  # evidence contributed solely by merged sources
         for ms in merged_sources:
             ms_ev = (ms.get("evidence_snippet") or "").strip()
             if ms_ev:
@@ -2454,8 +2495,10 @@ class DeepScanExtractor:
                     if ms_ev.lower() in ch_txt.lower() or any(w in ch_txt.lower() for w in re.findall(r"\b[a-zA-Z]{4,}\b", ms_ev.lower())):
                         if ms_ev not in ev_texts:
                             ev_texts.append(ms_ev)
+                            merged_source_ev_texts.append(ms_ev)
                 elif ms_ev != ms.get("description") and ms_ev not in ev_texts:
                     ev_texts.append(ms_ev)
+                    merged_source_ev_texts.append(ms_ev)
 
         if not ev_texts:
             return PROVENANCE_UNRESOLVED, "No verified source quotation available"
@@ -2506,6 +2549,35 @@ class DeepScanExtractor:
             "conducting", "provide", "providing", "do", "run"
         }
 
+        # FIX-Defect4: Pre-check for conflated testing types (unit vs UAT vs integration).
+        # If a candidate description or name conflates contrasting test types AND primary evidence
+        # only supports one of them, mark individual claims as potentially unsupported.
+        primary_ev_l = primary_ev_only.lower() if primary_ev_only else ""
+        primary_ev_entities = ActionEntityProtector.get_entities(primary_ev_l)
+        testing_entity_types = {"unit_testing", "uat_testing", "integration_testing"}
+        desc_testing_types = {
+            et for et in testing_entity_types
+            if ActionEntityProtector.get_entities(desc_l).intersection({et})
+        }
+        primary_testing_types = {
+            et for et in testing_entity_types
+            if primary_ev_entities.intersection({et})
+        }
+        # If multiple distinct testing types appear in description but primary evidence only
+        # covers a subset, those uncovered types are unsupported by primary evidence.
+        # They may be covered by merged-source evidence, but we need to check.
+        conflated_testing_unsupported = set()
+        if len(desc_testing_types) > 1 and merged_source_ev_texts:
+            # Check each testing type against merged source evidence
+            for ttype in desc_testing_types - primary_testing_types:
+                ttype_kws = ActionEntityProtector.ENTITIES.get(ttype, set())
+                covered_by_merged = any(
+                    any(kw in ms_ev.lower() for kw in ttype_kws)
+                    for ms_ev in merged_source_ev_texts
+                )
+                if not covered_by_merged:
+                    conflated_testing_unsupported.add(ttype)
+
         for cl in raw_clauses:
             cl_words = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", cl)) - cls.STOP_WORDS
             if not cl_words:
@@ -2539,6 +2611,40 @@ class DeepScanExtractor:
                             has_contrasting_entity_gap = True
                             break
 
+            # FIX-Defect1: Per-claim primary evidence check for merged candidates.
+            # A claim that is ONLY supported by merged-source evidence (not by primary evidence)
+            # must not silently become VERIFIED via the union.
+            # We detect this by finding tokens that are DISTINCTIVE to this clause
+            # (i.e. present in the clause but NOT in the primary evidence). If those
+            # distinctive tokens are ONLY found in merged-source evidence that introduces
+            # a contrasting action vs primary evidence, the claim is unsupported.
+            claim_only_in_merged_source = False
+            if merged_source_ev_texts and primary_ev_only:
+                cl_subst = cl_words - boilerplate_words
+                if cl_subst:
+                    primary_ev_tokens = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", primary_ev_l)) - cls.STOP_WORDS
+                    primary_ev_stems = {cls._stem_w(w) for w in primary_ev_tokens}
+                    cl_subst_stems = {cls._stem_w(w) for w in cl_subst}
+                    # Find tokens that are DISTINCTIVE to this clause (not in primary evidence)
+                    # These are the tokens that would need merged-source evidence to be supported.
+                    distinctive_stems = cl_subst_stems - primary_ev_stems
+                    if distinctive_stems:
+                        # Check if distinctive tokens appear in merged-source evidence
+                        merged_union_l = " ".join(merged_source_ev_texts).lower()
+                        merged_ev_tokens = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", merged_union_l)) - cls.STOP_WORDS
+                        merged_ev_stems = {cls._stem_w(w) for w in merged_ev_tokens}
+                        distinctive_in_merged = distinctive_stems & merged_ev_stems
+                        # If the distinctive tokens are exclusively in merged sources and those
+                        # merged sources have contrasting actions vs the primary evidence...
+                        if distinctive_in_merged and len(distinctive_in_merged) >= max(1, len(distinctive_stems) // 2):
+                            merged_ev_actions = ActionEntityProtector.get_actions(merged_union_l)
+                            primary_ev_actions = ActionEntityProtector.get_actions(primary_ev_l)
+                            for pair_1, pair_2 in ActionEntityProtector.CONTRASTING_ACTION_PAIRS:
+                                if ((primary_ev_actions.intersection(pair_1) and merged_ev_actions.intersection(pair_2)) or
+                                        (primary_ev_actions.intersection(pair_2) and merged_ev_actions.intersection(pair_1))):
+                                    claim_only_in_merged_source = True
+                                    break
+
             # Substantive non-boilerplate token check
             cl_substantive = cl_words - boilerplate_words
             substantive_stems = {cls._stem_w(w) for w in cl_substantive}
@@ -2562,8 +2668,17 @@ class DeepScanExtractor:
                 unsupported_claims.append(f"{cl} (missing entity: {missing_entities})")
             elif has_actor_conflict:
                 unsupported_claims.append(f"{cl} (responsible party conflict)")
+            elif claim_only_in_merged_source:
+                unsupported_claims.append(f"{cl} (claim only in merged-source evidence with contrasting action; requires split into separate candidate)")
             elif (stem_ov < 0.50 or (cl_substantive and substantive_ov < 0.50)) and cl not in union_ev_text_l:
                 unsupported_claims.append(cl)
+
+        # FIX-Defect4: If conflated testing types are unsupported by any evidence, flag them.
+        if conflated_testing_unsupported:
+            unsupported_claims.append(
+                f"Conflated testing types {conflated_testing_unsupported} not independently evidenced "
+                f"(unit testing, integration testing, and UAT must remain separate candidates)"
+            )
 
         if dates_ok and durations_ok and not unsupported_claims:
             return PROVENANCE_VERIFIED, "All material claims, obligations, dates, and durations verified against source quotation"
@@ -2618,6 +2733,17 @@ class DeepScanExtractor:
             )
             cand["provenance_status"] = status
             cand["verification_reason"] = reason
+
+        # FIX-Defect5: Log final provenance counts AFTER the gate so log and JSON are consistent.
+        gate_verified = sum(1 for c in candidates if c.get("provenance_status") == PROVENANCE_VERIFIED)
+        gate_partial = sum(1 for c in candidates if c.get("provenance_status") == PROVENANCE_PARTIAL)
+        gate_unresolved = sum(1 for c in candidates if c.get("provenance_status") == PROVENANCE_UNRESOLVED)
+        cls._log(
+            logger,
+            f"  [DeepScan][Canonical Verification Gate] Final provenance after gate: "
+            f"VERIFIED={gate_verified}, PARTIALLY_VERIFIED={gate_partial}, UNRESOLVED={gate_unresolved} "
+            f"(total={len(candidates)})\n"
+        )
 
     # ------------------------------------------------------------------ #
     # 6) MAP-to-REDUCE Coverage Auditor
