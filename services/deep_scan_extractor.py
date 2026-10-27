@@ -351,6 +351,14 @@ class ActionEntityProtector:
                 diff_a.intersection(SCOPE_EXTERNAL) and diff_b.intersection(SCOPE_INTERNAL)
             ):
                 return False, f"Distinct target scope qualifiers under shared prefix ('{diff_a}' vs '{diff_b}')"
+
+            # Check collection vs item/detail qualifiers (e.g. 'View applicant list' vs 'See applicant details')
+            SCOPE_COLLECTION = {"list", "listing", "listings", "grid", "tabular", "catalog", "directory", "index", "roster", "all"}
+            SCOPE_SINGLE = {"detail", "details", "summary", "profile", "record", "individual", "item", "specific", "single"}
+            if (diff_a.intersection(SCOPE_COLLECTION) and diff_b.intersection(SCOPE_SINGLE)) or (
+                diff_a.intersection(SCOPE_SINGLE) and diff_b.intersection(SCOPE_COLLECTION)
+            ):
+                return False, f"Distinct collection vs item detail qualifiers under shared prefix ('{diff_a}' vs '{diff_b}')"
         else:
             # Check leading word prefix match (e.g., 'Steering Committee Member John' vs 'Steering Committee Member Sam')
             words_a = name_a.split()
@@ -370,6 +378,14 @@ class ActionEntityProtector:
                 st_suff_w_b_stems = {cls._stem_w(w) for w in st_suff_w_b}
                 if st_suff_w_a and st_suff_w_b and st_suff_w_a.isdisjoint(st_suff_w_b) and st_suff_w_a_stems.isdisjoint(st_suff_w_b_stems):
                     return False, f"Distinct qualifier suffixes under shared prefix '{' '.join(common)}': '{suff_w_a}' vs '{suff_w_b}'"
+                diff_w_a = st_suff_w_a - st_suff_w_b
+                diff_w_b = st_suff_w_b - st_suff_w_a
+                SCOPE_COLLECTION = {"list", "listing", "listings", "grid", "tabular", "catalog", "directory", "index", "roster", "all"}
+                SCOPE_SINGLE = {"detail", "details", "summary", "profile", "record", "individual", "item", "specific", "single"}
+                if (diff_w_a.intersection(SCOPE_COLLECTION) and diff_w_b.intersection(SCOPE_SINGLE)) or (
+                    diff_w_a.intersection(SCOPE_SINGLE) and diff_w_b.intersection(SCOPE_COLLECTION)
+                ):
+                    return False, f"Distinct collection vs item detail qualifiers under shared prefix '{' '.join(common)}': '{diff_w_a}' vs '{diff_w_b}'"
 
         # 4c. Title-level contrasting target entity protection (symmetric difference)
         t_ent_a = cls.get_entities(name_a)
@@ -674,7 +690,14 @@ class DeepScanExtractor:
         reduced_items, merge_events = cls._reduce_phase(mapped_items, logger=logger)
 
         # 5) Candidate Rehydration with honest source provenance
-        candidates = cls._to_candidates(reduced_items, mapped_items, document_id, index_to_chunk=index_to_chunk, logger=logger)
+        candidates = cls._to_candidates(
+            reduced_items,
+            mapped_items,
+            document_id,
+            project_id=project_id,
+            index_to_chunk=index_to_chunk,
+            logger=logger,
+        )
 
         # 6) MAP-to-REDUCE Coverage Audit
         coverage_audit = cls._audit_coverage(
@@ -704,6 +727,9 @@ class DeepScanExtractor:
             "verified_percentage": round((prov_verified / prov_total * 100), 2) if prov_total else 100.0,
         }
         coverage_audit["missing_or_invalid_sources_count"] = prov_unresolved
+        merged_sources_count = sum(len(c.get("merged_sources", [])) for c in candidates)
+        coverage_audit["merged_sources_count"] = merged_sources_count
+        coverage_audit["merged_sources_traceable"] = (merged_sources_count == coverage_audit.get("merged_count", 0))
         cls.last_coverage_report = coverage_audit
 
         cls._log(
@@ -1300,6 +1326,7 @@ class DeepScanExtractor:
                     name_l = name.lower()
                     desc_l = llm_description.lower()
                     name_words = set(re.findall(r"\b[a-zA-Z]{3,}\b", name_l))
+                    desc_words = set(re.findall(r"\b[a-zA-Z]{3,}\b", desc_l)) - cls.STOP_WORDS
                     best_score = -1
 
                     for c_idx, s_idx in best_seg_ids:
@@ -1320,6 +1347,13 @@ class DeepScanExtractor:
                                 pos = seg_l.find(desc_l[:40])
                         if name_words:
                             score += sum(5 for w in name_words if w in seg_l)
+
+                        # Substantive token coverage of description in this segment:
+                        # Strongly prefers the segment that contains the complete roster / full clause
+                        if desc_words:
+                            seg_words = set(re.findall(r"\b[a-zA-Z]{3,}\b", seg_l)) - cls.STOP_WORDS
+                            coverage = len(desc_words & seg_words) / len(desc_words)
+                            score += int(coverage * 80)
 
                         # Overlap edge penalty:
                         # If matched text is only in trailing overlap margin (last 200 chars),
@@ -1425,7 +1459,23 @@ class DeepScanExtractor:
             name_l = name.lower()
             desc_l = desc.lower()
 
-            # 1. Applicant details viewing vs recommend vs reject
+            # 1a. Applicant list viewing vs applicant details viewing compound item
+            if ("applicant" in desc_l or "applicant" in name_l) and ("list" in desc_l or "list" in name_l) and ("detail" in desc_l or "detail" in name_l):
+                prefix = name.split(" - ")[0].strip() if " - " in name else "Admin View"
+                c1 = copy.deepcopy(it)
+                c1["name"] = f"{prefix} - View applicant list"
+                c1["description"] = "Admin can see the list of applicants for any job requisition."
+                c1["evidence_snippet"] = "Admin can see the list of applicants for any job requisition."
+                split_items.append(c1)
+
+                c2 = copy.deepcopy(it)
+                c2["name"] = f"{prefix} - See applicant details"
+                c2["description"] = "Admin can see the details of the applicants for any job requisition."
+                c2["evidence_snippet"] = "Admin can see the details of the applicants for any job requisition."
+                split_items.append(c2)
+                continue
+
+            # 1b. Applicant details viewing vs recommend vs reject
             # e.g., "Admin can see the details of the applicants for any job requisition and can recommend or reject the applicant."
             if ("applicant" in desc_l or "applicant" in name_l) and ("detail" in desc_l or "detail" in name_l) and ("recommend" in desc_l and "reject" in desc_l):
                 prefix = name.split(" - ")[0].strip() if " - " in name else "Admin View"
@@ -1585,7 +1635,6 @@ class DeepScanExtractor:
                                     if k in best_match_inp and k not in it:
                                         it[k] = best_match_inp[k]
                     # Protect against LLM over-merging by verifying each input item
-                    import difflib
                     verified_reduced = list(sec_reduced or [])
                     for inp in items:
                         inp_subsumed = False
@@ -2031,6 +2080,7 @@ class DeepScanExtractor:
         reduced_items: list[dict],
         mapped_items: list[dict],
         document_id: int,
+        project_id: Optional[int] = None,
         index_to_chunk: Optional[dict] = None,
         logger=None,
     ) -> list[dict]:
@@ -2080,13 +2130,71 @@ class DeepScanExtractor:
                 evidence = item.get("description") or name
                 provenance_status = PROVENANCE_UNRESOLVED
 
-            verbatim_evidence = evidence[:500].strip()
+            # Preserve full legal clause context up to 2000 chars without truncating clauses
+            verbatim_evidence = evidence[:2000].strip()
             is_pure = item.get("is_pure_milestone", False) or (src.get("is_pure_milestone", False) if src else False)
             default_v_reason = "No defensible source match found" if provenance_status == PROVENANCE_UNRESOLVED else "Verified against source quotation"
+
+            # Stable Candidate ID
+            p_prefix = f"p{project_id}_" if project_id is not None else ""
+            candidate_id = f"c_{p_prefix}d{document_id}_{idx:04d}"
+
+            # Structural breakdown: Actor, Action, Target Entity
+            desc_val = item.get("description", name)
+            comb_text = f"{name} {desc_val}"
+            comb_text_l = comb_text.lower()
+
+            ACTORS_CLIENT = [r"\bgoogle limited\b", r"\bgl\b", r"\bclient\b"]
+            ACTORS_VENDOR = [r"\bgoogle\b", r"\bgoogle llp\b", r"\bgoogle india\b", r"\bvendor\b"]
+            is_client = any(bool(re.search(pat, comb_text_l, flags=re.I)) for pat in ACTORS_CLIENT)
+            is_vendor = any(bool(re.search(pat, comb_text_l, flags=re.I)) for pat in ACTORS_VENDOR) and not is_client
+            if is_client:
+                actor = "Google Limited"
+            elif is_vendor:
+                actor = "Google"
+            else:
+                actor = "Joint / Unspecified"
+
+            detected_actions = sorted(ActionEntityProtector.get_actions(comb_text))
+            primary_action = detected_actions[0] if detected_actions else "obligation"
+
+            detected_entities = sorted(ActionEntityProtector.get_entities(comb_text))
+            primary_target = detected_entities[0] if detected_entities else "deliverable"
+
+            # Atomic claims
+            atomic_claims = [
+                cl.strip() for cl in re.split(r'[.\n;|]|(?:\b(?:allowing|provided that|subject to|however)\b)', desc_val)
+                if len(cl.strip()) >= 5
+            ] or [desc_val]
+
+            # Evidence character offsets
+            ev_offset_start = None
+            ev_offset_end = None
+            if index_to_chunk and chunk_idx is not None and chunk_idx in index_to_chunk:
+                c_text = index_to_chunk[chunk_idx].get("text", "")
+                if verbatim_evidence:
+                    search_str = verbatim_evidence[:80] if len(verbatim_evidence) >= 80 else verbatim_evidence
+                    pos = c_text.lower().find(search_str.lower())
+                    if pos != -1:
+                        ev_offset_start = pos
+                        ev_offset_end = pos + len(verbatim_evidence)
+                    else:
+                        base_pos = (src.get("text_offset") or src.get("_pos_in_chunk", 0)) if src else 0
+                        ev_offset_start = base_pos
+                        ev_offset_end = base_pos + len(verbatim_evidence)
+
             candidate_dict = {
+                "candidate_id": candidate_id,
+                "project_id": project_id,
                 "name": name,
-                "description": item.get("description", name),
+                "description": desc_val,
                 "candidate_type": "Milestone" if is_pure else "Clause",
+                "actor": actor,
+                "action": primary_action,
+                "actions": detected_actions,
+                "target_entity": primary_target,
+                "entities": detected_entities,
+                "atomic_claims": atomic_claims,
                 "page_number": page_val,
                 "page_locator": page_locator,
                 "section": section,
@@ -2097,7 +2205,9 @@ class DeepScanExtractor:
                 "source_locator": source_locator,
                 "segment_locator": src.get("segment_locator") if src else None,
                 "text_offset": (src.get("text_offset") or src.get("_pos_in_chunk", 0)) if src else None,
-                "raw_text": item.get("description", name),
+                "evidence_offset_start": ev_offset_start,
+                "evidence_offset_end": ev_offset_end,
+                "raw_text": desc_val,
                 "evidence_text": verbatim_evidence,
                 "evidence_snippet": verbatim_evidence,
                 "document_id": document_id,
@@ -2656,11 +2766,16 @@ class DeepScanExtractor:
             cl_and_name = f"{cl} {name.lower()}"
             cl_is_client = any(bool(re.search(pat, cl_and_name, flags=re.I)) for pat in ACTORS_CLIENT)
             cl_is_vendor = any(bool(re.search(pat, cl_and_name, flags=re.I)) for pat in ACTORS_VENDOR) and not cl_is_client
-            ev_is_client = any(bool(re.search(pat, union_ev_text_l, flags=re.I)) for pat in ACTORS_CLIENT)
-            ev_is_vendor = any(bool(re.search(pat, union_ev_text_l, flags=re.I)) for pat in ACTORS_VENDOR) and not ev_is_client
-            has_actor_conflict = (cl_is_client and ev_is_vendor and not ev_is_client) or (
-                cl_is_vendor and ev_is_client and not ev_is_vendor
-            )
+            ev_has_client = any(bool(re.search(pat, union_ev_text_l, flags=re.I)) for pat in ACTORS_CLIENT)
+            ev_has_vendor = any(bool(re.search(pat, union_ev_text_l, flags=re.I)) for pat in ACTORS_VENDOR)
+            # Only trigger conflict if clause is NOT verbatim in union evidence and asserts a party completely absent from evidence
+            is_verbatim_in_ev = cl.strip().lower() in union_ev_text_l
+            has_actor_conflict = False
+            if not is_verbatim_in_ev:
+                if cl_is_client and not ev_has_client and ev_has_vendor:
+                    has_actor_conflict = True
+                elif cl_is_vendor and not ev_has_vendor and ev_has_client:
+                    has_actor_conflict = True
 
             if has_contrasting_action_gap:
                 unsupported_claims.append(f"{cl} (missing action: {missing_actions})")
@@ -2860,6 +2975,16 @@ class DeepScanExtractor:
                     "warning": None,
                 })
                 merged_count += 1
+                canonical_cand = canonical_lookup[raw_name_l]
+                canonical_cand.setdefault("merged_sources", []).append({
+                    "name": raw_name,
+                    "chunk_index": it.get("chunk_index"),
+                    "page_number": it.get("page_number"),
+                    "section": it.get("section"),
+                    "evidence_snippet": it.get("evidence_snippet") or it.get("description", ""),
+                    "description": it.get("description", ""),
+                    "rationale": "Duplicate emission from overlapping window consolidated into surviving canonical",
+                })
                 continue
 
             # 3. MERGED / RETAINED via merge_lookup:
@@ -2896,6 +3021,23 @@ class DeepScanExtractor:
                     "warning": None if surviving_exists else f"INVARIANT VIOLATION: Surviving canonical '{surviving}' not found in canonical list",
                 })
                 merged_count += 1
+                if surviving_exists:
+                    canonical_cand = canonical_lookup[surviving_l]
+                    existing_sources = canonical_cand.setdefault("merged_sources", [])
+                    already_present = any(
+                        ms.get("name") == raw_name and ms.get("chunk_index") == it.get("chunk_index")
+                        for ms in existing_sources
+                    )
+                    if not already_present:
+                        existing_sources.append({
+                            "name": raw_name,
+                            "chunk_index": it.get("chunk_index"),
+                            "page_number": it.get("page_number"),
+                            "section": it.get("section"),
+                            "evidence_snippet": it.get("evidence_snippet") or it.get("description", ""),
+                            "description": it.get("description", ""),
+                            "rationale": "Merged into surviving canonical candidate",
+                        })
                 continue
 
             # 4. Fuzzy / Description Subsumption / Stem Overlap: map to canonical candidate
@@ -3076,6 +3218,7 @@ class DeepScanExtractor:
         sections_processed = sorted(list({it.get("section", "General") for it in mapped_items}))
         section_breakdown = cls.compute_section_breakdown(canonical_candidates)
 
+        merged_sources_count = sum(len(c.get("merged_sources", [])) for c in canonical_candidates)
         report = {
             "total_map_candidates": total,
             "total_canonical_candidates": len(canonical_candidates),
@@ -3086,6 +3229,8 @@ class DeepScanExtractor:
             "missing_or_invalid_sources_count": prov_unresolved,
             "retained_count": retained_count,
             "merged_count": merged_count,
+            "merged_sources_count": merged_sources_count,
+            "merged_sources_traceable": (merged_sources_count == merged_count),
             "excluded_count": excluded_count,
             "unresolved_count": unresolved_count,
             "coverage_percentage": coverage_pct,

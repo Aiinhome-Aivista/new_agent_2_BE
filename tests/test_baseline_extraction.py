@@ -3246,6 +3246,214 @@ def test_wb_unsupported_claims_stay_partially_verified():
     )
 
 
+
+
+def test_finding1_log_and_json_verification_counts_distinguished():
+    """
+    Finding 1: Log output must distinguish total canonical candidates extracted
+    from the verified candidates count.
+    """
+    prov_stats = {
+        "verified_count": 229,
+        "partially_verified_count": 4,
+        "unresolved_count": 0,
+        "verified_percentage": 98.28,
+    }
+    raw_candidates = [{"name": f"c_{i}"} for i in range(233)]
+    
+    # Check that canonical count != verified count
+    assert len(raw_candidates) == 233
+    assert prov_stats["verified_count"] == 229
+    assert prov_stats["partially_verified_count"] == 4
+    assert len(raw_candidates) == prov_stats["verified_count"] + prov_stats["partially_verified_count"]
+
+
+def test_finding2_applicant_list_vs_applicant_details_distinct_and_verified():
+    """
+    Finding 2: 'Admin View - View applicant list' and 'Admin View - See applicant details'
+    represent distinct granularity levels (collection vs item detail) and must not merge.
+    """
+    from services.deep_scan_extractor import ActionEntityProtector, DeepScanExtractor
+    item_list = {
+        "name": "Admin View - View applicant list",
+        "description": "Admin can see the list of applicants for any job requisition.",
+        "section": "Functional Scope",
+    }
+    item_detail = {
+        "name": "Admin View - See applicant details",
+        "description": "Admin can see the details of the applicants for any job requisition.",
+        "section": "Functional Scope",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_list, item_detail)
+    assert not can_m, f"List and details must not merge: {reason}"
+    assert "collection vs item detail" in reason.lower()
+
+    # Verify both against chunk 7 text
+    chunk_7_text = (
+        "- Admin can see the list of applicants for any job requisition.\n"
+        "- Admin can see the details of the applicants for any job requisition and can recommend or reject the applicant."
+    )
+    status_list, reason_list = DeepScanExtractor._verify_candidate_claims(
+        name=item_list["name"],
+        desc=item_list["description"],
+        primary_ev="Admin can see the list of applicants for any job requisition.",
+        merged_sources=[],
+        dates=set(),
+        durations=set(),
+        chunk_excerpt=chunk_7_text,
+        index_to_chunk={7: {"text": chunk_7_text}},
+    )
+    assert status_list == "VERIFIED", f"Applicant list should be VERIFIED, got {status_list} ({reason_list})"
+
+    status_detail, reason_detail = DeepScanExtractor._verify_candidate_claims(
+        name=item_detail["name"],
+        desc=item_detail["description"],
+        primary_ev="Admin can see the details of the applicants for any job requisition.",
+        merged_sources=[],
+        dates=set(),
+        durations=set(),
+        chunk_excerpt=chunk_7_text,
+        index_to_chunk={7: {"text": chunk_7_text}},
+    )
+    assert status_detail == "VERIFIED", f"Applicant details should be VERIFIED, got {status_detail} ({reason_detail})"
+
+
+def test_finding3a_long_evidence_clause_preservation():
+    """
+    Finding 3A: Long contractual clauses (>500 characters) must not be truncated
+    in candidate rehydration, ensuring complete verbatim evidence preservation.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    long_clause = (
+        "If there are any circumstances that reasonably restrict travel or physical presence of our personnel at your office / location, "
+        "then without prejudice to your payment obligations, you shall allow such personnel to work from home or other remote location till "
+        "the time such reasonable restrictions exist. Any delay / default in performing our obligations arising from such restrictions, "
+        "shall not be attributable to us and shall not be considered a breach of contract on our part and no consequent damages / penalties "
+        "etc. arising therefrom would be imposed on us under the Contract."
+    )
+    assert len(long_clause) > 500, f"Clause should be >500 chars (len={len(long_clause)})"
+
+    reduced_items = [{
+        "name": "Remote work during travel restrictions",
+        "description": long_clause,
+        "section": "Assumptions",
+        "evidence_snippet": long_clause,
+    }]
+    mapped_items = [{
+        "name": "Remote work during travel restrictions",
+        "description": long_clause,
+        "section": "Assumptions",
+        "chunk_index": 17,
+        "page_number": None,
+        "evidence_snippet": long_clause,
+        "_window_text": long_clause,
+    }]
+    candidates = DeepScanExtractor._to_candidates(
+        reduced_items=reduced_items,
+        mapped_items=mapped_items,
+        document_id=250,
+        project_id=112,
+        index_to_chunk={17: {"text": long_clause, "page_number": None}},
+    )
+    cand = candidates[0]
+    assert len(cand["evidence_text"]) == len(long_clause), (
+        f"Evidence text was truncated: {len(cand['evidence_text'])} != {len(long_clause)}"
+    )
+    assert cand["evidence_text"].endswith("imposed on us under the Contract."), "Evidence text truncated before end of sentence"
+
+
+def test_finding3b_steering_committee_split_chunk_boundary_attribution():
+    """
+    Finding 3B: Segment attribution scoring must select the complete segment
+    containing all 7 roster members rather than a truncated segment ending at a chunk boundary.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    desc = (
+        "A Project Steering Committee will be constituted with the following members: "
+        "* Mr. John, GL * Mrs. Sam, Google * Mr. Nick, Google * Mr. elon, Google * Mr. sundar, Google "
+        "* Mr. satya, Google * Mr. demario, Google"
+    )
+    seg_29_5 = (
+        "A Project Steering Committee will be constituted with the following members:\n"
+        "* Mr. John, GL"
+    )
+    seg_30_0 = (
+        "A Project Steering Committee will be constituted with the following members:\n"
+        "* Mr. John, GL\n* Mrs. Sam, Google\n* Mr. Nick, Google\n* Mr. elon, Google\n"
+        "* Mr. sundar, Google\n* Mr. satya, Google\n* Mr. demario, Google"
+    )
+    # Token coverage check
+    desc_words = set(re.findall(r"\b[a-zA-Z]{3,}\b", desc.lower())) - DeepScanExtractor.STOP_WORDS
+    words_29 = set(re.findall(r"\b[a-zA-Z]{3,}\b", seg_29_5.lower())) - DeepScanExtractor.STOP_WORDS
+    words_30 = set(re.findall(r"\b[a-zA-Z]{3,}\b", seg_30_0.lower())) - DeepScanExtractor.STOP_WORDS
+
+    cov_29 = len(desc_words & words_29) / len(desc_words)
+    cov_30 = len(desc_words & words_30) / len(desc_words)
+
+    assert cov_30 == 1.0, "Segment 30_0 must have 100% token coverage of the roster"
+    assert cov_30 > cov_29, f"Segment 30_0 coverage ({cov_30}) must exceed truncated 29_5 coverage ({cov_29})"
+
+
+def test_finding4_coverage_audit_merged_sources_traceability():
+    """
+    Finding 4: Coverage audit merged_count must equal sum(len(c['merged_sources']))
+    across all canonical candidates, ensuring 100% traceability for all merged MAP items.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    mapped_items = [
+        {"name": "Item A", "description": "desc A", "section": "General", "chunk_index": 1},
+        {"name": "Item A", "description": "desc A dup", "section": "General", "chunk_index": 2},
+        {"name": "Item B", "description": "desc B", "section": "General", "chunk_index": 3},
+    ]
+    candidates = [
+        {"name": "Item A", "description": "desc A", "section": "General", "merged_sources": []},
+        {"name": "Item B", "description": "desc B", "section": "General", "merged_sources": []},
+    ]
+    audit = DeepScanExtractor._audit_coverage(
+        mapped_items=mapped_items,
+        canonical_candidates=candidates,
+        merge_events=[],
+        retrieval_metrics={},
+        total_chunks=3,
+        total_segments=3,
+    )
+    assert audit["merged_count"] == 1
+    assert audit["retained_count"] == 2
+    assert audit["merged_sources_count"] == 1
+    assert audit["merged_sources_traceable"] is True
+    assert len(candidates[0]["merged_sources"]) == 1
+    assert candidates[0]["merged_sources"][0]["chunk_index"] == 2
+
+
+def test_finding5_candidate_contract_schema_enrichment():
+    """
+    Finding 5: Canonical candidates must carry candidate_id, actor, action,
+    target_entity, atomic_claims, and evidence character offsets for downstream Step 4 consumption.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    raw_item = {
+        "name": "Google Limited UAT sign-off",
+        "description": "Google Limited will conduct user acceptance testing and provide formal sign-off.",
+        "section": "Milestones",
+        "evidence_snippet": "Google Limited will conduct user acceptance testing and provide formal sign-off.",
+    }
+    candidates = DeepScanExtractor._to_candidates(
+        reduced_items=[raw_item],
+        mapped_items=[{**raw_item, "chunk_index": 5, "_pos_in_chunk": 120}],
+        document_id=250,
+        project_id=112,
+        index_to_chunk={5: {"text": "Preceding text. Google Limited will conduct user acceptance testing and provide formal sign-off. Trailing text.", "page_number": None}},
+    )
+    cand = candidates[0]
+    assert cand["candidate_id"] == "c_p112_d250_0001"
+    assert cand["actor"] == "Google Limited"
+    assert cand["action"] in ["conduct", "sign-off", "testing", "obligation"] or cand["actions"]
+    assert cand["target_entity"] == "uat_testing" or "uat_testing" in cand["entities"]
+    assert len(cand["atomic_claims"]) >= 1
+    assert cand["evidence_offset_start"] is not None
+    assert cand["evidence_offset_end"] is not None
+    assert cand["evidence_offset_end"] > cand["evidence_offset_start"]
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------

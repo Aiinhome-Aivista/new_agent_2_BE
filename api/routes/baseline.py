@@ -424,7 +424,12 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             logger.banner("INSPECTION MODE COMPLETE — PIPELINE STOPPED AFTER STEP 3")
             logger.process(f"Diagnostic inspection artifact saved to: {inspection_artifact_path}")
             logger.process(f"Historical run artifact saved to: {run_artifact_path}")
-            logger.output("Step 3 Canonical Candidates Verified", len(raw_candidates))
+            logger.output("Step 3 Canonical Candidates Extracted", len(raw_candidates))
+            logger.output("Step 3 Canonical Candidates Verified", prov_stats.get("verified_count", 0))
+            if prov_stats.get("partially_verified_count", 0) > 0:
+                logger.output("Step 3 Candidates Partially Verified", prov_stats.get("partially_verified_count", 0))
+            if prov_stats.get("unresolved_count", 0) > 0:
+                logger.output("Step 3 Candidates Unresolved", prov_stats.get("unresolved_count", 0))
             logger.output("MAP-to-REDUCE Coverage", f"{coverage_audit.get('coverage_percentage', 100.0)}%")
             logger.output("Provenance Verification Rate", f"{prov_stats.get('verified_percentage', 100.0)}%")
 
