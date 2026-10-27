@@ -3454,6 +3454,160 @@ def test_finding5_candidate_contract_schema_enrichment():
     assert cand["evidence_offset_end"] is not None
     assert cand["evidence_offset_end"] > cand["evidence_offset_start"]
 
+
+
+def test_step4_inspector_execution_and_separate_artifacts():
+    """
+    Writing-Block-New-1 Requirement: Step 4 must execute in inspection mode,
+    generating separate Step 4 log and JSON artifacts while preserving candidate accounting.
+    """
+    import tempfile
+    import json
+    from services.step4_inspector import Step4Inspector
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        candidates = [
+            {
+                "candidate_id": "c_p112_d250_0001",
+                "name": "Deliverable 1 - Architecture Blueprint",
+                "description": "Deliver final architecture blueprint.",
+                "section": "Deliverables",
+                "evidence_text": "Vendor shall deliver the architecture blueprint.",
+                "evidence_snippet": "Vendor shall deliver the architecture blueprint.",
+                "evidence_offset_start": 100,
+                "evidence_offset_end": 145,
+                "provenance_status": "VERIFIED",
+                "chunk_index": 3,
+                "source_locator": "chunk_3",
+            },
+            {
+                "candidate_id": "c_p112_d250_0002",
+                "name": "Assumption 1 - Cloud Hosting Environment",
+                "description": "Client will provide cloud hosting access.",
+                "section": "Assumptions",
+                "evidence_text": "Client will provide cloud hosting access.",
+                "evidence_snippet": "Client will provide cloud hosting access.",
+                "evidence_offset_start": 200,
+                "evidence_offset_end": 240,
+                "provenance_status": "VERIFIED",
+                "chunk_index": 4,
+                "source_locator": "chunk_4",
+            },
+        ]
+
+        res = Step4Inspector.execute_inspection(
+            project_id=112,
+            document_id=250,
+            doc_name="demo_EL.docx",
+            raw_candidates=candidates,
+            step3_json_path="logs/step3_mock.json",
+            step3_log_path="logs/step3_mock.log",
+            run_id="inspection_test_run_001",
+            timestamp_str="20261027_120000",
+            logs_dir=tmp_dir,
+        )
+
+        assert res["verdict"] == "STEP_4_VALIDATION_PASSED"
+        assert res["total_candidates"] == 2
+        assert os.path.exists(res["step4_run_json_path"]), "Step 4 timestamped JSON artifact must exist"
+        assert os.path.exists(res["step4_log_path"]), "Step 4 log artifact must exist"
+
+        # Verify JSON artifact content
+        with open(res["step4_run_json_path"], "r", encoding="utf-8") as f_art:
+            art = json.load(f_art)
+        assert art["step4_execution_summary"]["accounting_reconciled"] is True
+        assert len(art["structured_records"]) == 2
+        assert art["structured_records"][0]["candidate_id"] == "c_p112_d250_0001"
+        assert art["structured_records"][0]["record_type"] == "Deliverable"
+        assert art["structured_records"][0]["work_item_eligible"] is True
+        assert art["structured_records"][1]["candidate_id"] == "c_p112_d250_0002"
+        assert art["structured_records"][1]["record_type"] == "Assumption"
+        assert art["structured_records"][1]["work_item_eligible"] is False
+
+
+def test_step4_candidate_provenance_and_schema_preservation():
+    """
+    Writing-Block-New-1 Requirement: Step 4 must preserve Step 3 candidate IDs,
+    actors, actions, target entities, atomic claims, evidence text, and character offsets.
+    """
+    from services.step4_inspector import Step4Inspector
+    from services.scope_classifier import ScopeClassifier
+
+    cand = {
+        "candidate_id": "c_p112_d250_0042",
+        "name": "Admin View - Applicant List",
+        "description": "Admin can see the list of applicants for any job requisition.",
+        "section": "Functional Scope",
+        "actor": "Google Limited",
+        "action": "view",
+        "actions": ["view"],
+        "target_entity": "applicant",
+        "entities": ["applicant"],
+        "atomic_claims": ["Admin can see the list of applicants for any job requisition."],
+        "evidence_text": "Admin can see the list of applicants for any job requisition.",
+        "evidence_snippet": "Admin can see the list of applicants for any job requisition.",
+        "evidence_offset_start": 350,
+        "evidence_offset_end": 412,
+        "provenance_status": "VERIFIED",
+        "chunk_index": 7,
+        "source_locator": "chunk_7",
+    }
+
+    # Run prefilter
+    classified = ScopeClassifier.prefilter_by_heading(cand)
+    assert classified is not None
+    assert classified["scope_type"] == "IN_SCOPE"
+    # Evidence text must NOT be overwritten with generic heading message
+    assert classified["evidence_text"] == "Admin can see the list of applicants for any job requisition."
+
+    # Structure into Step 4 contract
+    structured = Step4Inspector.structure_candidate(classified)
+    assert structured["candidate_id"] == "c_p112_d250_0042"
+    assert structured["actor"] == "Google Limited"
+    assert structured["action"] == "view"
+    assert structured["target_entity"] == "applicant"
+    assert structured["evidence_offset_start"] == 350
+    assert structured["evidence_offset_end"] == 412
+    assert structured["verification_status"] == "VERIFIED"
+
+
+def test_step4_contract_structuring_and_taxonomy():
+    """
+    Writing-Block-New-1 Requirement: Step 4 taxonomy must classify items into
+    distinct record types and correctly identify schedulable work vs contextual records.
+    """
+    from services.step4_inspector import Step4Inspector
+
+    deliverable_cand = {
+        "name": "Project Completion Report",
+        "description": "Deliver formal completion report.",
+        "section": "Deliverables",
+        "scope_type": "IN_SCOPE",
+    }
+    s_del = Step4Inspector.structure_candidate(deliverable_cand)
+    assert s_del["record_type"] == "Deliverable"
+    assert s_del["work_item_eligible"] is True
+
+    assumption_cand = {
+        "name": "Network Connectivity",
+        "description": "Reliable internet connectivity will be provided.",
+        "section": "Assumptions",
+        "scope_type": "OUT_OF_SCOPE",
+    }
+    s_assump = Step4Inspector.structure_candidate(assumption_cand)
+    assert s_assump["record_type"] == "Assumption"
+    assert s_assump["work_item_eligible"] is False
+
+    recurring_cand = {
+        "name": "Weekly Progress Status Reporting",
+        "description": "Submit weekly status report to steering committee.",
+        "section": "Governance",
+        "scope_type": "IN_SCOPE",
+    }
+    s_rec = Step4Inspector.structure_candidate(recurring_cand)
+    assert s_rec["recurrence"] == "Weekly"
+    assert s_rec["record_type"] == "Governance Obligation"
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------

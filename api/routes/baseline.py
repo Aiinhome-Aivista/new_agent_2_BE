@@ -421,9 +421,9 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             if sec_bk.get("multi_section_count", 0) > 0:
                 logger.log(f"    Multi-Section Candidates: {sec_bk.get('multi_section_count')} (Tracked without double counting)")
 
-            logger.banner("INSPECTION MODE COMPLETE — PIPELINE STOPPED AFTER STEP 3")
-            logger.process(f"Diagnostic inspection artifact saved to: {inspection_artifact_path}")
-            logger.process(f"Historical run artifact saved to: {run_artifact_path}")
+            logger.banner("STEP 3 COMPLETE — PROCEEDING TO STEP 4 INSPECTION")
+            logger.process(f"Step 3 diagnostic inspection artifact saved to: {inspection_artifact_path}")
+            logger.process(f"Step 3 historical run artifact saved to: {run_artifact_path}")
             logger.output("Step 3 Canonical Candidates Extracted", len(raw_candidates))
             logger.output("Step 3 Canonical Candidates Verified", prov_stats.get("verified_count", 0))
             if prov_stats.get("partially_verified_count", 0) > 0:
@@ -433,20 +433,37 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             logger.output("MAP-to-REDUCE Coverage", f"{coverage_audit.get('coverage_percentage', 100.0)}%")
             logger.output("Provenance Verification Rate", f"{prov_stats.get('verified_percentage', 100.0)}%")
 
+            # ── [INSPECTION MODE: STEP 4 CLASSIFICATION & STRUCTURING] ──
+            # Step 3 is complete and its artifacts are preserved independently.
+            # Now execute Step 4 under inspection mode with a dedicated Step 4 log and JSON artifact.
+            from services.step4_inspector import Step4Inspector
+            run_id = f"inspection_run_{timestamp_str}"
+            step4_results = Step4Inspector.execute_inspection(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                raw_candidates=raw_candidates,
+                step3_json_path=run_artifact_path,
+                step3_log_path=logger.get_log_paths()["run_log"],
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+            )
+
             conn = get_valid_db_conn()
             if conn:
                 try:
                     with conn.cursor() as cur:
                         cur.execute(
                             "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, "
-                            "processing_step = 'Inspection Complete (Step 3)', processing_error = NULL WHERE id = %s",
+                            "processing_step = 'Inspection Complete (Steps 1-4)', processing_error = NULL WHERE id = %s",
                             (document_id,),
                         )
                         conn.commit()
                 except Exception as db_err:
                     logger.log(f"Notice updating document inspection status: {db_err}", level="WARN")
 
-            emit("Inspection Complete (Step 3)", 100)
+            emit("Inspection Complete (Steps 1-4)", 100)
             return
         else:
             # ── Step 4: Candidate Scope Classification ──
