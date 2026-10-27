@@ -215,6 +215,24 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             logger.raw_log(f"    [Chunk {i+1:02d}/20] chunk_index={c_idx} | {page_info} | length={c_len} chars")
             logger.raw_log(f"      Text: \"{snippet}...\"")
         logger.raw_log("")
+
+        # Check / Ensure ChromaDB vector indexing for Phase 1 Vector Heatmap
+        try:
+            coll = ChromaService.get_collection()
+            if coll:
+                existing_probe = coll.get(
+                    where={"$and": [{"project_id": {"$eq": project_id}}, {"document_id": {"$eq": document_id}}]},
+                    limit=1,
+                )
+                if not (existing_probe.get("ids") or []):
+                    logger.process("Document chunks not yet indexed in ChromaDB; indexing for vector heatmap...")
+                    RAGService.index_document(project_id, document_id, doc_name, doc_type, chunks)
+                    logger.output("ChromaDB Vector Indexing", f"Indexed {len(chunks)} chunks into vector store.")
+                else:
+                    logger.output("ChromaDB Vector Indexing", "Document already indexed in vector store.")
+        except Exception as idx_err:
+            logger.log(f"Notice: Non-fatal vector indexing check: {idx_err}", level="WARN")
+
         logger.step_end(1, "Document Parsing & Text Extraction", step1_time)
 
         # ── Step 2: Scope Section Detection ──
@@ -276,6 +294,16 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 
         logger.output("Canonical Candidates Extracted", len(raw_candidates))
         if coverage_audit:
+            ret_h = coverage_audit.get("retrieval_health", {})
+            if ret_h:
+                logger.output("ChromaDB Vector Retrieval Health", {
+                    "Status": ret_h.get("retrieval_status", "UNKNOWN"),
+                    "Queries Total": ret_h.get("queries_total", 0),
+                    "Queries Successful": ret_h.get("queries_successful", 0),
+                    "Queries Failed": ret_h.get("queries_failed", 0),
+                    "Hot Chunks Count": ret_h.get("hot_chunks_count", 0),
+                    "Fallback Used": ret_h.get("used_fallback", False),
+                })
             logger.output("MAP-to-REDUCE Candidate Coverage Audit", {
                 "Total MAP Raw Candidates": coverage_audit.get("total_map_candidates", 0),
                 "Canonical Candidates Produced": coverage_audit.get("total_canonical_candidates", 0),
@@ -283,6 +311,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 "Consolidated Merged Count": coverage_audit.get("merged_count", 0),
                 "Excluded Count": coverage_audit.get("excluded_count", 0),
                 "Unresolved Count": coverage_audit.get("unresolved_count", 0),
+                "Accounting Reconciled": "YES" if (coverage_audit.get("map_accounting_reconciled") and coverage_audit.get("canonical_reconciled")) else "NO",
                 "Coverage Accounting": f"{coverage_audit.get('coverage_percentage', 100.0)}%",
             })
 
@@ -344,6 +373,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                     "categories_defined": section_stats.get("categories_defined", 16),
                     "categories_detected": section_stats.get("categories_detected", len(section_stats.get("detected_sections", []))),
                     "detected_sections": section_stats.get("detected_sections", []),
+                    "unmapped_headings": section_stats.get("unmapped_headings", []),
                     "total_segments": len(chunks_with_sections),
                     "all_segments": [
                         {
@@ -352,6 +382,8 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                             "section": c.get("section"),
                             "confidence": c.get("section_confidence", 1.0),
                             "is_inferred": c.get("is_inferred", False),
+                            "parent_section": c.get("parent_section"),
+                            "section_source": c.get("section_source"),
                             "snippet": c.get("text", "")[:150],
                         }
                         for c in chunks_with_sections
@@ -359,6 +391,8 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 },
                 "step3_candidate_extraction": {
                     "canonical_candidates_count": len(raw_candidates),
+                    "retrieval_health": coverage_audit.get("retrieval_health", {}),
+                    "accounting_reconciled": bool(coverage_audit.get("map_accounting_reconciled") and coverage_audit.get("canonical_reconciled")),
                     "coverage_audit": coverage_audit,
                     "provenance_summary": {
                         "verified_count": prov_stats.get("verified_count", 0),
@@ -366,6 +400,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                         "unresolved_count": prov_stats.get("unresolved_count", 0),
                         "verified_percentage": prov_stats.get("verified_percentage", 100.0),
                     },
+                    "section_breakdown": coverage_audit.get("section_breakdown", DeepScanExtractor.compute_section_breakdown(raw_candidates)),
                     "canonical_candidates": raw_candidates,
                 },
             }
@@ -377,6 +412,14 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                     json.dump(diagnostic_artifact, f_run, indent=2, default=str)
             except Exception:
                 pass
+
+            sec_bk = diagnostic_artifact["step3_candidate_extraction"]["section_breakdown"]
+            logger.log("\n  >> [Step 3: Canonical Candidates Section Breakdown] <<")
+            for sec, count in sec_bk.get("counts", {}).items():
+                logger.log(f"    - Section '{sec}': {count} candidate(s)")
+            logger.log(f"    Total Section Counts Sum: {sec_bk.get('total_counted')} (Reconciled with canonical count: {sec_bk.get('section_sum_equals_canonical_count')})")
+            if sec_bk.get("multi_section_count", 0) > 0:
+                logger.log(f"    Multi-Section Candidates: {sec_bk.get('multi_section_count')} (Tracked without double counting)")
 
             logger.banner("INSPECTION MODE COMPLETE — PIPELINE STOPPED AFTER STEP 3")
             logger.process(f"Diagnostic inspection artifact saved to: {inspection_artifact_path}")

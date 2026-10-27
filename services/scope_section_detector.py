@@ -9,7 +9,7 @@ class ScopeSectionDetector:
     rather than ordinary body-text keywords.
     """
 
-    # All 16 intended contractual target sections (Taxonomy)
+    # All 17 intended contractual target sections (Taxonomy)
     DEFINED_SECTIONS = [
         "Scope of Work",
         "Deliverables",
@@ -22,6 +22,7 @@ class ScopeSectionDetector:
         "Recurring Commitments",
         "General",
         "Functional Scope",
+        "Technical Scope",
         "Methodology",
         "Governance",
         "Support",
@@ -58,6 +59,8 @@ class ScopeSectionDetector:
                 r"client\s+(?:responsibilit(?:y|ies)|obligations?|prerequisites?)"
                 r"|customer\s+(?:responsibilit(?:y|ies)|obligations?)"
                 r"|gl\s+responsibilit(?:y|ies)"
+                r"|responsibilit(?:y|ies):\s*(?:gl|client|customer)"
+                r"|(?:gl|client|customer)\s+responsibilit(?:y|ies)"
                 r"|client\s+(?:inputs?|dependencies|will\s+provide)"
                 r"|client\s+obligations"
                 r")",
@@ -77,6 +80,8 @@ class ScopeSectionDetector:
                 r"|our\s+responsibilit(?:y|ies)"
                 r"|vendor\s+responsibilit(?:y|ies)"
                 r"|description\s+of\s+responsibilities"
+                r"|responsibilit(?:y|ies):?\s*(?:our|vendor|service\s+provider|consultant|[a-z0-9_\s]+)"
+                r"|responsibilit(?:y|ies)\b"
                 r")",
                 re.MULTILINE,
             ),
@@ -105,6 +110,8 @@ class ScopeSectionDetector:
                 r"assumptions?"
                 r"|key\s+assumptions?"
                 r"|key\s+assgptions?"
+                r"|assgptions?\s+(?:&|and)\s+dependencies"
+                r"|assumptions?\s+(?:&|and)\s+dependencies"
                 r"|general\s+assumptions?"
                 r"|engagement\s+assumptions?"
                 r")",
@@ -115,13 +122,14 @@ class ScopeSectionDetector:
         (
             "Deliverables",
             re.compile(
-                r"(?i)(?:^|[\s#\*\-])"
+                r"(?i)(?:^|[\s#\*\-|])"
                 r"(?:"
-                r"list\s+of\s+deliverables"
+                r"list\s+of\s+deliverables(?:\s+with\s+milestones?)?"
                 r"|project\s+deliverables?"
                 r"|key\s+deliverables?"
                 r"|expected\s+deliverables?"
                 r"|documentation\s+deliverables?"
+                r"|deliverables?"
                 r")",
                 re.MULTILINE,
             ),
@@ -160,7 +168,22 @@ class ScopeSectionDetector:
                 re.MULTILINE,
             ),
         ),
-        # 9. FUNCTIONAL SCOPE / MODULE VIEWS
+        # 9. TECHNICAL SCOPE — distinct category from Functional Scope
+        (
+            "Technical Scope",
+            re.compile(
+                r"(?i)(?:^|[\s#\*\-])"
+                r"(?:"
+                r"technical\s+scope"
+                r"|system\s+scope"
+                r"|architecture(?:\s+scope)?"
+                r"|infrastructure(?:\s+scope)?"
+                r"|technology\s+(?:stack|landscape|scope)"
+                r")",
+                re.MULTILINE,
+            ),
+        ),
+        # 10. FUNCTIONAL SCOPE / MODULE VIEWS
         (
             "Functional Scope",
             re.compile(
@@ -173,13 +196,12 @@ class ScopeSectionDetector:
                 r"|user\s+(?:or|and)\s+employee\s+view"
                 r"|manager\s+view"
                 r"|application\s+features?"
-                r"|system\s+features?"
                 r"|portal\s+features?"
                 r")",
                 re.MULTILINE,
             ),
         ),
-        # 10. SCOPE OF WORK (and In Scope)
+        # 11. SCOPE OF WORK (and In Scope)
         (
             "Scope of Work",
             re.compile(
@@ -191,11 +213,13 @@ class ScopeSectionDetector:
                 r"|project\s+scope"
                 r"|engagement\s+scope"
                 r"|scope\s+of\s+engagement"
+                r"|organi[sz]ational\s+scope"
+                r"|geographical\s+scope|graphical\s+scope"
                 r")",
                 re.MULTILINE,
             ),
         ),
-        # 11. METHODOLOGY / APPROACH
+        # 12. METHODOLOGY / APPROACH
         (
             "Methodology",
             re.compile(
@@ -207,11 +231,17 @@ class ScopeSectionDetector:
                 r"|implementation\s+(?:approach|methodology)"
                 r"|delivery\s+(?:approach|methodology)"
                 r"|transform\s+methodology"
+                r"|project\s+phases?"
+                r"|assess(?:\s+phase)?"
+                r"|design(?:\s+phase)?"
+                r"|construct(?:\s+phase)?"
+                r"|implementation\s+(?:&|and)\s+go[\s\-_]*live"
+                r"|operate\s+(?:&|and)\s+review"
                 r")",
                 re.MULTILINE,
             ),
         ),
-        # 12. GOVERNANCE / REPORTING
+        # 13. GOVERNANCE / REPORTING
         (
             "Governance",
             re.compile(
@@ -220,16 +250,20 @@ class ScopeSectionDetector:
                 r"progress\s+reporting\s+(?:and|&)\s+issue\s+resolution"
                 r"|project\s+status\s+report"
                 r"|escalation\s+matrix"
+                r"|level\s+of\s+escalation"
                 r"|project\s+governance"
                 r"|steering\s+committee"
                 r"|governance\s+structure"
                 r"|project\s+organisation\s+structure"
                 r"|reporting\s+cadence"
+                r"|(?:your\s+|google\s+)?project\s+manager"
+                r"|(?:your\s+|google\s+)?project\s+director"
+                r"|team\s+leaders?"
                 r")",
                 re.MULTILINE,
             ),
         ),
-        # 13. RESOURCES / TEAM / EXPENSES
+        # 14. RESOURCES / TEAM / EXPENSES
         (
             "Resources",
             re.compile(
@@ -245,7 +279,7 @@ class ScopeSectionDetector:
                 re.MULTILINE,
             ),
         ),
-        # 14. SUPPORT / HYPERCARE
+        # 15. SUPPORT / HYPERCARE
         (
             "Support",
             re.compile(
@@ -260,7 +294,7 @@ class ScopeSectionDetector:
                 re.MULTILINE,
             ),
         ),
-        # 15. ACCEPTANCE / UAT
+        # 16. ACCEPTANCE / UAT
         (
             "Acceptance",
             re.compile(
@@ -277,7 +311,7 @@ class ScopeSectionDetector:
                 re.MULTILINE,
             ),
         ),
-        # 16. GENERAL / PREAMBLE
+        # 17. GENERAL / PREAMBLE / CONTRACT TERMS
         (
             "General",
             re.compile(
@@ -289,6 +323,9 @@ class ScopeSectionDetector:
                 r"|introduction"
                 r"|background"
                 r"|preamble"
+                r"|contract\s+(?:will\s+be\s+valid|validity|term|period)"
+                r"|validity\s+(?:period|of\s+contract)"
+                r"|term\s+and\s+termination"
                 r")",
                 re.MULTILINE,
             ),
@@ -297,13 +334,13 @@ class ScopeSectionDetector:
 
     FUNCTIONAL_SCOPE_SECTIONS = frozenset({
         "In Scope", "Scope of Work", "Deliverables", "Responsibilities",
-        "Milestones", "Recurring Commitments", "Functional Scope",
+        "Milestones", "Recurring Commitments", "Functional Scope", "Technical Scope",
         "Methodology", "Governance", "Support", "Acceptance",
     })
 
     @classmethod
     def get_defined_sections(cls) -> List[str]:
-        """Returns the full list of all 16 supported section categories."""
+        """Returns the full list of all supported section categories."""
         return list(cls.DEFINED_SECTIONS)
 
     @classmethod
@@ -339,31 +376,41 @@ class ScopeSectionDetector:
             if any(any(hdr in c.lower() for hdr in structural_table_headers) for c in cells):
                 return True, clean, 0.95
 
-        # 3. Explicit module view division markers (e.g., * Functional Scope:, * **Admin View:**)
-        if re.match(r"^\*\s+(?:\*{2}[^*:]+\*{2}:?|Functional Scope:?)$", clean, re.IGNORECASE):
+        # 3. Explicit module view division markers (e.g., * Functional Scope:, * **Admin View:**, * **User or Employee View:**)
+        if re.match(r"^\*\s+(?:\*{1,3}[^*]+\*{1,3}:?|Functional Scope:?)$", clean, re.IGNORECASE):
             h_text = re.sub(r"^\*\s+", "", clean).replace("*", "").strip(":").strip()
             return True, h_text, 0.90
 
+        # 3b. Bulleted section titles ending with a colon: e.g. * Technical Scope:, * AssGptions and dependencies:, * Assumptions:
+        m_bullet_title = re.match(r"^\*\s+([A-Za-z\s/&]{3,60}):$", clean)
+        if m_bullet_title:
+            h_text = m_bullet_title.group(1).strip()
+            return True, h_text, 0.90
+
         # 4. Numbered bold headings (e.g., 1. **Scope of Work**, * 1. **Key Assumptions**)
-        m_num_bold = re.match(r"^(?:\*\s*)?(?:\d+[\.\)]|\*{1,2}\d+[\.\)])\s*\*{2}([^*]+)\*{2}:?$", clean)
+        m_num_bold = re.match(r"^(?:\*\s*)?(?:\d+[\.\)]|\*{1,2}\d+[\.\)])\s*\*{1,3}([^*]+)\*{1,3}:?$", clean)
         if m_num_bold:
             h_text = m_num_bold.group(1).strip()
             if 2 < len(h_text) < 140:
                 return True, h_text, 1.0
 
         # 4b. Prefix bold numbered headings (e.g., **2 Scope of our services**, **4. Progress reporting...**)
-        m_bold_num = re.match(r"^\*{2}\s*\d+[\.\d\)]*\s*([^*]+)\*{2}:?$", clean)
+        m_bold_num = re.match(r"^\*{1,3}\s*\d+[\.\d\)]*\s*([^*]+)\*{1,3}:?$", clean)
         if m_bold_num:
             h_text = m_bold_num.group(1).strip()
             if 2 < len(h_text) < 140:
                 return True, h_text, 1.0
 
-        # 5. Standalone bold headings (e.g., **Letter of Engagement**, **Steering Committee**)
-        m_bold = re.match(r"^\*{2}([^*]{3,90})\*{2}:?$", clean)
+        # 5. Standalone bold/italic headings (e.g., ***Responsibility: GL***, **Letter of Engagement**, **Steering Committee**)
+        m_bold = re.match(r"^\*{1,3}([^*]{3,90})\*{1,3}:?$", clean)
         if m_bold:
             h_text = m_bold.group(1).strip()
             if 2 < len(h_text) < 90:
                 return True, h_text, 0.95
+
+        # 5b. Standalone contractual term / validity statements (e.g. Contract will be valid till 30th April 2027)
+        if re.match(r"^(?:(?:\*+\s*)?(?:Contract|Agreement)\s+(?:will\s+be\s+valid\s+till|validity\s+period|term\s+and\s+termination)\b.*)$", clean, re.IGNORECASE):
+            return True, clean, 0.95
 
         # 6. Appendix / Section titles
         if re.match(r"^(?:Appendix|Schedule|Annexure|Exhibit)\s*[\d\w\-_]+", clean, re.IGNORECASE):
@@ -410,10 +457,12 @@ class ScopeSectionDetector:
         current_section = "General"
         current_confidence = 0.50
         current_inferred = True
+        current_section_source = "Document Start"
         section_hierarchy: List[str] = ["General"]
 
         new_chunks = []
         detected_sections_set = set()
+        unmapped_headings: List[Dict[str, Any]] = []
 
         for chunk_idx, chunk in enumerate(chunks):
             text = chunk.get("text", "")
@@ -429,6 +478,7 @@ class ScopeSectionDetector:
                     if matched:
                         meta_section, current_confidence = matched
                         current_inferred = False
+                        current_section_source = clean_meta
                         break
             if meta_section:
                 current_section = meta_section
@@ -447,12 +497,13 @@ class ScopeSectionDetector:
                     if matched:
                         matched_section, match_conf = matched
                         
-                        # Only transition if section actually changes
-                        if matched_section != current_section:
+                        # Transition if section changes OR if a distinct structural heading begins
+                        if matched_section != current_section or heading_text != current_section_source:
                             # Save previous subchunk before transition
                             if current_subchunk_lines:
                                 sub_text = "\n".join(current_subchunk_lines).strip()
                                 if sub_text:
+                                    parent_sec = section_hierarchy[0] if len(section_hierarchy) > 1 else None
                                     new_chunks.append({
                                         "chunk_index": chunk.get("chunk_index", chunk_idx),
                                         "segment_index": subchunk_idx,
@@ -461,6 +512,8 @@ class ScopeSectionDetector:
                                         "section": current_section,
                                         "section_confidence": current_confidence,
                                         "is_inferred": current_inferred,
+                                        "parent_section": parent_sec,
+                                        "section_source": current_section_source,
                                         "section_hierarchy": list(section_hierarchy),
                                     })
                                     subchunk_idx += 1
@@ -470,16 +523,52 @@ class ScopeSectionDetector:
                             current_section = matched_section
                             current_confidence = min(heading_conf, match_conf)
                             current_inferred = False
+                            current_section_source = heading_text
                             
                             # Update hierarchy
-                            if matched_section == "Functional Scope" and "Scope of Work" in section_hierarchy:
-                                section_hierarchy = ["Scope of Work", "Functional Scope"]
+                            if matched_section in ("Functional Scope", "Technical Scope") and "Scope of Work" in section_hierarchy:
+                                section_hierarchy = ["Scope of Work", matched_section]
                             elif matched_section in ("Client Responsibilities", "Responsibilities") and "Responsibilities" in section_hierarchy:
                                 section_hierarchy = ["Responsibilities", matched_section]
                             else:
                                 section_hierarchy = [matched_section]
-
                             detected_sections_set.add(current_section)
+
+                    else:
+                        # Unmapped structural heading: safe fallback to "General", preserving original heading
+                        unmapped_headings.append({
+                            "heading": heading_text,
+                            "chunk_index": chunk.get("chunk_index", chunk_idx),
+                            "confidence": heading_conf,
+                        })
+                        fallback_sec = "General"
+                        if (fallback_sec != current_section or heading_text != current_section_source) and heading_conf >= 0.85:
+                            if current_subchunk_lines:
+                                sub_text = "\n".join(current_subchunk_lines).strip()
+                                if sub_text:
+                                    parent_sec = section_hierarchy[0] if len(section_hierarchy) > 1 else None
+                                    new_chunks.append({
+                                        "chunk_index": chunk.get("chunk_index", chunk_idx),
+                                        "segment_index": subchunk_idx,
+                                        "page_number": chunk_page,
+                                        "text": sub_text,
+                                        "section": current_section,
+                                        "section_confidence": current_confidence,
+                                        "is_inferred": current_inferred,
+                                        "parent_section": parent_sec,
+                                        "section_source": current_section_source,
+                                        "section_hierarchy": list(section_hierarchy),
+                                    })
+                                    subchunk_idx += 1
+                                    current_subchunk_lines = []
+                            current_section = fallback_sec
+                            current_confidence = 0.50
+                            current_inferred = True
+                            current_section_source = heading_text
+                            section_hierarchy = [fallback_sec]
+                            detected_sections_set.add(current_section)
+                        elif heading_conf >= 0.85:
+                            current_section_source = heading_text
 
                 current_subchunk_lines.append(line)
 
@@ -487,6 +576,7 @@ class ScopeSectionDetector:
             if current_subchunk_lines:
                 sub_text = "\n".join(current_subchunk_lines).strip()
                 if sub_text:
+                    parent_sec = section_hierarchy[0] if len(section_hierarchy) > 1 else None
                     new_chunks.append({
                         "chunk_index": chunk.get("chunk_index", chunk_idx),
                         "segment_index": subchunk_idx,
@@ -495,20 +585,23 @@ class ScopeSectionDetector:
                         "section": current_section,
                         "section_confidence": current_confidence,
                         "is_inferred": current_inferred,
+                        "parent_section": parent_sec,
+                        "section_source": current_section_source,
                         "section_hierarchy": list(section_hierarchy),
                     })
                     subchunk_idx += 1
 
-        detected_sections_set.add(current_section)
-        # Always count General if any chunk remained General
-        if any(c.get("section") == "General" for c in new_chunks):
-            detected_sections_set.add("General")
+        # Populate detected_sections_set comprehensively from all emitted segments
+        detected_sections_set = {c["section"] for c in new_chunks if c.get("section")}
+        if not detected_sections_set:
+            detected_sections_set = {"General"}
 
         stats = {
             "categories_defined": len(cls.DEFINED_SECTIONS),
             "categories_detected": len(detected_sections_set),
             "detected_sections": sorted(list(detected_sections_set)),
             "all_defined_sections": list(cls.DEFINED_SECTIONS),
+            "unmapped_headings": unmapped_headings,
         }
         return new_chunks, stats
 

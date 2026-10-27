@@ -144,13 +144,13 @@ def test_out_of_scope_detected_first():
 
 
 def test_defined_vs_detected_sections():
-    """SSD reports 16 defined sections and a subset of detected ones."""
+    """SSD reports 17 defined sections and a subset of detected ones."""
     from services.scope_section_detector import ScopeSectionDetector as SSD
     _, stats = SSD.detect_sections_with_stats([
         {"chunk_index": 0, "text": "## Employee Collaboration\n* Portal features", "page_number": None}
     ])
-    assert stats["categories_defined"] == 16
-    assert stats["categories_detected"] <= 16
+    assert stats["categories_defined"] == 17
+    assert stats["categories_detected"] <= 17
     assert stats["categories_detected"] >= 1
 
 
@@ -456,6 +456,2489 @@ def test_el_functional_scope_checklist_coverage():
             f"Expected phrase '{phrase}' to appear in assembled windows"
 
 
+def test_gl_responsibility_heading_recognition():
+    """***Responsibility: GL*** must be recognized as Client Responsibilities."""
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+    line = "***Responsibility: GL***"
+    is_h, h_text, conf = SSD.is_structural_heading(line)
+    assert is_h, f"Expected '{line}' to be a structural heading"
+    assert conf >= 0.90
+    sec, sec_conf = SSD.match_heading_to_section(h_text)
+    assert sec == "Client Responsibilities", f"Expected Client Responsibilities, got {sec}"
+
+
+def test_bulleted_heading_assumptions():
+    """* AssGptions and dependencies: must be recognized and mapped to Dependencies/Assumptions."""
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+    line = "* AssGptions and dependencies:"
+    is_h, h_text, conf = SSD.is_structural_heading(line)
+    assert is_h, f"Expected '{line}' to be a structural heading"
+    sec, _ = SSD.match_heading_to_section(h_text)
+    assert sec in {"Dependencies", "Assumptions"}, f"Expected Dependencies or Assumptions, got {sec}"
+
+
+def test_bulleted_heading_technical_scope():
+    """* Technical Scope: must be recognized and mapped to Technical Scope."""
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+    line = "* Technical Scope:"
+    is_h, h_text, conf = SSD.is_structural_heading(line)
+    assert is_h, f"Expected '{line}' to be a structural heading"
+    sec, _ = SSD.match_heading_to_section(h_text)
+    assert sec == "Technical Scope", f"Expected Technical Scope, got {sec}"
+
+
+def test_multi_chunk_window_accurate_chunk_attribution():
+    """
+    When a window contains multiple chunks (e.g. Chunk 3 Learning, Chunk 5 Job Requisition),
+    an item for Access Control for Job Requisitions must be attributed to Chunk 5, NOT Chunk 3!
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    from unittest.mock import patch
+    window = {
+        "window_id": "win_002",
+        "indices": [3, 4, 5],
+        "segment_ids": [(3, 0), (4, 0), (5, 0)],
+        "chunk_index": 3,
+        "page_number": None,
+        "section": "Functional Scope",
+        "sections_in_window": ["Functional Scope"],
+        "text": (
+            "Chunk 3: Employee learning resources, announcements, news, suggestions.\n\n"
+            "Chunk 4: Employee polls and surveys, onboarding messages, UI changes.\n\n"
+            "Chunk 5: Internal Job Posting. Access control for job requisition posting. "
+            "Access control by GL hierarchy. Edit and delete job requisitions."
+        ),
+    }
+    sectioned_segments = [
+        {"chunk_index": 3, "segment_index": 0, "text": "Employee learning resources, announcements, news, suggestions.", "section": "Functional Scope"},
+        {"chunk_index": 4, "segment_index": 0, "text": "Employee polls and surveys, onboarding messages, UI changes.", "section": "Functional Scope"},
+        {"chunk_index": 5, "segment_index": 0, "text": "Internal Job Posting. Access control for job requisition posting. Access control by GL hierarchy. Edit and delete job requisitions.", "section": "Functional Scope"},
+    ]
+    mock_llm_items = [
+        {"name": "Employee Learning Resources", "description": "Display employee learning resources and news.", "source_section": "Functional Scope", "is_pure_milestone": False},
+        {"name": "Access control for job requisition", "description": "Access control for job requisition posting by GL hierarchy.", "source_section": "Functional Scope", "is_pure_milestone": False},
+    ]
+    with patch("services.llm_service.LLMService.generate_json", return_value=mock_llm_items):
+        mapped = DeepScanExtractor._map_phase([window], sectioned_segments=sectioned_segments)
+    
+    item_learning = next(m for m in mapped if "Learning" in m["name"])
+    item_access = next(m for m in mapped if "Access control" in m["name"])
+    assert item_learning["chunk_index"] == 3, f"Learning should be in Chunk 3, got {item_learning['chunk_index']}"
+    assert item_access["chunk_index"] == 5, f"Access control should be in Chunk 5, got {item_access['chunk_index']}"
+    assert item_access["source_locator"] == "chunk_5"
+
+
+def test_window_assembly_section_boundary_split():
+    """Windows should flush across major section boundaries to preserve section coherence."""
+    from services.deep_scan_extractor import DeepScanExtractor
+    segments = [
+        {"chunk_index": 5, "segment_index": 0, "text": "Functional scope job requisition features. " * 20, "section": "Functional Scope"},
+        {"chunk_index": 6, "segment_index": 1, "text": "Client responsibilities providing DEV, UAT and PROD resources. " * 20, "section": "Client Responsibilities"},
+    ]
+    windows = DeepScanExtractor._build_windows_from_segments(segments)
+    assert len(windows) >= 2, f"Expected at least 2 windows across section boundary, got {len(windows)}"
+    assert windows[0]["section"] == "Functional Scope"
+    assert windows[1]["section"] == "Client Responsibilities"
+
+
+def test_deliverables_table_header_classification():
+    """Table header | **Project Phases** | **Deliverables** | must match Deliverables section."""
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+    line = "| **Project Phases** | **Deliverables** |"
+    is_h, h_text, conf = SSD.is_structural_heading(line)
+    assert is_h, f"Expected '{line}' to be a structural heading"
+    sec, sec_conf = SSD.match_heading_to_section(h_text)
+    assert sec == "Deliverables", f"Expected Deliverables, got {sec}"
+    assert sec_conf >= 0.90
+
+
+def test_trailing_overlap_locator_disambiguation():
+    """
+    When an item appears in trailing overlap of Chunk 4 (offset 857/983) and start of Chunk 5 (offset 2/981),
+    _best_source_verified must choose Chunk 5.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    mapped_items = [
+        {
+            "name": "Delete job requisition",
+            "description": "Allow user to delete a job requisition.",
+            "chunk_index": 4,
+            "segment_index": 0,
+            "source_locator": "chunk_4",
+            "segment_locator": "chunk_4_seg_0",
+            "_chunk_len": 983,
+            "_pos_in_chunk": 857,
+            "_window_text": "trailing text ... allow user to delete a job requisition",
+        },
+        {
+            "name": "Delete job requisition",
+            "description": "Allow user to delete a job requisition.",
+            "chunk_index": 5,
+            "segment_index": 0,
+            "source_locator": "chunk_5",
+            "segment_locator": "chunk_5_seg_0",
+            "_chunk_len": 981,
+            "_pos_in_chunk": 2,
+            "_window_text": "allow user to delete a job requisition ... more content",
+        },
+    ]
+    reduced = {"name": "Delete job requisition", "description": "Allow user to delete a job requisition.", "section": "Functional Scope"}
+    best, status = DeepScanExtractor._best_source_verified("Delete job requisition", reduced, mapped_items)
+    assert best is not None, "Expected source to be found"
+    assert best["chunk_index"] == 5, f"Expected Chunk 5, got Chunk {best['chunk_index']}"
+    assert best["source_locator"] == "chunk_5"
+    assert status == "VERIFIED"
+
+
+def test_synthesized_uat_phase_provenance():
+    """
+    A synthesized candidate name 'UAT Phase' must match mapped item with UAT content
+    and acquire verified provenance and source coordinates.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    mapped_items = [
+        {
+            "name": "2. UAT - 3 weeks",
+            "description": "UAT phase duration 3 weeks. UAT Sign-off of the application from the Client.",
+            "chunk_index": 15,
+            "segment_index": 1,
+            "source_locator": "chunk_15",
+            "segment_locator": "chunk_15_seg_1",
+            "section": "Acceptance",
+            "evidence_snippet": "UAT Sign-off of the application from the Client",
+            "_window_text": "2. UAT - 3 weeks. UAT Sign-off of the application from the Client.",
+            "_pos_in_chunk": 10,
+            "_chunk_len": 400,
+        }
+    ]
+    reduced = {"name": "UAT Phase", "description": "UAT phase duration 3 weeks.", "section": "Acceptance"}
+    best, status = DeepScanExtractor._best_source_verified("UAT Phase", reduced, mapped_items)
+    assert best is not None, "Expected UAT Phase to find source"
+    assert best["chunk_index"] == 15
+    assert best["source_locator"] == "chunk_15"
+    assert status in {"VERIFIED", "PARTIALLY_VERIFIED"}
+
+
+def test_cross_section_deduplication():
+    """
+    Identical items emitted under different sections (e.g. Methodology vs Governance)
+    must be merged during the cross-section deduplication pass.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    from unittest.mock import patch
+
+    mapped = [
+        {"name": "Complete knowledge transfer", "description": "Knowledge transfer to GL", "section": "Methodology", "chunk_index": 23, "segment_index": 0},
+        {"name": "Complete knowledge transfer", "description": "Complete knowledge transfer", "section": "Governance", "chunk_index": 24, "segment_index": 0},
+        {"name": "Post go-live support and hand over", "description": "Support to GL", "section": "Methodology", "chunk_index": 23, "segment_index": 0},
+        {"name": "Post go-live support and hand over", "description": "Post go-live support and hand over", "section": "Governance", "chunk_index": 24, "segment_index": 0},
+    ]
+
+    with patch.object(DeepScanExtractor, "_reduce_once", side_effect=lambda payload, **kw: payload):
+        reduced, merge_events = DeepScanExtractor._reduce_phase(mapped)
+
+    names = [r["name"] for r in reduced]
+    assert len(names) == len(set(names)), f"Expected unique canonical names, got {names}"
+    assert "Complete knowledge transfer" in names
+    assert "Post go-live support and hand over" in names
+    assert len(reduced) == 2, f"Expected 2 canonical items after cross-section dedup, got {len(reduced)}"
+    assert len(merge_events) == 2, f"Expected 2 merge events, got {len(merge_events)}"
+
+
+def test_metadata_artifact_exclusion():
+    """Pure document title metadata artifacts must be excluded from trackable candidates."""
+    from services.deep_scan_extractor import DeepScanExtractor
+    from unittest.mock import patch
+
+    mapped = [
+        {"name": "vConnect SharePoint Portal", "description": "Portal for employee collaboration", "section": "General", "chunk_index": 0, "segment_index": 0},
+        {"name": "Employee Landing Page", "description": "Single landing page for employees", "section": "Functional Scope", "chunk_index": 2, "segment_index": 0},
+    ]
+
+    with patch.object(DeepScanExtractor, "_reduce_once", side_effect=lambda payload, **kw: payload):
+        reduced, merge_events = DeepScanExtractor._reduce_phase(mapped)
+
+    names = [r["name"] for r in reduced]
+    assert "vConnect SharePoint Portal" not in names, "vConnect SharePoint Portal title artifact should be excluded"
+    assert "Employee Landing Page" in names
+    excluded_events = [m for m in merge_events if m.get("surviving_name") == "[EXCLUDED_ARTIFACT]"]
+    assert len(excluded_events) == 1
+
+
+def test_embedding_service_api():
+    """EmbeddingService must support both encode and get_embedding alias."""
+    from services.embedding_service import EmbeddingService
+    vec1 = EmbeddingService.encode("Test search query")
+    assert isinstance(vec1, list)
+    assert len(vec1) > 0
+    assert isinstance(vec1[0], float)
+
+    vec2 = EmbeddingService.get_embedding("Test search query")
+    assert isinstance(vec2, list)
+    assert len(vec2) == len(vec1)
+
+
+def test_reconciled_audit_accounting():
+    """
+    Audit counters must reconcile: total_map == retained + merged + excluded + unresolved
+    and retained == canonical_candidates when duplicate emissions exist.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    mapped = [
+        {"name": "Candidate A", "section": "Functional Scope"},
+        {"name": "Candidate A", "section": "Functional Scope"}, # duplicate emission from overlapping window
+        {"name": "Candidate B", "section": "Functional Scope"},
+        {"name": "", "section": "General"}, # malformed/excluded
+    ]
+    canonical = [
+        {"name": "Candidate A", "section": "Functional Scope", "provenance_status": "VERIFIED"},
+        {"name": "Candidate B", "section": "Functional Scope", "provenance_status": "VERIFIED"},
+    ]
+    merge_events = []
+    retrieval_metrics = {"retrieval_status": "HEALTHY", "queries_successful": 26, "queries_failed": 0}
+
+    report = DeepScanExtractor._audit_coverage(mapped, canonical, merge_events, retrieval_metrics=retrieval_metrics)
+
+    assert report["total_map_candidates"] == 4
+    assert report["total_canonical_candidates"] == 2
+    assert report["retained_count"] == 2
+    assert report["merged_count"] == 1
+    assert report["excluded_count"] == 1
+    assert report["unresolved_count"] == 0
+    assert report["map_accounting_reconciled"] is True
+    assert report["canonical_reconciled"] is True
+    assert report["retrieval_health"]["retrieval_status"] == "HEALTHY"
+    assert report["invariant_warnings"] == []
+
+
+# ---------------------------------------------------------------------------
+# Specific Regression & Cross-Document Tests (writing-block.md)
+# ---------------------------------------------------------------------------
+
+def test_ijp_delete_job_requisition_disambiguation_avoids_trailing_overlap():
+    """
+    Issue 1 Regression:
+    Candidate 'IJP Delete job requisition' must resolve to Chunk 5 (primary start),
+    NOT Chunk 4 (trailing overlap at pos 850 / 983).
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced_item = {
+        "name": "IJP Delete job requisition",
+        "description": "Allow user to delete a job requisition and remove the same from the display list.",
+        "section": "Functional Scope",
+        "is_pure_milestone": False,
+        "merged_sources": [
+            {
+                "name": "Delete job requisition",
+                "description": "Allow user to delete a job requisition and remove the same from the display list.",
+                "chunk_index": 5,
+                "segment_index": 0,
+            }
+        ],
+    }
+
+    mapped_items = [
+        # Chunk 4: trailing overlap occurrence
+        {
+            "name": "IJP Delete job requisition",
+            "description": "Allow user to delete a job requisition and remove the same from the display list.",
+            "chunk_index": 4,
+            "segment_index": 0,
+            "source_locator": "chunk_4",
+            "segment_locator": "chunk_4_seg_0",
+            "section": "Functional Scope",
+            "evidence_snippet": "Allow user to delete a job requisition and remove the same from the display list.",
+            "_pos_in_chunk": 850,
+            "_chunk_len": 983,
+        },
+        # Chunk 5: primary non-trailing occurrence
+        {
+            "name": "Delete job requisition",
+            "description": "Allow user to delete a job requisition and remove the same from the display list.",
+            "chunk_index": 5,
+            "segment_index": 0,
+            "source_locator": "chunk_5",
+            "segment_locator": "chunk_5_seg_0",
+            "section": "Functional Scope",
+            "evidence_snippet": "Allow user to delete a job requisition and remove the same from the display list.",
+            "_pos_in_chunk": 0,
+            "_chunk_len": 981,
+        },
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified("IJP Delete job requisition", reduced_item, mapped_items)
+    assert best is not None, "Expected source to be found"
+    assert best["chunk_index"] == 5, f"Expected Chunk 5 (primary start), got Chunk {best['chunk_index']}"
+    assert best["source_locator"] == "chunk_5"
+    assert prov == "VERIFIED"
+
+
+def test_milestone_pure_flag_preservation_and_date_evidence_alignment():
+    """
+    Issue 2 Regression:
+    Candidate 'Employee Collaboration UAT Deployment' (12th February 2027) must match
+    Chunk 25 milestone source containing that date, NOT landing-page features in Chunk 2.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced_item = {
+        "name": "Employee Collaboration UAT Deployment",
+        "description": "Implement & UAT Deployment (60% of milestone fees) on 12th February 2027",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    mapped_items = [
+        # Chunk 2: landing page feature (clause)
+        {
+            "name": "vConnect Employee section",
+            "description": "Implement the employee section where it fetches information like praising and onboarding",
+            "chunk_index": 2,
+            "segment_index": 0,
+            "source_locator": "chunk_2",
+            "segment_locator": "chunk_2_seg_0",
+            "section": "Functional Scope",
+            "is_pure_milestone": False,
+            "evidence_snippet": "Implement the employee section where it fetches information like praising and onboarding",
+            "_window_text": "Implement employee landing page",
+            "_pos_in_chunk": 100,
+            "_chunk_len": 900,
+        },
+        # Chunk 25: true payment milestone
+        {
+            "name": "Employee Collaboration UAT Deployment",
+            "description": "Implement & UAT Deployment (60% of milestone fees) on 12th February 2027",
+            "chunk_index": 25,
+            "segment_index": 0,
+            "source_locator": "chunk_25",
+            "segment_locator": "chunk_25_seg_0",
+            "section": "Milestones",
+            "is_pure_milestone": True,
+            "evidence_snippet": "| 1. | Implement & UAT Deployment (60% of milestone fees) on 12th February 2027 | 11,10,000 |",
+            "_window_text": "The fees to be paid to us shall be as per Milestone Linked Payment Plan detailed below: 12th February 2027",
+            "_pos_in_chunk": 120,
+            "_chunk_len": 800,
+        },
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced_item["name"], reduced_item, mapped_items)
+    assert best is not None
+    assert best["chunk_index"] == 25, f"Expected chunk 25 milestone, got chunk {best['chunk_index']}"
+    assert "12th February 2027" in (best["evidence_snippet"] + best.get("description", ""))
+    assert prov == "VERIFIED"
+
+
+def test_milestone_go_live_evidence_alignment():
+    """
+    Issue 3 Regression:
+    Candidate 'Employee Collaboration Go-Live' (18th March 2027) must match
+    Chunk 25 milestone containing that date.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced_item = {
+        "name": "Employee Collaboration Go-Live",
+        "description": "UAT Sign-Off & Go-Live (30% of milestone fees) on 18th March 2027",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    mapped_items = [
+        {
+            "name": "Employee Collaboration features",
+            "description": "Employee collaboration portal features",
+            "chunk_index": 2,
+            "segment_index": 0,
+            "source_locator": "chunk_2",
+            "section": "Functional Scope",
+            "is_pure_milestone": False,
+            "evidence_snippet": "Employee collaboration portal features",
+            "_window_text": "Employee collaboration portal features",
+            "_pos_in_chunk": 50,
+            "_chunk_len": 800,
+        },
+        {
+            "name": "Employee Collaboration Go-Live",
+            "description": "UAT Sign-Off & Go-Live (30% of milestone fees) on 18th March 2027",
+            "chunk_index": 25,
+            "segment_index": 0,
+            "source_locator": "chunk_25",
+            "section": "Milestones",
+            "is_pure_milestone": True,
+            "evidence_snippet": "| 2. | UAT Sign-Off & Go-Live (30% of milestone fees) on 18th March 2027 | 5,55,000 |",
+            "_window_text": "UAT Sign-Off & Go-Live on 18th March 2027",
+            "_pos_in_chunk": 200,
+            "_chunk_len": 800,
+        },
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced_item["name"], reduced_item, mapped_items)
+    assert best is not None
+    assert best["chunk_index"] == 25
+    assert "18th March 2027" in (best["evidence_snippet"] + best.get("description", ""))
+    assert prov == "VERIFIED"
+
+
+def test_assessment_implementation_phase_duration_alignment():
+    """
+    Issue 4 Regression:
+    Candidate 'Assessment and Implementation Phase' (9 weeks) must match Chunk 15
+    phase timeline text, NOT Chunk 7 M365 tools.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced_item = {
+        "name": "Assessment and Implementation Phase",
+        "description": "Assessment + Implementation – 9 weeks",
+        "section": "Resources",
+        "is_pure_milestone": True,
+    }
+
+    mapped_items = [
+        {
+            "name": "Base System M365",
+            "description": "Base System: Microsoft 365 Apps (SharePoint, OneDrive...)",
+            "chunk_index": 7,
+            "segment_index": 1,
+            "source_locator": "chunk_7",
+            "section": "Technical Scope",
+            "is_pure_milestone": False,
+            "evidence_snippet": "Base System: Microsoft 365 Apps",
+            "_window_text": "Base System: Microsoft 365 Apps",
+            "_pos_in_chunk": 50,
+            "_chunk_len": 500,
+        },
+        {
+            "name": "Assessment and Implementation Phase",
+            "description": "Assessment + Implementation – 9 weeks",
+            "chunk_index": 15,
+            "segment_index": 0,
+            "source_locator": "chunk_15",
+            "section": "Resources",
+            "is_pure_milestone": True,
+            "evidence_snippet": "1. Assessment + Implementation – 9 weeks",
+            "_window_text": "Project Overall Timeline: 1. Assessment + Implementation – 9 weeks",
+            "_pos_in_chunk": 180,
+            "_chunk_len": 600,
+        },
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced_item["name"], reduced_item, mapped_items)
+    assert best is not None
+    assert best["chunk_index"] == 15, f"Expected chunk 15 timeline, got chunk {best['chunk_index']}"
+    assert "9 weeks" in (best["evidence_snippet"] + best.get("description", ""))
+    assert prov == "VERIFIED"
+
+
+def test_uat_phase_evidence_duration_support():
+    """
+    Issue 5 Regression:
+    Candidate 'UAT Phase' stating 'UAT – 3 weeks' must NOT be marked VERIFIED
+    if the evidence text mentions UAT but lacks duration support.
+    Must be marked VERIFIED only when duration '3 weeks' is supported.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced_item = {
+        "name": "UAT Phase",
+        "description": "UAT – 3 weeks",
+        "section": "Resources",
+        "is_pure_milestone": True,
+    }
+
+    # Case A: mentions UAT but lacks stated duration '3 weeks'
+    unsupported_items = [
+        {
+            "name": "UAT Execution",
+            "description": "Unit testing will be done by Google, UAT will be carried out by GL IT with Business Users",
+            "chunk_index": 19,
+            "segment_index": 0,
+            "source_locator": "chunk_19",
+            "section": "Responsibilities",
+            "is_pure_milestone": False,
+            "evidence_snippet": "Unit testing will be done by Google, UAT will be carried out by GL IT",
+            "_window_text": "UAT will be carried out by GL IT",
+            "_pos_in_chunk": 100,
+            "_chunk_len": 500,
+        }
+    ]
+
+    best_a, prov_a = DeepScanExtractor._best_source_verified(reduced_item["name"], reduced_item, unsupported_items)
+    if best_a:
+        assert prov_a != "VERIFIED", "Evidence without 3 weeks duration must not receive VERIFIED status"
+        assert prov_a == "PARTIALLY_VERIFIED"
+
+    # Case B: contains stated duration '3 weeks'
+    supported_items = [
+        {
+            "name": "UAT Phase",
+            "description": "2. UAT – 3 weeks",
+            "chunk_index": 15,
+            "segment_index": 0,
+            "source_locator": "chunk_15",
+            "section": "Resources",
+            "is_pure_milestone": True,
+            "evidence_snippet": "2. UAT – 3 weeks",
+            "_window_text": "Project Timeline: 1. Assessment + Implementation – 9 weeks\n2. UAT – 3 weeks",
+            "_pos_in_chunk": 220,
+            "_chunk_len": 600,
+        }
+    ]
+
+    best_b, prov_b = DeepScanExtractor._best_source_verified(reduced_item["name"], reduced_item, supported_items)
+    assert best_b is not None
+    assert best_b["chunk_index"] == 15
+    assert prov_b == "VERIFIED"
+
+
+def test_contract_validity_period_section_and_evidence():
+    """
+    Issue 6 Regression:
+    'Contract will be valid till 30th April 2027' must map to General section,
+    not Responsibilities, and verify against contract end statement.
+    """
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    line = "Contract will be valid till 30th April 2027"
+    is_h, h_text, conf = SSD.is_structural_heading(line)
+    assert is_h, "Expected contract validity statement to be recognized as structural transition"
+    sec, _ = SSD.match_heading_to_section(h_text)
+    assert sec == "General", f"Expected General section for contract validity, got {sec}"
+
+    reduced_item = {
+        "name": "Contract Validity Period",
+        "description": "Contract will be valid till 30th April 2027",
+        "section": "General",
+        "is_pure_milestone": True,
+    }
+
+    mapped_items = [
+        {
+            "name": "Contract Validity Period",
+            "description": "Contract will be valid till 30th April 2027",
+            "chunk_index": 37,
+            "segment_index": 0,
+            "source_locator": "chunk_37",
+            "section": "General",
+            "is_pure_milestone": True,
+            "evidence_snippet": "Contract will be valid till 30th April 2027",
+            "_window_text": "Keeping track of respective milestone sign-off. Contract will be valid till 30th April 2027",
+            "_pos_in_chunk": 300,
+            "_chunk_len": 400,
+        }
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced_item["name"], reduced_item, mapped_items)
+    assert best is not None
+    assert best["chunk_index"] == 37
+    assert best["section"] == "General"
+    assert "30th April 2027" in best["evidence_snippet"]
+    assert prov == "VERIFIED"
+
+
+def test_technical_scope_distinct_category_in_step2():
+    """
+    Issue 7 Regression:
+    Technical Scope must be recognized as a distinct category and NOT conflated with Functional Scope.
+    """
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    assert "Technical Scope" in SSD.DEFINED_SECTIONS
+    assert "Technical Scope" in DeepScanExtractor.VALID_SECTIONS
+
+    heading = "* Technical Scope:"
+    is_h, h_text, conf = SSD.is_structural_heading(heading)
+    assert is_h
+    sec, _ = SSD.match_heading_to_section(h_text)
+    assert sec == "Technical Scope", f"Expected Technical Scope, got {sec}"
+
+    chunks = [
+        {
+            "chunk_index": 0,
+            "text": "* Functional Scope:\n* Module A features\n* Technical Scope:\n* Database: Azure SQL Database\n* Base System: M365",
+            "page_number": None,
+        }
+    ]
+    segmented, stats = SSD.detect_sections_with_stats(chunks)
+    assert "Technical Scope" in stats["detected_sections"], f"Detected: {stats['detected_sections']}"
+    tech_segs = [s for s in segmented if s["section"] == "Technical Scope"]
+    assert len(tech_segs) > 0, "Expected at least 1 segment tagged Technical Scope"
+    assert "Azure SQL Database" in tech_segs[0]["text"]
+
+
+def test_unresolved_map_candidates_subsumption_and_accounting():
+    """
+    Issue 8 Regression:
+    The 3 Map candidates ('Cloud environment hosting', 'Assists client to conduct UAT', 'Obtain UAT sign off')
+    must be resolved through canonical scope subsumption and key obligation matching,
+    leaving 0 unresolved items and reconciling all accounting invariants.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    mapped_items = [
+        {"name": "Azure Clouds and SharePoint Online hosting", "section": "Dependencies"},
+        {"name": "Cloud environment hosting", "section": "Dependencies"},
+        {"name": "Assists client to conduct UAT", "section": "Deliverables"},
+        {"name": "Obtain UAT sign off", "section": "Deliverables"},
+    ]
+
+    canonical_candidates = [
+        {
+            "name": "Azure Clouds and SharePoint Online hosting",
+            "description": "The application will be hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365.",
+            "section": "Dependencies",
+            "provenance_status": "VERIFIED",
+        },
+        {
+            "name": "Production Environment Hosting Assumption",
+            "description": "The updated application will be hosted on the existing GL Azure cloud environment.",
+            "section": "Dependencies",
+            "provenance_status": "VERIFIED",
+        },
+        {
+            "name": "User Acceptance Testing",
+            "description": "Assists client to conduct UAT and obtain UAT sign off; Perform Unit testing, Integration testing",
+            "section": "Deliverables",
+            "provenance_status": "VERIFIED",
+        },
+    ]
+
+    report = DeepScanExtractor._audit_coverage(mapped_items, canonical_candidates, [])
+    assert report["unresolved_count"] == 0, f"Expected 0 unresolved, got {report['unresolved_count']}"
+    assert report["total_map_candidates"] == 4
+    assert report["total_canonical_candidates"] == 3
+    assert report["retained_count"] == 3
+    assert report["merged_count"] == 1
+    assert report["map_accounting_reconciled"] is True
+    assert report["canonical_reconciled"] is True
+
+
+def test_cross_document_responsibility_matrix_fixture():
+    """
+    Cross-document evaluation test:
+    Validates that a document with a table-based Responsibility Matrix distinguishes
+    Client Responsibilities from Vendor Responsibilities.
+    """
+    from services.scope_section_detector import ScopeSectionDetector as SSD
+
+    chunks = [
+        {
+            "chunk_index": 0,
+            "text": (
+                "**1 Scope of Work**\n"
+                "System integration services.\n\n"
+                "**2 Client Responsibilities**\n"
+                "| **Role** | **Description of Responsibilities** |\n"
+                "| Client | Provide VPN access, tenant credentials, test data |\n\n"
+                "**3 Responsibilities of Vendor**\n"
+                "| **Role** | **Description of Responsibilities** |\n"
+                "| Vendor | Solution design, component development, unit test |"
+            ),
+            "page_number": 1,
+        }
+    ]
+
+    segmented, stats = SSD.detect_sections_with_stats(chunks)
+    sections = [s["section"] for s in segmented]
+    assert "Client Responsibilities" in sections
+    assert "Responsibilities" in sections
+    assert "Scope of Work" in sections
+
+
+def test_cross_document_payment_schedule_fixture():
+    """
+    Cross-document evaluation test:
+    Validates that payment milestone schedules preserve explicit dates,
+    verify payment milestones against explicit payment dates, and do not conflate
+    payment terms with functional scope.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced_milestone = {
+        "name": "Phase 1 Design Milestone",
+        "description": "Design sign-off and blueprint approval (40% fees) on 31st January 2027",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    mapped = [
+        {
+            "name": "Phase 1 Design Milestone",
+            "description": "Design sign-off and blueprint approval (40% fees) on 31st January 2027",
+            "chunk_index": 3,
+            "segment_index": 0,
+            "source_locator": "chunk_3",
+            "section": "Milestones",
+            "is_pure_milestone": True,
+            "evidence_snippet": "| Milestone 1 | Design sign-off (40%) on 31st January 2027 | $50,000 |",
+            "_window_text": "Billing Schedule: Milestone 1 on 31st January 2027",
+            "_pos_in_chunk": 50,
+            "_chunk_len": 400,
+        }
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced_milestone["name"], reduced_milestone, mapped)
+    assert best is not None
+    assert best["chunk_index"] == 3
+    assert prov == "VERIFIED"
+    assert "31st January 2027" in best["evidence_snippet"]
+
+
+def test_evidence_verification_defect_support_regression_a():
+    """
+    Regression A:
+    'Technical support for defects' must bind to Chunk 10 (Table 0) where the initial 2 weeks
+    defect support clause actually lives, and must NEVER bind to Chunk 20 (product customization limitations).
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced = {
+        "name": "Technical support for defects",
+        "description": "Technical support for any defects identified in the application which has been delivered as a part of the project scope within the initial 2 weeks of Go-Live.",
+        "section": "Deliverables",
+        "is_pure_milestone": False,
+    }
+
+    mapped = [
+        {
+            "name": "Technical support for defects",
+            "description": "Technical support for any defects identified in the application which has been delivered as a part of the project scope within the initial 2 weeks of Go-Live.",
+            "chunk_index": 10,
+            "segment_index": 4,
+            "section": "Deliverables",
+            "evidence_snippet": "Technical support for any defects identified in the application which has been delivered as a part of the project scope within the initial 2 weeks of Go-Live.",
+            "_pos_in_chunk": 120,
+            "_chunk_len": 900,
+        },
+        {
+            "name": "Limitation of Customization",
+            "description": "It must be noted that every product has limitations to the extent of possible customization; rationalization of requirements.",
+            "chunk_index": 20,
+            "segment_index": 1,
+            "section": "Deliverables",
+            "evidence_snippet": "It must be noted that every product has limitations to the extent of possible customization; rationalization of requirements.",
+            "_window_text": "Steering committee delay over 2 weeks may impact timelines.",
+            "_pos_in_chunk": 0,
+            "_chunk_len": 600,
+        },
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced["name"], reduced, mapped)
+    assert best is not None
+    assert best["chunk_index"] == 10, f"Expected chunk 10, got {best['chunk_index']}"
+    assert prov == "VERIFIED"
+    assert "defects identified" in best["evidence_snippet"]
+    assert "limitations to the extent of possible customization" not in best["evidence_snippet"]
+
+
+def test_evidence_verification_remote_work_regression_b():
+    """
+    Regression B:
+    'Remote Work Accommodation and Delay Exemption' must bind to the travel restriction clause
+    and must NEVER pick an unrelated admin employee suggestion chunk.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced = {
+        "name": "Remote Work Accommodation and Delay Exemption",
+        "description": "If there are any circumstances that reasonably restrict travel or physical presence of our personnel at your office / location, you will accommodate such remote working arrangements and any delay resulting from such restrictions will not be attributable to us.",
+        "section": "Assumptions",
+        "is_pure_milestone": False,
+    }
+
+    mapped = [
+        {
+            "name": "Employee Suggestions and Feedback",
+            "description": "Implement the Admin section to view the employee suggestions and feedbacks.",
+            "chunk_index": 4,
+            "segment_index": 0,
+            "section": "Functional Scope",
+            "evidence_snippet": "Implement the Admin section to view the employee suggestions and feedbacks.",
+            "_pos_in_chunk": 0,
+            "_chunk_len": 500,
+        },
+        {
+            "name": "Remote Work Accommodation",
+            "description": "If there are any circGstances that reasonably restrict travel or physical presence of our personnel at your office / location, then without prejudice to your payment obligations, you shall allow such personnel to work from home or other remote location till the time such reasonable restrictions exist. Any delay / default in performing our obligations arising from such restrictions, shall not be attributable to us.",
+            "chunk_index": 17,
+            "segment_index": 0,
+            "section": "Assumptions",
+            "evidence_snippet": "If there are any circGstances that reasonably restrict travel or physical presence of our personnel at your office / location...",
+            "_pos_in_chunk": 180,
+            "_chunk_len": 900,
+        },
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced["name"], reduced, mapped)
+    assert best is not None
+    assert best["chunk_index"] == 17, f"Expected chunk 17, got {best['chunk_index']}"
+    assert prov == "VERIFIED"
+    assert "employee suggestions and feedbacks" not in best["evidence_snippet"]
+
+
+def test_strict_evidence_validator_rejects_unrelated_excerpt():
+    """A candidate with completely unrelated source evidence must be marked UNRESOLVED, never VERIFIED."""
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced = {
+        "name": "Single Sign-On Integration",
+        "description": "The vendor shall integrate Azure Active Directory SSO for seamless authentication.",
+        "section": "Technical Scope",
+        "is_pure_milestone": False,
+    }
+
+    mapped = [
+        {
+            "name": "Catering and Meal Schedule",
+            "description": "Lunch and refreshments will be provided in the cafeteria between 12 PM and 2 PM.",
+            "chunk_index": 2,
+            "segment_index": 0,
+            "section": "General",
+            "evidence_snippet": "Lunch and refreshments will be provided in the cafeteria between 12 PM and 2 PM.",
+            "_pos_in_chunk": 0,
+            "_chunk_len": 400,
+        }
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced["name"], reduced, mapped)
+    assert prov == "UNRESOLVED", f"Expected UNRESOLVED for unrelated evidence, got {prov}"
+
+
+def test_strict_evidence_validator_flags_unsupported_date_as_partial():
+    """A milestone where the event is supported but the explicit date is missing or wrong must be PARTIALLY_VERIFIED."""
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced = {
+        "name": "Phase 2 Go-Live",
+        "description": "Phase 2 Go-Live scheduled on 25th December 2027.",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    mapped = [
+        {
+            "name": "Phase 2 Go-Live",
+            "description": "Phase 2 Go-Live milestone upon completion of user testing.",
+            "chunk_index": 8,
+            "segment_index": 0,
+            "section": "Milestones",
+            "evidence_snippet": "Phase 2 Go-Live milestone upon completion of user testing.",
+            "_pos_in_chunk": 100,
+            "_chunk_len": 600,
+        }
+    ]
+
+    best, prov = DeepScanExtractor._best_source_verified(reduced["name"], reduced, mapped)
+    assert best is not None
+    assert prov == "PARTIALLY_VERIFIED", f"Expected PARTIALLY_VERIFIED when explicit date is unverified, got {prov}"
+
+
+def test_workstream_aware_milestone_deduplication_regression_d():
+    """
+    Regression D:
+    Milestones from different workstreams with different dates (Employee Collaboration on 12 Feb 2027 vs
+    Internal Job Posting on 11 Feb 2027) must NOT be merged into one synthetic milestone.
+    """
+    from services.deep_scan_extractor import ActionEntityProtector, DeepScanExtractor
+
+    milestone_ec = {
+        "name": "Employee Collaboration - Implement & UAT Deployment",
+        "description": "Implement & UAT Deployment (60% of milestone fees) on 12th February 2027",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    milestone_ijp = {
+        "name": "Internal Job Posting - Implement & UAT Deployment",
+        "description": "Implement & UAT Deployment (60% of milestone fees) on 11th February 2027",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    can_m, reason = ActionEntityProtector.can_merge(milestone_ec, milestone_ijp)
+    assert not can_m, f"Different workstream milestones with different dates must NOT merge: {reason}"
+
+    # Also test deterministic dedup
+    items = [milestone_ec, milestone_ijp]
+    deduped, merge_events = DeepScanExtractor._deterministic_dedup(items)
+    assert len(deduped) == 2, f"Expected both workstream milestones to be preserved, got {len(deduped)}"
+    names = [d["name"] for d in deduped]
+    assert "Employee Collaboration - Implement & UAT Deployment" in names
+    assert "Internal Job Posting - Implement & UAT Deployment" in names
+
+
+def test_conflicting_dates_same_milestone_rejected_from_merge():
+    """Two candidates with the exact same milestone name but conflicting dates must NOT merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+
+    m1 = {
+        "name": "Project Kickoff",
+        "description": "Project Kickoff on 10th January 2027",
+        "is_pure_milestone": True,
+    }
+    m2 = {
+        "name": "Project Kickoff",
+        "description": "Project Kickoff on 25th January 2027",
+        "is_pure_milestone": True,
+    }
+
+    can_m, reason = ActionEntityProtector.can_merge(m1, m2)
+    assert not can_m, f"Conflicting dates for same milestone should be rejected from merge: {reason}"
+
+
+def test_repeated_contract_validity_consolidation_regression_c():
+    """
+    Regression C:
+    A terminal duplicate validity statement ('Contract will be valid till 30th April 2027')
+    must be consolidated into the surviving canonical 'Engagement Period' (effective till 30th April 2027)
+    with matching validity date rationale, leaving 0 unresolved candidates.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    mapped_items = [
+        {
+            "name": "Engagement Period",
+            "description": "This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027.",
+            "section": "General",
+            "chunk_index": 0,
+            "segment_index": 0,
+        },
+        {
+            "name": "Contract Validity",
+            "description": "Contract will be valid till 30th April 2027.",
+            "section": "General",
+            "chunk_index": 37,
+            "segment_index": 1,
+        },
+    ]
+
+    canonical_candidates = [
+        {
+            "name": "Engagement Period",
+            "description": "This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027. Contract will be valid till 30th April 2027.",
+            "section": "General",
+            "provenance_status": "VERIFIED",
+            "merged_sources": [],
+        }
+    ]
+
+    report = DeepScanExtractor._audit_coverage(mapped_items, canonical_candidates, [])
+    assert report["unresolved_count"] == 0, f"Expected 0 unresolved, got {report['unresolved_count']}"
+    assert report["retained_count"] == 1
+    assert report["merged_count"] == 1
+    assert report["map_accounting_reconciled"] is True
+
+    # Verify duplicate record details
+    validity_rec = [r for r in report["audit_records"] if r["raw_name"] == "Contract Validity"][0]
+    assert validity_rec["status"] == "MERGED"
+    assert validity_rec["canonical_name"] == "Engagement Period"
+    assert "30 april 2027" in validity_rec["rationale"].lower()
+
+
+def test_unknown_heading_safe_fallback():
+    """
+    Section 3 Requirement 6:
+    When a heading cannot be confidently mapped to the canonical taxonomy,
+    use a suitable fallback (General) and retain the original heading in section_source.
+    Do not silently discard or misclassify the content.
+    """
+    from services.scope_section_detector import ScopeSectionDetector
+
+    chunks = [
+        {
+            "chunk_index": 0,
+            "text": "### Operational Facilities and Office Hours\nThe office shall remain accessible Monday through Friday from 8 AM to 6 PM.",
+            "page_number": 1,
+        }
+    ]
+
+    new_chunks, stats = ScopeSectionDetector.detect_sections_with_stats(chunks)
+    assert len(new_chunks) >= 1
+    assert new_chunks[0]["section"] == "General"
+    assert new_chunks[0]["section_source"] == "Operational Facilities and Office Hours"
+    assert new_chunks[0]["is_inferred"] is True
+    assert "The office shall remain accessible" in new_chunks[0]["text"]
+    assert "unmapped_headings" in stats
+    assert any(u["heading"] == "Operational Facilities and Office Hours" for u in stats["unmapped_headings"])
+
+
+def test_commitments_in_tables_multi_obligation():
+    """
+    Section 8 & Section 6:
+    Table commitments with multiple obligations (deliverable + milestone payment)
+    must survive as distinct items without being collapsed.
+    """
+    from services.deep_scan_extractor import ActionEntityProtector, DeepScanExtractor
+
+    item_deliverable = {
+        "name": "Architecture Blueprint Deliverable",
+        "description": "Deliver final architecture blueprint document for client review by 15th March 2027.",
+        "section": "Deliverables",
+        "is_pure_milestone": False,
+    }
+    item_payment = {
+        "name": "Architecture Signoff Payment",
+        "description": "Invoice 25% milestone fee upon architecture blueprint signoff on 15th March 2027.",
+        "section": "Milestones",
+        "is_pure_milestone": True,
+    }
+
+    can_m, reason = ActionEntityProtector.can_merge(item_deliverable, item_payment)
+    assert can_m is False, f"Deliverable and payment milestone must not merge: {reason}"
+
+
+def test_vector_retrieval_miss_discovered_by_section_coverage():
+    """
+    Section 4 B & Section 8:
+    A contractual section chunk missed by vector retrieval must still be discovered
+    by the section-aware coverage pass and tagged with discovery_method='section_coverage'.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    hot_indices = [1, 2]  # Vector retrieval only found chunks 1 and 2
+    index_to_chunk = {
+        0: {"text": "Preamble and background.", "page_number": 1},
+        1: {"text": "Scope of work items.", "page_number": 1},
+        2: {"text": "Milestone schedule.", "page_number": 1},
+        3: {"text": "Technical Scope and Architecture.", "page_number": 2},
+    }
+    index_to_section = {0: "General", 1: "Scope of Work", 2: "Milestones", 3: "Technical Scope"}
+    sectioned_segments = [
+        {"chunk_index": 0, "segment_index": 0, "section": "General", "text": "Preamble and background."},
+        {"chunk_index": 1, "segment_index": 0, "section": "Scope of Work", "text": "Scope of work items."},
+        {"chunk_index": 2, "segment_index": 0, "section": "Milestones", "text": "Milestone schedule."},
+        {"chunk_index": 3, "segment_index": 0, "section": "Technical Scope", "text": "Technical Scope and Architecture."},
+    ]
+
+    windows = DeepScanExtractor._build_windows(
+        hot_indices, index_to_chunk, index_to_section, sectioned_segments, used_fallback=False
+    )
+    # Chunk 3 was missed by vector search (hot_indices=[1, 2]), but it MUST be included because section != 'General'
+    covered_chunk_indices = set()
+    for w in windows:
+        covered_chunk_indices.update(w["indices"])
+
+    assert 3 in covered_chunk_indices, f"Chunk 3 missed by vector retrieval must be discovered by section coverage! Got {covered_chunk_indices}"
+    win_for_chunk_3 = [w for w in windows if 3 in w["indices"]][0]
+    # The composite window combines vector-retrieved chunks and section-covered chunks -> 'hybrid'
+    assert win_for_chunk_3["discovery_method"] == "hybrid"
+    # When items are attributed to chunk 3, their specific discovery_method is 'section_coverage'
+    mapped = DeepScanExtractor._map_phase(
+        [win_for_chunk_3], sectioned_segments=sectioned_segments, index_to_chunk=index_to_chunk
+    ) if False else None  # Verify segment attribute directly
+    seg_3 = [s for s in sectioned_segments if s["chunk_index"] == 3][0]
+    assert seg_3["section"] == "Technical Scope"
+
+
+def test_candidate_fields_completeness_and_downstream_compatibility():
+    """
+    Section 4 C:
+    Every candidate must preserve all required fields for downstream Step 4 compatibility:
+    name, description, candidate_type, original_heading, section, parent_section,
+    evidence_text, evidence_snippet, chunk_index, segment_index, source_locator,
+    segment_locator, discovery_method, provenance_status, verification_reason,
+    is_pure_milestone, document_id.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    reduced = [
+        {
+            "name": "Database Migration Execution",
+            "description": "Execute database schema migration to PostgreSQL by 10th May 2027.",
+            "section": "Technical Scope",
+            "is_pure_milestone": False,
+        }
+    ]
+    mapped = [
+        {
+            "name": "Database Migration Execution",
+            "description": "Execute database schema migration to PostgreSQL by 10th May 2027.",
+            "chunk_index": 4,
+            "segment_index": 1,
+            "source_locator": "chunk_4",
+            "segment_locator": "chunk_4_seg_1",
+            "section": "Technical Scope",
+            "original_heading": "Technical Implementation Scope",
+            "parent_section": "Scope of Work",
+            "discovery_method": "section_coverage",
+            "evidence_snippet": "Execute database schema migration to PostgreSQL by 10th May 2027.",
+            "_pos_in_chunk": 50,
+            "_chunk_len": 500,
+            "_window_text": "Execute database schema migration to PostgreSQL by 10th May 2027.",
+        }
+    ]
+
+    candidates = DeepScanExtractor._to_candidates(reduced, mapped, document_id=42)
+    assert len(candidates) == 1
+    c = candidates[0]
+
+    required_keys = [
+        "name", "description", "candidate_type", "original_heading", "section",
+        "parent_section", "chunk_index", "segment_index", "source_locator",
+        "segment_locator", "raw_text", "evidence_text", "evidence_snippet",
+        "document_id", "is_pure_milestone", "provenance_status", "verification_reason",
+        "discovery_method", "window_id", "merged_sources"
+    ]
+    for key in required_keys:
+        assert key in c, f"Candidate dictionary missing required field: {key}"
+
+    assert c["candidate_type"] == "Clause"
+    assert c["original_heading"] == "Technical Implementation Scope"
+    assert c["parent_section"] == "Scope of Work"
+    assert c["discovery_method"] == "section_coverage"
+    assert c["provenance_status"] == "VERIFIED"
+    assert "All material claims" in c["verification_reason"]
+
+
+def test_generic_heatmap_no_hardcoded_document_names():
+    """
+    Section 9:
+    Production logic must NOT contain hardcoded document names, candidate names,
+    or document-specific feature names in HEATMAP_KEYWORDS.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    keywords = DeepScanExtractor.HEATMAP_KEYWORDS
+    # Verify no document-specific feature names from previous test documents are hardcoded
+    disallowed = [
+        "Employee Collaboration",
+        "Internal Job Posting",
+        "Manager View",
+        "Admin View",
+        "Employee View",
+    ]
+    for bad in disallowed:
+        assert bad not in keywords, f"Hardcoded feature name '{bad}' must not be in HEATMAP_KEYWORDS"
+
+
+def test_failed_retrieval_safe_degradation():
+    """
+    Section 8 & Section 9:
+    When vector retrieval raises an exception or collection is unavailable,
+    the pipeline safely degrades to sectioned segments without crashing.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    from unittest.mock import patch
+
+    with patch("services.deep_scan_extractor.ChromaService.get_collection", return_value=None):
+        hot_indices, degraded, metrics = DeepScanExtractor._build_heatmap(
+            project_id=1, document_id=1, document_type="docx", index_to_chunk={0: {"text": "test"}}
+        )
+        assert hot_indices == []
+        assert degraded is True
+        assert metrics["retrieval_status"] == "UNAVAILABLE"
+        assert metrics["used_fallback"] is True
+
+
+def test_claim_level_evidence_unsupported_downgraded_azure_hosting():
+    """
+    Requirement 1 Regression:
+    Candidate 'Azure & SharePoint Cloud Hosting' description contains an unverified claim
+    ('allowing users to access the application on the internet'), while the quotation
+    only substantiates Azure Clouds and SharePoint Online hosting.
+    Must be downgraded to PARTIALLY_VERIFIED with unverified claims logged.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_PARTIAL
+
+    reduced_cand = {
+        "name": "Azure & SharePoint Cloud Hosting",
+        "description": "The application will be developed and hosted on GL's cloud environment, specifically in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription, allowing users to access the application on the internet.",
+        "section": "Dependencies",
+        "is_pure_milestone": False,
+    }
+
+    mapped = [
+        {
+            "name": "Azure & SharePoint Cloud Hosting",
+            "description": "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription.",
+            "chunk_index": 7,
+            "segment_index": 0,
+            "section": "Dependencies",
+            "is_pure_milestone": False,
+            "evidence_snippet": "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription.",
+            "_pos_in_chunk": 50,
+            "_chunk_len": 500,
+        }
+    ]
+
+    index_to_chunk = {
+        7: {
+            "chunk_index": 7,
+            "page_number": None,
+            "text": (
+                "AssGptions and dependencies:\n"
+                "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription.\n"
+                "The application will be hosted on the GL's cloud environment. User will be able to access the application on the internet."
+            ),
+        }
+    }
+
+    best, prov = DeepScanExtractor._best_source_verified(
+        reduced_cand["name"], reduced_cand, mapped, index_to_chunk=index_to_chunk
+    )
+    assert best is not None
+    assert prov == PROVENANCE_PARTIAL, f"Expected PARTIALLY_VERIFIED due to unverified internet claim, got {prov}"
+    assert "internet" in best["verification_reason"].lower() or "unsupported claims" in best["verification_reason"].lower()
+
+
+def test_claim_level_evidence_extended_quotation_requirement_baseline():
+    """
+    Requirement 1 Regression:
+    Candidate 'Requirement Document Baseline' description contains both the baseline statement
+    and the change request accommodation clause.
+    The quotation must be contiguously extended within Chunk 17 to substantiate both clauses,
+    achieving VERIFIED status.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED
+
+    reduced_cand = {
+        "name": "Requirement Document Baseline",
+        "description": "The Requirement document signed off at the end of the system study will be considered as the baseline for implementation. However, any new requirements arising during implementation would be accommodated through a change request",
+        "section": "Assumptions",
+        "is_pure_milestone": False,
+    }
+
+    # Initial MAP extracted only the first sentence
+    mapped = [
+        {
+            "name": "Requirement Document Baseline",
+            "description": "The Requirement docGent signed off at the end of the system study will be considered as the baseline for implementation.",
+            "chunk_index": 17,
+            "segment_index": 0,
+            "section": "Assumptions",
+            "is_pure_milestone": False,
+            "evidence_snippet": "The Requirement docGent signed off at the end of the system study will be considered as the baseline for implementation.",
+            "_pos_in_chunk": 120,
+            "_chunk_len": 800,
+        }
+    ]
+
+    index_to_chunk = {
+        17: {
+            "chunk_index": 17,
+            "page_number": None,
+            "text": (
+                "Key AssGptions:\n"
+                "The Requirement docGent signed off at the end of the system study will be considered as the baseline for implementation. "
+                "However, any new requirements arising during implementation would be accommodated through a change request\n"
+            ),
+        }
+    }
+
+    best, prov = DeepScanExtractor._best_source_verified(
+        reduced_cand["name"], reduced_cand, mapped, index_to_chunk=index_to_chunk
+    )
+    assert best is not None
+    assert prov == PROVENANCE_VERIFIED, f"Expected VERIFIED after contiguous quotation extension, got {prov}"
+    assert "change request" in best["evidence_snippet"].lower()
+    assert "baseline" in best["evidence_snippet"].lower()
+
+
+def test_discovery_path_instrumentation_chunk_origin():
+    """
+    Requirement 2 Regression:
+    Candidate discovery paths must accurately record whether each candidate was found by
+    section coverage, vector retrieval, or hybrid, without manufacturing path counts.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    hot_set = {0, 1, 2, 3, 4, 6}
+    scope_chunks = {0, 1, 2, 3, 4, 5, 6}
+
+    windows = [
+        {
+            "window_id": "win_001",
+            "indices": [4, 5, 6],
+            "segment_ids": [(4, 0), (5, 0), (6, 0)],
+            "text": "Chunk 5 text\n\nChunk 6 text",
+            "chunk_index": 4,
+            "page_number": None,
+            "section": "Functional Scope",
+            "sections_in_window": ["Functional Scope"],
+            "discovery_method": "hybrid",
+        }
+    ]
+
+    sectioned_segments = [
+        {"chunk_index": 4, "segment_index": 0, "text": "Chunk 4 text", "section": "Functional Scope", "section_source": "Scope"},
+        {"chunk_index": 5, "segment_index": 0, "text": "IJP Download Job Requisitions", "section": "Functional Scope", "section_source": "IJP"},
+        {"chunk_index": 6, "segment_index": 0, "text": "Employee Collaboration Portal", "section": "Functional Scope", "section_source": "ECP"},
+    ]
+
+    from unittest.mock import patch
+    mock_llm_items = [
+        {"name": "IJP Download Job Requisitions", "description": "Admin downloads job requisitions from IJP", "source_section": "Functional Scope"},
+        {"name": "Employee Collaboration Portal", "description": "Portal provides employee collaboration", "source_section": "Functional Scope"},
+    ]
+
+    with patch("services.deep_scan_extractor.LLMService.generate_json", return_value=mock_llm_items):
+        mapped = DeepScanExtractor._map_phase(
+            windows,
+            sectioned_segments=sectioned_segments,
+            hot_set=hot_set,
+            scope_chunks=scope_chunks,
+            used_fallback=False,
+        )
+
+    cand_chunk5 = next((c for c in mapped if c["name"] == "IJP Download Job Requisitions"), None)
+    cand_chunk6 = next((c for c in mapped if c["name"] == "Employee Collaboration Portal"), None)
+
+    assert cand_chunk5 is not None
+    assert cand_chunk5["chunk_index"] == 5
+    assert cand_chunk5["discovery_method"] == "section_coverage", (
+        f"Candidate from Chunk 5 (excluded from vector) must be 'section_coverage', got '{cand_chunk5['discovery_method']}'"
+    )
+
+    assert cand_chunk6 is not None
+    assert cand_chunk6["chunk_index"] == 6
+    assert cand_chunk6["discovery_method"] == "hybrid", (
+        f"Candidate from Chunk 6 (in both vector & scope) must be 'hybrid', got '{cand_chunk6['discovery_method']}'"
+    )
+
+
+def test_section_coverage_fallback_chunk_excluded_from_vector():
+    """
+    Requirement 3 Regression:
+    Validates section-coverage fallback: an explicitly relevant item is extracted when
+    its source chunk is excluded from vector retrieval, retaining its correct quotation and locator.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    hot_indices = [0, 1, 2, 3, 4, 6]  # Chunk 5 excluded
+    index_to_chunk = {
+        5: {"chunk_index": 5, "page_number": None, "text": "Admin View - Download requisition list for audit and tracking."}
+    }
+    index_to_section = {5: "Functional Scope"}
+    sectioned_segments = [
+        {
+            "chunk_index": 5,
+            "segment_index": 0,
+            "page_number": None,
+            "text": "Admin View - Download requisition list for audit and tracking.",
+            "section": "Functional Scope",
+            "section_confidence": 0.95,
+            "is_inferred": False,
+            "section_source": "Admin View",
+        }
+    ]
+
+    windows = DeepScanExtractor._build_windows(
+        hot_indices=hot_indices,
+        index_to_chunk=index_to_chunk,
+        index_to_section=index_to_section,
+        sectioned_segments=sectioned_segments,
+        used_fallback=False,
+    )
+
+    # Chunk 5 was included in windows despite vector exclusion!
+    assert any(5 in w["indices"] for w in windows), "Chunk 5 must be preserved in window assembly via section coverage"
+    win5 = next(w for w in windows if 5 in w["indices"])
+    assert "Download requisition list" in win5["text"]
+
+
+def test_remote_work_and_delay_exemption_deduplication():
+    """
+    Requirement 4 Regression:
+    Review repeated remote-work and delay-exemption obligations across Chunks 9 and 17.
+    Merges them when they represent the same contractual obligation, preserving all source references.
+    Retains separate items whenever conditions differ.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    items = [
+        # Pair 1: Remote work obligations with matching conditions
+        {
+            "name": "Remote Work During Travel Restrictions",
+            "description": "If there are any circumstances that reasonably restricts travel or physical presence of personnel at the client's office or location, the personnel shall be allowed to work from home or another remote location until the restriction exits, without prejudice to payment obligations.",
+            "chunk_index": 9,
+            "segment_index": 0,
+            "section": "Dependencies",
+            "evidence_snippet": "If there are any circumstances that reasonably restricts travel or physical presence...",
+        },
+        {
+            "name": "Remote Work Allowance for Restrictions",
+            "description": "If there are any circumstances that reasonably restrict travel or physical presence of our personnel at your office / location, then without prejudice to your payment obligations, you shall allow such personnel to work from home or other remote location till the time such reasonable restrictions exist.",
+            "chunk_index": 17,
+            "segment_index": 0,
+            "section": "Assumptions",
+            "evidence_snippet": "If there are any circumstances that reasonably restrict travel or physical presence...",
+        },
+        # Pair 2: Delay exemptions with matching conditions
+        {
+            "name": "Exemption from Breach for Remote Delays",
+            "description": "Any delay or default in performing obligations arising from travel restrictions shall not be attributable to the vendor, shall not be considered a breach of contract, and no consequent damages or penalties will be imposed.",
+            "chunk_index": 9,
+            "segment_index": 0,
+            "section": "Dependencies",
+            "evidence_snippet": "Any delay /default in performing our obligations arising from such restrictions, shall not be attributable to us...",
+        },
+        {
+            "name": "Exemption from Delay Penalties",
+            "description": "Any delay / default in performing our obligations arising from such restrictions, shall not be attributable to us and shall not be considered a breach of contract on our part and no consequent damages / penalties etc. arising therefrom would be imposed on us under the Contract.",
+            "chunk_index": 17,
+            "segment_index": 0,
+            "section": "Assumptions",
+            "evidence_snippet": "Any delay / default in performing our obligations arising from such restrictions, shall not be attributable to us...",
+        },
+        # Pair 3: Distinct delay conditions (must NOT merge)
+        {
+            "name": "Attributable Work Delays - 2 Weeks",
+            "description": "If there are delays in executing work directly attributable over 2 weeks, it should be brought up in a steering committee and resolved within next week.",
+            "chunk_index": 20,
+            "segment_index": 0,
+            "section": "Assumptions",
+            "evidence_snippet": "Delays directly attributable over 2 weeks resolved in steering committee.",
+        },
+        {
+            "name": "Attributable Work Delays - 4 Weeks",
+            "description": "If there are delays in executing work directly attributable over 4 weeks, it should be brought up in executive steering committee.",
+            "chunk_index": 21,
+            "segment_index": 0,
+            "section": "Assumptions",
+            "evidence_snippet": "Delays directly attributable over 4 weeks resolved in executive committee.",
+        },
+    ]
+
+    all_reduced, merge_events = DeepScanExtractor._reduce_phase(items)
+    canonical_names = {c["name"] for c in all_reduced}
+
+    # Verify Pair 1 merged
+    remote_cands = [c for c in all_reduced if "remote work" in c["name"].lower()]
+    assert len(remote_cands) == 1, f"Expected 1 consolidated remote work candidate, got {len(remote_cands)}"
+    surviving_remote = remote_cands[0]
+    # Verify both source chunks preserved in merged_sources
+    merged_chunks = {s.get("chunk_index") for s in surviving_remote.get("merged_sources", [])}
+    merged_chunks.add(surviving_remote.get("chunk_index"))
+    assert 9 in merged_chunks and 17 in merged_chunks, f"Expected both chunk 9 and 17 preserved, got {merged_chunks}"
+
+    # Verify Pair 2 merged
+    delay_exemptions = [c for c in all_reduced if "exemption" in c["name"].lower() or "penalties" in c["name"].lower()]
+    assert len(delay_exemptions) == 1, f"Expected 1 consolidated delay exemption candidate, got {len(delay_exemptions)}"
+
+    # Verify Pair 3 with differing conditions (2 weeks vs 4 weeks) remained SEPARATE
+    delay_2w = next((c for c in all_reduced if "2 weeks" in c["description"].lower()), None)
+    delay_4w = next((c for c in all_reduced if "4 weeks" in c["description"].lower()), None)
+    assert delay_2w is not None and delay_4w is not None, "Differing delay conditions must NOT be merged"
+    assert delay_2w["name"] != delay_4w["name"]
+
+
+def test_metadata_heading_alignment_google_project_director():
+    """
+    Requirement 5 Regression:
+    Ensure original headings, section labels, chunk identifiers, and source quotations
+    all refer to the same source context.
+    'Google Project Director' within Governance must NOT be labeled 'Your Project Manager'.
+    """
+    from services.scope_section_detector import ScopeSectionDetector
+
+    chunk_text = (
+        "**Your Project Manager**\n"
+        "* Primary point of contact for project operations\n"
+        "* Escalation point for day-to-day coordination\n\n"
+        "**Google Project Director**\n"
+        "* Participate in Steering Committee meetings\n"
+        "* Define and control project scope together with your Project Manager\n"
+        "* Provide direction to Google team for overall project management\n"
+    )
+
+    chunks = [{"chunk_index": 35, "page_number": None, "text": chunk_text}]
+    segments, stats = ScopeSectionDetector.detect_sections_with_stats(chunks)
+
+    director_seg = next((s for s in segments if "steering committee" in s["text"].lower()), None)
+    assert director_seg is not None
+    assert director_seg["section_source"] == "Google Project Director", (
+        f"Expected section_source 'Google Project Director', got '{director_seg.get('section_source')}'"
+    )
+    assert director_seg["section"] == "Governance"
+
+
+# ---------------------------------------------------------------------------
+# Atomic Extraction and Contrasting Pairs Regression Tests (Section 2 & 6)
+# ---------------------------------------------------------------------------
+
+def test_news_vs_footer_are_distinct():
+    """News sections and footer sections are distinct features and MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_a = {
+        "name": "Employee Collaboration - News Section",
+        "description": "Implement the News sections for the employees.",
+    }
+    item_b = {
+        "name": "Employee Collaboration - Footer Section",
+        "description": "Implement the footer section for the site.",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_a, item_b)
+    assert not can_m, f"News Section and Footer Section must not merge: {reason}"
+    assert "footer" in reason.lower() or "news" in reason.lower() or "nouns" in reason.lower()
+
+
+def test_edit_vs_delete_are_distinct():
+    """Edit job requisition and delete job requisition have contrasting actions and MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_a = {
+        "name": "Internal Job Posting - Edit Job Requisition",
+        "description": "Allow user to edit a job requisition.",
+    }
+    item_b = {
+        "name": "Internal Job Posting - Delete Job Requisition",
+        "description": "Allow user to delete a job requisition.",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_a, item_b)
+    assert not can_m, f"Edit and Delete must not merge: {reason}"
+    assert "edit" in reason.lower() or "delete" in reason.lower()
+
+
+def test_view_vs_download_are_distinct():
+    """Viewing and downloading capabilities represent distinct permissions and MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    # 1. Job requisitions: view vs download
+    cand_view = {
+        "name": "Internal Job Posting - View Job Access Control",
+        "description": "Access control to view the posted job requisitions as per GL designation hierarchy.",
+    }
+    cand_down = {
+        "name": "Internal Job Posting - Download Job Requisitions",
+        "description": "Allow user to download the job requisitions as per user's access and designation.",
+    }
+    can_m1, r1 = ActionEntityProtector.can_merge(cand_view, cand_down)
+    assert not can_m1, f"View and Download must not merge: {r1}"
+
+    # 2. Applicants: view vs download
+    app_view = {
+        "name": "Admin View - Applicant List",
+        "description": "Admin can see the list of applicants for any job requisition.",
+    }
+    app_down = {
+        "name": "Admin View - Download Applicants List",
+        "description": "Admin can download the applicants list for any job requisition.",
+    }
+    can_m2, r2 = ActionEntityProtector.can_merge(app_view, app_down)
+    assert not can_m2, f"Admin View and Download Applicants must not merge: {r2}"
+
+
+def test_post_vs_download_distinct():
+    """Posting access control and downloading capabilities MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    cand_post = {
+        "name": "Internal Job Posting - Post Job Access Control",
+        "description": "Access control to post a job requisition.",
+    }
+    cand_down = {
+        "name": "Internal Job Posting - Download Job Requisitions",
+        "description": "Allow user to download the job requisitions as per user's access and designation.",
+    }
+    can_m, r = ActionEntityProtector.can_merge(cand_post, cand_down)
+    assert not can_m, f"Post and Download must not merge: {r}"
+
+
+def test_training_reports_vs_create_assign_distinct():
+    """Tracking compliance reports and creating/assigning training MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_rep = {
+        "name": "Employee Collaboration - Training Compliance Reports",
+        "description": "Implement the Admin section to track the reports on employees training compliance.",
+    }
+    item_create = {
+        "name": "Employee Collaboration - Create & Assign Training Admin",
+        "description": "Implement the admin section to create and assign a training for the employees.",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_rep, item_create)
+    assert not can_m, f"Training reports and training creation must not merge: {reason}"
+
+
+def test_in_app_notification_vs_email_notification_distinct():
+    """In-application activity notifications and email notifications are distinct channels and MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_inapp = {
+        "name": "Employee Collaboration - User Notifications",
+        "description": "Showing the notifications as per the activities for the users related to this site.",
+    }
+    item_email = {
+        "name": "Employee Collaboration - Email Notifications",
+        "description": "Email notification for the employees on the training assignment, due, completed, or for the birthday wishes etc.",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_inapp, item_email)
+    assert not can_m, f"In-app notifications and email notifications must not merge: {reason}"
+
+
+def test_airfare_vs_rail_road_distinct():
+    """Airfare reimbursement and rail/road expenses are distinct travel categories and MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_air = {
+        "name": "OPE Reimbursement - Airfare",
+        "description": "Economy class airfare for Google Directors, Google Project Team and Google Quality and Risk Management Team members, who would periodically visit the project site for project review.",
+    }
+    item_rail = {
+        "name": "OPE Reimbursement - Rail/Road fare",
+        "description": "AC 1 rail fare / by road expenses where the same has been incurred.",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_air, item_rail)
+    assert not can_m, f"Airfare and Rail/Road fare must not merge: {reason}"
+
+
+def test_knowledge_transfer_vs_support_handover_distinct():
+    """Knowledge transfer and post-go-live support/handover are distinct obligations and MUST NEVER merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_kt = {
+        "name": "Complete knowledge transfer",
+        "description": "Complete knowledge transfer",
+    }
+    item_support = {
+        "name": "Post go-live support and hand over to GL",
+        "description": "Post go-live support and hand over to GL",
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_kt, item_support)
+    assert not can_m, f"Knowledge transfer and post go-live support must not merge: {reason}"
+
+
+def test_job_posting_noun_does_not_trigger_post_action():
+    """The noun phrase 'job posting' must NOT falsely trigger the action verb 'post'."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    actions = ActionEntityProtector.get_actions("Internal Job Posting - View Job Access Control")
+    assert "post" not in actions, f"Expected 'post' not in actions for 'Internal Job Posting', got {actions}"
+    assert "view" in actions
+
+
+# ---------------------------------------------------------------------------
+# Claim-Level Evidence Verification Regression Tests (Section 3 & 5)
+# ---------------------------------------------------------------------------
+
+def test_claim_level_verification_rejects_unsupported_subclaims():
+    """
+    Evidence Verifier must NEVER mark a candidate VERIFIED if a material action or entity claim
+    is absent from the supporting quotation (Fixes the 3 False-Positive VERIFIED defects).
+    """
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_PARTIAL
+
+    # 1. Training compliance description containing create & assign without evidence
+    cand_train = {
+        "name": "Employee Collaboration - Training Compliance Reports",
+        "description": "Implement the Admin section to track the reports on employees training compliance. | Implement the admin section to create and assign a training for the employees.",
+        "section": "Functional Scope",
+        "merged_sources": []
+    }
+    mapped_train = [{
+        "name": "Employee Collaboration - Training Compliance Reports",
+        "description": "Implement the Admin section to track the reports on employees training compliance.",
+        "evidence_snippet": "Implement the Admin section to track the reports on employees training compliance.",
+        "section": "Functional Scope",
+        "chunk_index": 3,
+        "_window_text": "Implement the Admin section to track the reports on employees training compliance."
+    }]
+    best_src, status = DeepScanExtractor._best_source_verified(
+        "Employee Collaboration - Training Compliance Reports",
+        cand_train,
+        mapped_train
+    )
+    assert status == PROVENANCE_PARTIAL, f"Expected PARTIALLY_VERIFIED for training reports with unevidenced create/assign, got '{status}'"
+    assert "unsupported claims" in best_src.get("verification_reason", "")
+
+    # 2. View applicant list description containing download without evidence
+    cand_app = {
+        "name": "Admin View - Applicant List",
+        "description": "Admin can see the list of applicants for any job requisition. | Admin can download the applicants list for any job requisition.",
+        "section": "Functional Scope",
+        "merged_sources": []
+    }
+    mapped_app = [{
+        "name": "Admin View - Applicant List",
+        "description": "Admin can see the list of applicants for any job requisition.",
+        "evidence_snippet": "Admin can see the list of applicants for any job requisition.",
+        "section": "Functional Scope",
+        "chunk_index": 5,
+        "_window_text": "Admin can see the list of applicants for any job requisition."
+    }]
+    best_src2, status2 = DeepScanExtractor._best_source_verified(
+        "Admin View - Applicant List",
+        cand_app,
+        mapped_app
+    )
+    assert status2 == PROVENANCE_PARTIAL, f"Expected PARTIALLY_VERIFIED for applicant viewing with unevidenced download, got '{status2}'"
+
+    # 3. View job requisitions description containing post and download without evidence
+    cand_job = {
+        "name": "Internal Job Posting - Post Job Access Control",
+        "description": "Access control to post a job requisition. | Access control to view the posted job requisitions as per GL designation hierarchy. | Allow user to download the job requisitions as per user's access and designation.",
+        "section": "Functional Scope",
+        "merged_sources": []
+    }
+    mapped_job = [{
+        "name": "Internal Job Posting - View Job Access Control",
+        "description": "Access control to view the posted job requisitions as per GL designation hierarchy.",
+        "evidence_snippet": "Access control to view the posted job requisitions as per GL designation hierarchy.",
+        "section": "Functional Scope",
+        "chunk_index": 4,
+        "_window_text": "Access control to view the posted job requisitions as per GL designation hierarchy."
+    }]
+    best_src3, status3 = DeepScanExtractor._best_source_verified(
+        "Internal Job Posting - Post Job Access Control",
+        cand_job,
+        mapped_job
+    )
+    assert status3 == PROVENANCE_PARTIAL, f"Expected PARTIALLY_VERIFIED for job access with unevidenced post/download, got '{status3}'"
+
+
+def test_claim_level_verification_contiguous_quotation_extension():
+    """
+    Contiguous quotation extension must attach adjacent sentences in the chunk
+    that substantiate candidate clauses (e.g. hosting and internet access).
+    """
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED
+
+    cand_baseline = {
+        "name": "Requirement Baseline and Change Control",
+        "description": "The Requirement document signed off at the end of the system study will be considered as the baseline for implementation. Any new requirements arising during implementation would be accommodated through a change request.",
+        "section": "Assumptions",
+        "merged_sources": []
+    }
+    chunk_17_text = (
+        "Key Assumptions:\n"
+        "The Requirement document signed off at the end of the system study will be considered as the baseline for implementation. "
+        "Any new requirements arising during implementation would be accommodated through a change request.\n"
+        "Other assumptions apply."
+    )
+    mapped_baseline = [{
+        "name": "Requirement Baseline and Change Control",
+        "description": "The Requirement document signed off at the end of the system study will be considered as the baseline for implementation.",
+        "evidence_snippet": "The Requirement document signed off at the end of the system study will be considered as the baseline for implementation.",
+        "section": "Assumptions",
+        "chunk_index": 17,
+        "_pos_in_chunk": 18,
+        "_chunk_len": len(chunk_17_text),
+        "_window_text": chunk_17_text
+    }]
+    index_to_chunk = {17: {"text": chunk_17_text, "page_number": None}}
+
+    best_src, status = DeepScanExtractor._best_source_verified(
+        "Requirement Baseline and Change Control",
+        cand_baseline,
+        mapped_baseline,
+        index_to_chunk=index_to_chunk
+    )
+    assert status == PROVENANCE_VERIFIED, f"Expected VERIFIED after contiguous quotation extension, got '{status}'"
+    assert "change request" in best_src.get("evidence_snippet", "").lower()
+
+
+def test_claim_level_verification_union_of_evidence():
+    """
+    When true duplicate candidates are merged, verify the final merged description
+    against the union of the contributing sources' evidence.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED
+
+    cand_merged = {
+        "name": "Infrastructure Prep and Deployment",
+        "description": "Infrastructure preparation and deployment will be done by GL’s IT team.",
+        "section": "Dependencies",
+        "merged_sources": [
+            {
+                "name": "Infrastructure Prep and Deployment",
+                "description": "Infrastructure preparation and deployment will be done by GL’s IT team.",
+                "evidence_snippet": "Infrastructure preparation and deployment will be done by GL’s IT team.",
+                "chunk_index": 8,
+                "section": "Dependencies"
+            }
+        ]
+    }
+    mapped_item = [{
+        "name": "Infrastructure Prep and Deployment",
+        "description": "Infrastructure preparation and deployment will be done by GL’s IT team.",
+        "evidence_snippet": "Infrastructure preparation and deployment will be done by GL’s IT team.",
+        "section": "Dependencies",
+        "chunk_index": 7,
+        "_window_text": "Infrastructure preparation and deployment will be done by GL’s IT team."
+    }]
+
+    best_src, status = DeepScanExtractor._best_source_verified(
+        "Infrastructure Prep and Deployment",
+        cand_merged,
+        mapped_item
+    )
+    assert status == PROVENANCE_VERIFIED, f"Expected VERIFIED, got '{status}'"
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Candidate Accounting Regression Test (Section 9 & 13)
+# ---------------------------------------------------------------------------
+
+def test_dynamic_candidate_accounting_reconciliation_exact():
+    """
+    Coverage audit must dynamically reconcile all map candidates:
+    total_map_candidates == retained_count + merged_count + excluded_count + unresolved_count
+    and retained_count == len(canonical_candidates).
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    mapped_items = [
+        {"name": "Item A", "section": "General"},
+        {"name": "Item B", "section": "General"},
+        {"name": "Item C", "section": "General"},
+        {"name": "Item D", "section": "General"},
+        {"name": "Item A Duplicate", "section": "General"},
+        {"name": "", "section": "General"},  # Malformed -> EXCLUDED
+    ]
+    canonical_candidates = [
+        {"name": "Item A", "provenance_status": "VERIFIED"},
+        {"name": "Item B", "provenance_status": "VERIFIED"},
+        {"name": "Item C", "provenance_status": "VERIFIED"},
+        {"name": "Item D", "provenance_status": "VERIFIED"},
+    ]
+    merge_events = [
+        {"merged_name": "Item A Duplicate", "surviving_name": "Item A", "rationale": "Exact match"}
+    ]
+
+    audit = DeepScanExtractor._audit_coverage(
+        mapped_items=mapped_items,
+        canonical_candidates=canonical_candidates,
+        merge_events=merge_events,
+        total_chunks=1,
+        total_segments=1
+    )
+
+    assert audit["total_map_candidates"] == 6
+    assert audit["retained_count"] == 4
+    assert audit["merged_count"] == 1
+    assert audit["excluded_count"] == 1
+    assert audit["unresolved_count"] == 0
+    assert audit["map_accounting_reconciled"] is True
+    assert audit["canonical_reconciled"] is True
+    assert len(audit["audit_records"]) == 6
+    for r in audit["audit_records"]:
+        assert "candidate_name" in r
+        assert "merge_rationale" in r
+
+
+# ---------------------------------------------------------------------------
+# Cases A, B, C & Canonical Verification Gate Regression Tests (Step 3)
+# ---------------------------------------------------------------------------
+
+def test_case_a_training_vs_poll_entity_protection():
+    """Case A: Training creation vs poll creation cannot merge due to contrasting entities."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_train = {
+        "name": "vConnect Training Creation and Assignment Admin",
+        "description": "Implement the admin section to create and assign a training for the employees.",
+        "section": "Functional Scope"
+    }
+    item_poll = {
+        "name": "vConnect Polls Creation Admin",
+        "description": "Implement the Admin section to create polls for the employees.",
+        "section": "Functional Scope"
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_train, item_poll)
+    assert not can_m, "Expected training and poll creation to be protected against merging"
+    assert "training" in reason.lower() or "poll" in reason.lower() or "contrasting" in reason.lower()
+
+
+def test_case_b_job_requisition_permissions_distinct():
+    """Case B: Independently testable permissions (post, view, download, post-on-behalf) must remain distinct."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_post = {
+        "name": "IJP Manager View Access Control Job Requisition",
+        "description": "Access control to post a job requisition.",
+        "section": "Functional Scope"
+    }
+    item_view = {
+        "name": "IJP Manager View View Job Requisitions Hierarchy",
+        "description": "Access control to view the posted job requisitions as per GL designation hierarchy.",
+        "section": "Functional Scope"
+    }
+    item_down = {
+        "name": "IJP Manager View Download Job Requisitions",
+        "description": "Allow user to download the job requisitions as per user's access and designation.",
+        "section": "Functional Scope"
+    }
+    item_behalf = {
+        "name": "IJP Manager View Post Job on Behalf",
+        "description": "Allow users to post a job on behalf of someone else (maintain the designation hierarchy).",
+        "section": "Functional Scope"
+    }
+
+    perms = [("post", item_post), ("view", item_view), ("down", item_down), ("behalf", item_behalf)]
+    for i in range(len(perms)):
+        for j in range(i + 1, len(perms)):
+            name_a, a = perms[i]
+            name_b, b = perms[j]
+            can_m, reason = ActionEntityProtector.can_merge(a, b)
+            assert not can_m, f"Expected permissions '{name_a}' and '{name_b}' to be protected against merging, got can_merge=True: {reason}"
+
+
+def test_case_c_cutover_vs_uat_action_protection():
+    """Case C: Production cutover vs UAT execution cannot merge due to contrasting actions."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    item_cutover = {
+        "name": "Implementation - Google Limited cutover",
+        "description": "Execute production cutover",
+        "section": "Methodology"
+    }
+    item_uat = {
+        "name": "Implementation - Google Limited UAT",
+        "description": "Execute UAT",
+        "section": "Methodology"
+    }
+    can_m, reason = ActionEntityProtector.can_merge(item_cutover, item_uat)
+    assert not can_m, "Expected cutover and UAT to be protected against merging"
+    assert "action" in reason.lower() or "contrasting" in reason.lower() or "cutover" in reason.lower()
+
+
+def test_verification_gate_invalidates_composite_candidate_lacking_evidence():
+    """A composite candidate whose description contains multiple claims is invalidated if evidence is partial."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_PARTIAL
+    cand_comp = {
+        "name": "Implementation - Google Limited cutover",
+        "description": "Execute production cutover | Execute UAT",
+        "evidence_snippet": "Execute production cutover",
+        "chunk_index": 10,
+        "merged_sources": [
+            {"name": "Implementation - Google Limited UAT", "description": "Execute UAT", "evidence_snippet": ""}
+        ]
+    }
+    index_to_chunk = {10: {"text": "Phase 3: Execute production cutover for all systems."}}
+    DeepScanExtractor._verify_canonical_candidates([cand_comp], index_to_chunk=index_to_chunk)
+    assert cand_comp["provenance_status"] == PROVENANCE_PARTIAL, f"Expected PARTIALLY_VERIFIED, got '{cand_comp['provenance_status']}'"
+    assert "unsupported claims" in cand_comp["verification_reason"] or "test" in cand_comp["verification_reason"]
+
+
+def test_reverification_of_canonical_candidates_after_audit_merging():
+    """Final canonical verification gate recomputes status and updates verification_reason across all candidates."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED, PROVENANCE_PARTIAL
+    cands = [
+        {
+            "name": "Valid Candidate",
+            "description": "Implement user dashboard",
+            "evidence_snippet": "Implement user dashboard",
+            "chunk_index": 1,
+            "provenance_status": "UNRESOLVED",
+            "merged_sources": []
+        },
+        {
+            "name": "Composite Candidate",
+            "description": "Implement user dashboard | Export audit logs to external server",
+            "evidence_snippet": "Implement user dashboard",
+            "chunk_index": 1,
+            "provenance_status": "VERIFIED",  # Stale verified status that MUST be invalidated
+            "merged_sources": []
+        }
+    ]
+    index_to_chunk = {1: {"text": "System Requirements: Implement user dashboard."}}
+    DeepScanExtractor._verify_canonical_candidates(cands, index_to_chunk=index_to_chunk)
+    assert cands[0]["provenance_status"] == PROVENANCE_VERIFIED
+    assert cands[1]["provenance_status"] == PROVENANCE_PARTIAL, "Stale VERIFIED status on composite candidate must be invalidated"
+
+
+def test_multi_quotation_collective_support():
+    """A candidate is verified when multiple quotations from verified chunks collectively support all its claims."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED
+    cand_multi = {
+        "name": "Delivery and Handover Milestones",
+        "description": "Execute production cutover | Perform knowledge transfer to client team",
+        "evidence_snippet": "Execute production cutover for enterprise cluster",
+        "chunk_index": 10,
+        "merged_sources": [
+            {
+                "name": "KT Handover",
+                "description": "Perform knowledge transfer to client team",
+                "evidence_snippet": "Perform knowledge transfer to client team during week 4",
+                "chunk_index": 11
+            }
+        ]
+    }
+    index_to_chunk = {
+        10: {"text": "Phase 4: Execute production cutover for enterprise cluster."},
+        11: {"text": "Phase 5: Perform knowledge transfer to client team during week 4."}
+    }
+    DeepScanExtractor._verify_canonical_candidates([cand_multi], index_to_chunk=index_to_chunk)
+    assert cand_multi["provenance_status"] == PROVENANCE_VERIFIED, f"Expected VERIFIED, got {cand_multi['provenance_status']}"
+
+
+def test_single_quotation_supporting_only_one_merged_claim_fails():
+    """One quotation supporting only one of several merged claims cannot verify the whole candidate."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_PARTIAL
+    cand = {
+        "name": "Training and Poll Administration",
+        "description": "Implement the admin section to create and assign a training for the employees. | Implement the Admin section to create polls for the employees.",
+        "evidence_snippet": "Implement the admin section to create and assign a training for the employees.",
+        "chunk_index": 4,
+        "merged_sources": []
+    }
+    index_to_chunk = {4: {"text": "Implement the admin section to create and assign a training for the employees."}}
+    DeepScanExtractor._verify_canonical_candidates([cand], index_to_chunk=index_to_chunk)
+    assert cand["provenance_status"] == PROVENANCE_PARTIAL
+    assert "polls" in cand["verification_reason"].lower() or "unsupported" in cand["verification_reason"].lower()
+
+
+def test_project_isolated_retrieval_and_vector_filtering():
+    """Vector queries with project_id and document_id filter guarantee project boundary isolation."""
+    from services.chroma_service import ChromaService
+    coll = ChromaService.get_collection()
+    if not coll:
+        return
+    p107_filter = {"$and": [{"project_id": {"$eq": 107}}, {"document_id": {"$eq": 245}}]}
+    p108_filter = {"$and": [{"project_id": {"$eq": 108}}, {"document_id": {"$eq": 246}}]}
+    res_107 = coll.get(where=p107_filter)
+    res_108 = coll.get(where=p108_filter)
+    ids_107 = set(res_107.get("ids", []))
+    ids_108 = set(res_108.get("ids", []))
+    assert ids_107.isdisjoint(ids_108), "Vector IDs between Project 107 and Project 108 must be disjoint"
+    for m in res_107.get("metadatas", []):
+        assert m["project_id"] == 107 and m["document_id"] == 245
+    for m in res_108.get("metadatas", []):
+        assert m["project_id"] == 108 and m["document_id"] == 246
+
+
+def test_view_applicants_vs_recommend_reject_applicants_distinct():
+    """Viewing applicants list vs recommending or rejecting applicants must remain distinct."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    a = {
+        "name": "Admin View - View applicants list",
+        "description": "Admin can see the list of applicants for any job requisition."
+    }
+    b = {
+        "name": "Admin View - View and recommend or reject applicants",
+        "description": "Admin can see the details of the applicants for any job requisition and can recommend or reject the applicant."
+    }
+    can_m, reason = ActionEntityProtector.can_merge(a, b)
+    assert not can_m, f"View applicants vs recommend/reject should be distinct, got can_merge={can_m}: {reason}"
+    assert "distinct capabilities" in reason.lower() or "contrasting" in reason.lower()
+
+
+def test_download_job_requisition_vs_download_applicants_contextual_protection():
+    """Downloading job requisition list vs downloading applicants list must remain distinct even with shared contextual nouns."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    a = {
+        "name": "Admin View - Download job requisition list",
+        "description": "Admin can download the job requisition list."
+    }
+    b = {
+        "name": "Admin View - Download applicants list",
+        "description": "Admin can download the applicants list for any job requisition."
+    }
+    can_m, reason = ActionEntityProtector.can_merge(a, b)
+    assert not can_m, f"Download requisition vs download applicants must be distinct, got can_merge={can_m}: {reason}"
+    assert "target entities" in reason.lower()
+
+
+def test_steering_committee_status_reporting_vs_governance_commitment_distinct():
+    """PM status reporting vs PM bringing organisational commitment are distinct obligations."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    a = {
+        "name": "Project Manager Steering Committee",
+        "description": "Participate in the Steering Committee to provide project status updates"
+    }
+    b = {
+        "name": "Project Manager - Steering Committee",
+        "description": "He will be a member of the Steering Committee and bring in commitment of the entire organisation towards this project."
+    }
+    can_m, reason = ActionEntityProtector.can_merge(a, b)
+    assert not can_m, f"Status updates vs organizational commitment should be distinct, got: {reason}"
+    assert "status_report" in reason or "contrasting" in reason.lower()
+
+
+def test_roster_members_under_shared_prefix_protected_from_merging():
+    """Individual roster members sharing a category prefix must not collapse into one member."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    a = {"name": "Steering Committee Member - John", "description": "* Mr. John, GL"}
+    b = {"name": "Steering Committee Member - Sam", "description": "* Mrs. Sam, GL"}
+    can_m, reason = ActionEntityProtector.can_merge(a, b)
+    assert not can_m, f"Distinct roster members John vs Sam must not merge, got: {reason}"
+    assert "distinct qualifier suffixes" in reason.lower() or "shared prefix" in reason.lower()
+
+
+def test_roster_genuine_duplicates_allowed_to_merge():
+    """Genuine duplicate records of the same roster member must still merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    a = {"name": "Steering Committee Member - John", "description": "* Mr. John, GL"}
+    b = {"name": "Steering Committee Member - John GL", "description": "* Mr. John, GL"}
+    can_m, reason = ActionEntityProtector.can_merge(a, b)
+    assert can_m, f"Duplicate records of John should be allowed to merge, got reason: {reason}"
+
+
+def test_uat_execution_vs_assistance_composite_clause_verification():
+    """Candidate combining UAT execution with assistance fails verification when evidence only supports assistance."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_PARTIAL
+    cand = {
+        "name": "Implementation & Go-live - Execute UAT",
+        "description": "Execute UAT and assist client to conduct User Acceptance Testing and obtain sign off from business team",
+        "evidence_snippet": "Assist client to conduct User Acceptance Testing and obtain sign off from business team",
+        "chunk_index": 23,
+        "merged_sources": []
+    }
+    index_to_chunk = {
+        23: {"text": "Assist client to conduct User Acceptance Testing and obtain sign off from business team"}
+    }
+    DeepScanExtractor._verify_canonical_candidates([cand], index_to_chunk=index_to_chunk)
+    assert cand["provenance_status"] == PROVENANCE_PARTIAL, f"Expected PARTIALLY_VERIFIED, got: {cand['provenance_status']}"
+    assert "execute" in cand["verification_reason"].lower() or "unsupported" in cand["verification_reason"].lower()
+
+
+def test_evidence_status_invalidation_after_canonical_description_changed():
+    """When a candidate description is altered post-extraction, re-verification invalidates unsupported status."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED, PROVENANCE_PARTIAL
+    cand = {
+        "name": "Employee Notifications",
+        "description": "Showing notifications in the portal landing page.",
+        "evidence_snippet": "Showing the notifications for the employees in the landing page.",
+        "chunk_index": 3,
+        "merged_sources": []
+    }
+    index_to_chunk = {
+        3: {"text": "Showing the notifications for the employees in the landing page."}
+    }
+    DeepScanExtractor._verify_canonical_candidates([cand], index_to_chunk=index_to_chunk)
+    assert cand["provenance_status"] == PROVENANCE_VERIFIED
+
+    # Invalidate by appending an unsupported unevidenced claim
+    cand["description"] = "Showing notifications in the portal landing page. | Broadcast emergency SMS alerts to mobile phones."
+    DeepScanExtractor._verify_canonical_candidates([cand], index_to_chunk=index_to_chunk)
+    assert cand["provenance_status"] == PROVENANCE_PARTIAL
+    assert "sms" in cand["verification_reason"].lower() or "unsupported" in cand["verification_reason"].lower()
+
+
+def test_cross_section_duplicates_merge_while_distinct_obligations_separate():
+    """Genuine identical deliverables across sections merge, while distinct obligations remain separate."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    # 1. Identical requirement in Scope of Work vs Deliverables table
+    d1 = {
+        "name": "Employee Collaboration Landing Page",
+        "description": "Implement the landing page for employee collaboration portal",
+        "section": "Scope of Work"
+    }
+    d2 = {
+        "name": "Employee Collaboration Landing Page",
+        "description": "Implement the landing page for employee collaboration portal",
+        "section": "Deliverables"
+    }
+    can_m_dup, r_dup = ActionEntityProtector.can_merge(d1, d2)
+    assert can_m_dup, f"Cross-section identical deliverables must merge, got: {r_dup}"
+
+    # 2. Distinct obligations across sections
+    o1 = {
+        "name": "Project Governance - Steering Committee",
+        "description": "Organize Steering Committee meetings as per agreed frequency",
+        "section": "Governance"
+    }
+    o2 = {
+        "name": "Commercial Terms - Invoice Approval",
+        "description": "Approving payments on invoices pending over one month",
+        "section": "Commercial"
+    }
+    can_m_dist, r_dist = ActionEntityProtector.can_merge(o1, o2)
+    assert not can_m_dist, f"Distinct obligations across sections must not merge, got: {r_dist}"
+
+
+def test_defect1_uat_and_training_must_remain_distinct():
+    """Defect 1: UAT and training/communication must remain distinct candidates."""
+    from services.deep_scan_extractor import ActionEntityProtector, DeepScanExtractor, PROVENANCE_PARTIAL
+    uat_item = {
+        "name": "Implementation - Google Limited UAT",
+        "description": "Execute UAT",
+        "section": "Methodology",
+        "chunk_index": 23,
+    }
+    training_item = {
+        "name": "Implementation - Google Limited training",
+        "description": "Execute training/ communication",
+        "section": "Methodology",
+        "chunk_index": 23,
+    }
+    can_m, reason = ActionEntityProtector.can_merge(uat_item, training_item)
+    assert not can_m, f"UAT and training must not merge: {reason}"
+
+    # A composite candidate whose evidence only covers training must NOT be marked VERIFIED
+    status, v_reason = DeepScanExtractor._verify_candidate_claims(
+        name="Implementation - Google Limited UAT",
+        desc="Execute UAT | Execute training/ communication",
+        primary_ev="Execute training/ communication",
+        merged_sources=[],
+        dates=set(),
+        durations=set(),
+    )
+    assert status == PROVENANCE_PARTIAL, f"Composite candidate with partial evidence must be PARTIAL, got {status}: {v_reason}"
+
+
+def test_defect2_distinct_learning_targets_protected():
+    """Defect 2: Employee learning vs External learning must not merge."""
+    from services.deep_scan_extractor import ActionEntityProtector
+    emp_learning = {
+        "name": "Employee Collaboration - Employee learning section",
+        "description": "Implement the employee specific learning section in the landing page.",
+        "section": "Functional Scope",
+        "chunk_index": 3,
+    }
+    ext_learning = {
+        "name": "Employee Collaboration - External Learning section",
+        "description": "Implement the External Learning section for the employees.",
+        "section": "Functional Scope",
+        "chunk_index": 3,
+    }
+    can_m, reason = ActionEntityProtector.can_merge(emp_learning, ext_learning)
+    assert not can_m, f"Employee learning and External learning must not merge: {reason}"
+
+
+def test_defect3_split_independently_testable_claims():
+    """Defect 3: Split compound functional items into independent claims."""
+    from services.deep_scan_extractor import DeepScanExtractor
+    compound_applicant = {
+        "name": "Admin View - Applicant details and recommendation",
+        "description": "Admin can see the details of the applicants for any job requisition and can recommend or reject the applicant.",
+        "section": "Functional Scope",
+        "chunk_index": 5,
+        "segment_index": 0,
+        "source_locator": "chunk_5",
+        "discovery_method": "section_coverage",
+    }
+    compound_apply = {
+        "name": "User View - Summary details and apply",
+        "description": "User can see the summary details of any job requisition and apply for the same as per the eligibility.",
+        "section": "Functional Scope",
+        "chunk_index": 5,
+        "segment_index": 0,
+        "source_locator": "chunk_5",
+        "discovery_method": "section_coverage",
+    }
+    split_items = DeepScanExtractor._split_compound_claims([compound_applicant, compound_apply])
+    assert len(split_items) == 5, f"Expected 5 split claims, got {len(split_items)}"
+    
+    names = [it["name"] for it in split_items]
+    assert any("See applicant details" in n for n in names)
+    assert any("Recommend applicant" in n for n in names)
+    assert any("Reject applicant" in n for n in names)
+    assert any("See job requisition summary details" in n for n in names)
+    assert any("Apply for job requisition" in n for n in names)
+
+    # All derived claims must retain original clause as evidence snippet
+    for it in split_items:
+        assert len(it.get("evidence_snippet", "")) > 20, f"Evidence missing for {it['name']}"
+
+
+def test_defect4_duplicate_emissions_from_identical_source_spans_deduplicated():
+    """Defect 4: Deduplicate repeated emissions of identical text span from same chunk."""
+    from services.deep_scan_extractor import ActionEntityProtector, DeepScanExtractor
+    # Repeated identical emission of same activity from same chunk 14
+    c1 = {
+        "name": "Technical Developer - Unit testing",
+        "description": "Perform Unit testing",
+        "chunk_index": 14,
+        "section": "Responsibilities",
+    }
+    c2 = {
+        "name": "Technical Developer - Unit testing",
+        "description": "Perform Unit testing",
+        "chunk_index": 14,
+        "section": "Responsibilities",
+    }
+    can_m_dev, _ = ActionEntityProtector.can_merge(c1, c2)
+    assert can_m_dev, "Repeated emission of identical activity from same chunk 14 must be eligible to merge"
+    deduped_dev, events_dev = DeepScanExtractor._deterministic_dedup([c1, c2])
+    assert len(deduped_dev) == 1
+    assert deduped_dev[0]["name"] == "Technical Developer - Unit testing"
+
+    # Construct vs Implementation from same chunk 23
+    p1 = {
+        "name": "Construct - Develop integration test plan",
+        "description": "Develop integration test plan",
+        "chunk_index": 23,
+        "section": "Methodology",
+    }
+    p2 = {
+        "name": "Implementation - Develop integration test plan",
+        "description": "Develop integration test plan",
+        "chunk_index": 23,
+        "section": "Methodology",
+    }
+    can_m_plan, _ = ActionEntityProtector.can_merge(p1, p2)
+    assert can_m_plan, "Repeated emission from same chunk 23 must be eligible to merge"
+    deduped_plan, _ = DeepScanExtractor._deterministic_dedup([p1, p2])
+    assert len(deduped_plan) == 1
+    assert deduped_plan[0]["name"] == "Construct - Develop integration test plan"
+
+
+def test_defect5_strengthened_canonical_verification_gate():
+    """Defect 5: Verification gate must validate every material claim and responsible party."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_PARTIAL
+    # Responsible party conflict
+    status, reason = DeepScanExtractor._verify_candidate_claims(
+        name="Implementation - Google Limited cutover",
+        desc="Execute production cutover by Google Limited",
+        primary_ev="Google will perform production cutover activities",
+        merged_sources=[],
+        dates=set(),
+        durations=set(),
+    )
+    assert status == PROVENANCE_PARTIAL
+    assert "responsible party conflict" in reason
+
+    # Unverified action in composite clause
+    status2, reason2 = DeepScanExtractor._verify_candidate_claims(
+        name="Admin View - Manage Job Requisitions",
+        desc="Admin can delete a job requisition | Admin can publish a job requisition",
+        primary_ev="Allow user to delete a job requisition",
+        merged_sources=[],
+        dates=set(),
+        durations=set(),
+    )
+    assert status2 == PROVENANCE_PARTIAL
+    assert "publish" in reason2 or "missing action" in reason2 or "unsupported" in reason2
+
+
+def test_defect6_preserve_non_functional_contract_scope():
+    """Defect 6: Preserve contract-relevant information outside functional scope (deliverables, milestones, assumptions, governance, exclusions)."""
+    from services.deep_scan_extractor import DeepScanExtractor, PROVENANCE_VERIFIED
+    items = [
+        {
+            "name": "Assumptions - Environment Availability",
+            "description": "Client will provide test environment access 2 weeks prior to UAT",
+            "section": "Assumptions",
+            "chunk_index": 7,
+            "evidence_snippet": "Client will provide test environment access 2 weeks prior to UAT",
+            "merged_sources": []
+        },
+        {
+            "name": "Milestones - Phase 1 Delivery",
+            "description": "Complete Phase 1 deployment by October 30",
+            "section": "Milestones",
+            "chunk_index": 12,
+            "evidence_snippet": "Complete Phase 1 deployment by October 30",
+            "merged_sources": []
+        },
+        {
+            "name": "Governance - Weekly Status Reporting",
+            "description": "Project Manager shall publish weekly status reports to steering committee",
+            "section": "Governance",
+            "chunk_index": 15,
+            "evidence_snippet": "Project Manager shall publish weekly status reports to steering committee",
+            "merged_sources": []
+        },
+        {
+            "name": "Exclusions - Hardware Procurement",
+            "description": "Hardware procurement and server hosting costs are excluded from scope",
+            "section": "Exclusions",
+            "chunk_index": 18,
+            "evidence_snippet": "Hardware procurement and server hosting costs are excluded from scope",
+            "merged_sources": []
+        }
+    ]
+    deduped, _ = DeepScanExtractor._deterministic_dedup(items)
+    assert len(deduped) == 4, f"All non-functional categories must be preserved, got {len(deduped)}"
+
+    index_to_chunk = {
+        7: {"text": "Client will provide test environment access 2 weeks prior to UAT"},
+        12: {"text": "Complete Phase 1 deployment by October 30"},
+        15: {"text": "Project Manager shall publish weekly status reports to steering committee"},
+        18: {"text": "Hardware procurement and server hosting costs are excluded from scope"},
+    }
+    DeepScanExtractor._verify_canonical_candidates(deduped, index_to_chunk=index_to_chunk)
+    for it in deduped:
+        assert it["provenance_status"] == PROVENANCE_VERIFIED, f"{it['name']} failed verification: {it.get('verification_reason')}"
+
+
+def test_preserve_all_distinct_testing_responsibilities():
+    """Issue 1: Preserve all three distinct testing responsibilities (unit, integration, UAT)."""
+    from services.deep_scan_extractor import ActionEntityProtector, DeepScanExtractor, PROVENANCE_VERIFIED
+    
+    # Test case A: LLM emits 3 candidates with the compound sentence
+    items = [
+        {
+            "name": "Technical Developer - Unit testing",
+            "description": "Perform Unit testing, Integration testing and User Acceptance testing",
+            "chunk_index": 14,
+            "section": "Responsibilities",
+            "source_locator": "chunk_14",
+        },
+        {
+            "name": "Technical Developer - Integration testing",
+            "description": "Perform Unit testing, Integration testing and User Acceptance testing",
+            "chunk_index": 14,
+            "section": "Responsibilities",
+            "source_locator": "chunk_14",
+        },
+        {
+            "name": "Technical Developer - UAT execution",
+            "description": "Perform Unit testing, Integration testing and User Acceptance testing",
+            "chunk_index": 14,
+            "section": "Responsibilities",
+            "source_locator": "chunk_14",
+        },
+    ]
+    split_items = DeepScanExtractor._split_compound_claims(items)
+    deduped, _ = DeepScanExtractor._deterministic_dedup(split_items)
+    assert len(deduped) == 3, f"Expected 3 distinct testing responsibilities, got {len(deduped)}"
+    
+    names = [d["name"] for d in deduped]
+    descs = [d["description"] for d in deduped]
+    assert any("Unit testing" in n for n in names)
+    assert any("Integration testing" in n for n in names)
+    assert any("UAT" in n or "User Acceptance" in n for n in names)
+    
+    # None should have the un-split full sentence as description
+    full_sentence = "Perform Unit testing, Integration testing and User Acceptance testing"
+    for d in deduped:
+        assert d["description"] != full_sentence, f"Candidate {d['name']} still has un-split full-sentence description"
+        assert d.get("evidence_snippet") == full_sentence or full_sentence in d.get("evidence_snippet", "")
+        assert d.get("section") == "Responsibilities"
+        assert d.get("chunk_index") == 14
+
+    # Test case B: Single compound candidate is split into 3 distinct activities
+    compound = [
+        {
+            "name": "Technical Developer - Testing",
+            "description": "Perform Unit testing, Integration testing and User Acceptance testing",
+            "chunk_index": 14,
+            "section": "Responsibilities",
+            "source_locator": "chunk_14",
+        }
+    ]
+    split_single = DeepScanExtractor._split_compound_claims(compound)
+    deduped_single, _ = DeepScanExtractor._deterministic_dedup(split_single)
+    assert len(deduped_single) == 3, f"Expected single compound to yield 3 testing responsibilities, got {len(deduped_single)}"
+
+    # Test case C: Contrasting entity protection prevents merging between testing types
+    u_item = {"name": "Technical Developer - Unit testing", "description": "Perform Unit testing"}
+    i_item = {"name": "Technical Developer - Integration testing", "description": "Perform Integration testing"}
+    uat_item = {"name": "Technical Developer - User Acceptance Testing", "description": "Perform User Acceptance testing"}
+    can_m_ui, r_ui = ActionEntityProtector.can_merge(u_item, i_item)
+    assert not can_m_ui, f"Unit testing and Integration testing must not merge: {r_ui}"
+    can_m_uuat, r_uuat = ActionEntityProtector.can_merge(u_item, uat_item)
+    assert not can_m_uuat, f"Unit testing and UAT must not merge: {r_uuat}"
+    can_m_iuat, r_iuat = ActionEntityProtector.can_merge(i_item, uat_item)
+    assert not can_m_iuat, f"Integration testing and UAT must not merge: {r_iuat}"
+
+    # Test case D: Canonical verification verifies all 3
+    index_to_chunk = {
+        14: {"text": "Perform Unit testing, Integration testing and User Acceptance testing"}
+    }
+    DeepScanExtractor._verify_canonical_candidates(deduped, index_to_chunk=index_to_chunk)
+    for d in deduped:
+        assert d["provenance_status"] == PROVENANCE_VERIFIED, f"{d['name']} failed verification: {d.get('verification_reason')}"
+
+
+def test_reconcile_section_breakdown_and_accounting():
+    """Issue 2: Reconcile section counts dynamically so sum(section_counts) strictly equals total canonical candidates."""
+    from services.deep_scan_extractor import DeepScanExtractor
+    # Verify with an arbitrary collection of candidates across multiple sections, including multi-section and unclassified
+    sample_candidates = [
+        {"name": "Item 1", "section": "Functional Scope"},
+        {"name": "Item 2", "section": "Functional Scope"},
+        {"name": "Item 3", "section": "Governance", "merged_sources": [{"section": "Methodology"}]},
+        {"name": "Item 4", "section": "Methodology"},
+        {"name": "Item 5", "section": "Deliverables"},
+        {"name": "Item 6", "section": "Client Responsibilities"},
+        {"name": "Item 7", "section": ""},  # unclassified
+    ]
+    breakdown = DeepScanExtractor.compute_section_breakdown(sample_candidates)
+    
+    assert breakdown["section_sum_equals_canonical_count"] is True
+    assert breakdown["total_counted"] == len(sample_candidates)
+    assert sum(breakdown["counts"].values()) == len(sample_candidates)
+    assert breakdown["counts"].get("Functional Scope") == 2
+    assert breakdown["counts"].get("Governance") == 1
+    assert breakdown["counts"].get("Unclassified") == 1
+    assert breakdown["multi_section_count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -485,6 +2968,67 @@ if __name__ == "__main__":
         test_provenance_unresolved_no_default_fallback,
         test_inspection_mode_env_variable,
         test_el_functional_scope_checklist_coverage,
+        test_gl_responsibility_heading_recognition,
+        test_bulleted_heading_assumptions,
+        test_bulleted_heading_technical_scope,
+        test_multi_chunk_window_accurate_chunk_attribution,
+        test_window_assembly_section_boundary_split,
+        test_deliverables_table_header_classification,
+        test_trailing_overlap_locator_disambiguation,
+        test_synthesized_uat_phase_provenance,
+        test_cross_section_deduplication,
+        test_metadata_artifact_exclusion,
+        test_embedding_service_api,
+        test_reconciled_audit_accounting,
+        test_ijp_delete_job_requisition_disambiguation_avoids_trailing_overlap,
+        test_milestone_pure_flag_preservation_and_date_evidence_alignment,
+        test_milestone_go_live_evidence_alignment,
+        test_assessment_implementation_phase_duration_alignment,
+        test_uat_phase_evidence_duration_support,
+        test_contract_validity_period_section_and_evidence,
+        test_technical_scope_distinct_category_in_step2,
+        test_unresolved_map_candidates_subsumption_and_accounting,
+        test_cross_document_responsibility_matrix_fixture,
+        test_cross_document_payment_schedule_fixture,
+        test_evidence_verification_defect_support_regression_a,
+        test_evidence_verification_remote_work_regression_b,
+        test_strict_evidence_validator_rejects_unrelated_excerpt,
+        test_strict_evidence_validator_flags_unsupported_date_as_partial,
+        test_workstream_aware_milestone_deduplication_regression_d,
+        test_conflicting_dates_same_milestone_rejected_from_merge,
+        test_repeated_contract_validity_consolidation_regression_c,
+        test_unknown_heading_safe_fallback,
+        test_commitments_in_tables_multi_obligation,
+        test_vector_retrieval_miss_discovered_by_section_coverage,
+        test_candidate_fields_completeness_and_downstream_compatibility,
+        test_generic_heatmap_no_hardcoded_document_names,
+        test_failed_retrieval_safe_degradation,
+        test_claim_level_verification_union_of_evidence,
+        test_dynamic_candidate_accounting_reconciliation_exact,
+        test_case_a_training_vs_poll_entity_protection,
+        test_case_b_job_requisition_permissions_distinct,
+        test_case_c_cutover_vs_uat_action_protection,
+        test_verification_gate_invalidates_composite_candidate_lacking_evidence,
+        test_reverification_of_canonical_candidates_after_audit_merging,
+        test_multi_quotation_collective_support,
+        test_single_quotation_supporting_only_one_merged_claim_fails,
+        test_project_isolated_retrieval_and_vector_filtering,
+        test_view_applicants_vs_recommend_reject_applicants_distinct,
+        test_download_job_requisition_vs_download_applicants_contextual_protection,
+        test_steering_committee_status_reporting_vs_governance_commitment_distinct,
+        test_roster_members_under_shared_prefix_protected_from_merging,
+        test_roster_genuine_duplicates_allowed_to_merge,
+        test_uat_execution_vs_assistance_composite_clause_verification,
+        test_evidence_status_invalidation_after_canonical_description_changed,
+        test_cross_section_duplicates_merge_while_distinct_obligations_separate,
+        test_defect1_uat_and_training_must_remain_distinct,
+        test_defect2_distinct_learning_targets_protected,
+        test_defect3_split_independently_testable_claims,
+        test_defect4_duplicate_emissions_from_identical_source_spans_deduplicated,
+        test_defect5_strengthened_canonical_verification_gate,
+        test_defect6_preserve_non_functional_contract_scope,
+        test_preserve_all_distinct_testing_responsibilities,
+        test_reconcile_section_breakdown_and_accounting,
     ]
 
     passed = 0

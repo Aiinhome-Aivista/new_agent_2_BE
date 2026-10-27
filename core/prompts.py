@@ -926,17 +926,33 @@ Read the following excerpt from an Engagement Letter (EL) or Inter-Firm Approval
 Do NOT decide whether an item is in-scope or out-of-scope — a later stage does that. Your job is only to faithfully capture each distinct item.
 
 Rules:
-1. Extract each distinct obligation, deliverable, exclusion, assumption, dependency, or milestone as its OWN item. NEVER merge multiple distinct items into one.
-2. NEVER group distinct testing or deployment phases (e.g. SIT, UAT, Production) into a single item. They MUST be separate items.
-3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one item, and do not group distinct features like "audit logs" and "SSO" into one "Security" item).
-4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST be extracted as its own distinct item.
-5. "name" MUST be a short label (<= 60 characters). Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the name.
-6. "description" MUST be the faithful sentence or clause the item was taken from.
-7. "source_section" MUST be exactly one of: "Functional Scope", "Methodology", "Governance", "Support", "Acceptance", "Resources", "Scope of Work", "Deliverables", "Responsibilities", "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies", "Milestones", "Recurring Commitments", "General".
-8. If the excerpt contains no scope-related content, return an empty array [].
-9. Do NOT invent items that are not present in the excerpt.
-10. "is_pure_milestone" MUST be true if the item is purely a project phase, timeline event, or deadline (e.g., 'Kickoff', 'UAT', 'Go-Live'). Otherwise false.
-11. If ANY item (milestone, deliverable, or responsibility) has an explicitly stated date, deadline, or schedule in the text, you MUST include that date in its "description".
+1. ATOMIC EXTRACTION: Extract each distinct obligation, deliverable, exclusion, assumption, dependency, or milestone as its OWN item. NEVER merge multiple distinct items into one.
+   - NEVER combine adjacent bullet points, numbered items, or list entries into a single item. Each bullet point or numbered item represents an independent requirement and must be extracted separately:
+     * News sections vs Footer sections must remain separate items.
+     * Editing vs Deleting capabilities must remain separate items.
+     * Viewing vs Downloading capabilities or permissions must remain separate items.
+     * Posting vs Viewing access controls must remain separate items.
+     * Training compliance reporting vs Creating and assigning training must remain separate items.
+     * In-application activity notifications vs Email notifications must remain separate items.
+          * Knowledge transfer vs Post-go-live support and handover must remain separate items.
+      * Cloud hosting vs Internet access commitments must remain separate items.
+      * Seeing/viewing applicant details vs Recommending an applicant vs Rejecting an applicant must remain separate items.
+      * Viewing job requisition summary details vs Applying for a job must remain separate items.
+      * UAT execution vs Training / communication activities must remain separate items.
+      * Employee-specific / internal learning vs External learning must remain separate items.
+      * Unit testing vs Integration testing vs User Acceptance testing responsibilities must remain separate items (e.g. "Perform Unit testing, Integration testing and User Acceptance testing" contains THREE distinct testing activities; extract each testing activity as its OWN item, preserving the responsible role).
+2. WORKSTREAM & MODULE IDENTITY PRESERVATION: When extracting deliverables or milestones from structured tables or document sections organized under distinct workstream headers, module headers, or sub-table rows (e.g., table section rows dividing different workstreams or products), the candidate "name" or "description" MUST capture the workstream or component context (e.g. "Employee Collaboration - Implement & UAT Deployment" vs "Internal Job Posting - Implement & UAT Deployment"). Distinct workstream items MUST NOT receive identical ambiguous names that conceal their parent workstream.
+3. NEVER group distinct testing or deployment phases (e.g. SIT, UAT, Production) into a single item. They MUST be separate items.
+4. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one item, and do not group distinct features like "audit logs" and "SSO" into one "Security" item).
+5. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST be extracted as its own distinct item.
+6. PHASE & CONTEXT ACCURACY: Do NOT emit phase-specific candidate names (e.g. "Construct - ..." or "Implementation - ...") unless the source text explicitly places that statement under that specific phase header. Do NOT duplicate an activity under different phase labels if it appears only once in the source excerpt.
+7. "name" MUST be a short label (<= 60 characters). Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the name.
+8. "description" MUST be the faithful sentence or clause the item was taken from. Do NOT append hypothetical implementation details or concatenate adjacent sentences.
+9. "source_section" MUST be exactly one of: "Functional Scope", "Technical Scope", "Methodology", "Governance", "Support", "Acceptance", "Resources", "Scope of Work", "Deliverables", "Responsibilities", "Client Responsibilities", "Out of Scope", "Assumptions", "Dependencies", "Milestones", "Recurring Commitments", "General".
+10. If the excerpt contains no scope-related content, return an empty array [].
+11. Do NOT invent items that are not present in the excerpt.
+12. "is_pure_milestone" MUST be true if the item is purely a project phase, timeline event, or deadline (e.g., 'Kickoff', 'UAT', 'Go-Live'). Otherwise false.
+13. If ANY item (milestone, deliverable, or responsibility) has an explicitly stated date, deadline, schedule, duration, or payment percentage in the text, you MUST include that exact information in its "description".
 
 Output STRICTLY as a JSON ARRAY and nothing else (no markdown, no prose):
 [
@@ -971,20 +987,38 @@ Candidate items:
 Task:
 1. Merge duplicates and near-duplicates that refer to the EXACT SAME underlying item across overlapping excerpts into a single entry. Keep the clearest "name" and the most complete "description".
 2. Do NOT merge genuinely distinct items, even if they share a long common prefix or general feature area:
+   - WORKSTREAM & SUB-MODULE MILESTONES MUST NEVER BE MERGED:
+     * Never merge milestones, deliverables, or obligations belonging to different workstreams, modules, or sub-components, even if they share identical milestone names (e.g. "Implement & UAT Deployment") or adjacent dates. Keep each workstream's milestone as a distinct item.
+     * NEVER synthesize or combine distinct dates from different workstreams into a single composite milestone with notes like "(also noted as ...)"; preserve each workstream's milestone with its own distinct date.
    - ACTION CONTRASTS MUST BE PRESERVED:
+     * Viewing access control vs Downloading access control / lists (e.g. "Admin View - Applicant List" vs "Admin View - Download Applicants List" or "View Job Access Control" vs "Download Job Requisitions" are distinct capabilities; KEEP BOTH).
      * Posting access control vs Viewing access control (e.g. "Job Requisition Access Control - Post" and "Job Requisition Access Control - View" are distinct permissions; KEEP BOTH).
-     * Downloading job requisition lists vs Downloading applicant lists (different datasets; KEEP BOTH).
+     * Editing a job requisition vs Deleting a job requisition (e.g. "Edit Job Requisition" vs "Delete Job Requisition" are distinct operations; KEEP BOTH).
+     * Tracking/Reporting compliance vs Creating/Assigning training (e.g. "Training Compliance Reports" vs "Create & Assign Training"; KEEP BOTH).
      * Approving/rejecting a job requisition vs Recommending/rejecting an applicant (different operations; KEEP BOTH).
+     * Seeing/viewing applicant details vs Recommending an applicant vs Rejecting an applicant (distinct actions; KEEP ALL).
+     * Seeing/viewing job requisition summary details vs Applying for a job requisition (distinct actions; KEEP BOTH).
+     * Unit testing vs Integration testing vs User Acceptance testing responsibilities (e.g. "Unit testing", "Integration testing", and "User Acceptance testing" are distinct testable activities; NEVER merge them into a single generic testing item; KEEP ALL THREE).
+     * UAT execution vs Training / communication activities (e.g. "Execute UAT" vs "Execute training/communication" are distinct obligations; KEEP BOTH).
      * UAT Execution vs UAT Sign-off (different workflow milestones; KEEP BOTH).
      * Production Deployment vs Production Cutover (different activities; KEEP BOTH).
-     * Training Creation vs Training Assignment (different administrative functions; KEEP BOTH).
+     * Knowledge transfer vs Post-go-live support / handover (different contractual obligations; KEEP BOTH).
+     * Cloud hosting vs Internet access commitments (different technical commitments; KEEP BOTH).
+   - ENTITY & EXPENSE CONTRASTS MUST BE PRESERVED:
+     * Employee-specific / internal learning sections vs External learning sections (different target scopes/entities; KEEP BOTH).
+     * News sections vs Footer sections (distinct page components; KEEP BOTH).
+     * In-application activity notifications vs Email notifications (distinct communication channels; KEEP BOTH).
+     * Airfare reimbursement vs Rail/road travel expenses (distinct expense categories; KEEP BOTH).
+   - CONDITIONAL & NUMERIC THRESHOLD CONTRASTS MUST BE PRESERVED:
+     * Never merge clauses or obligations that specify different timeframes, delay thresholds, durations, or numerical conditions (e.g. delays of 2 weeks vs delays of 4 weeks, or notice of 30 days vs notice of 60 days). They are distinct contractual obligations or escalation tiers; KEEP BOTH.
+     * Never merge operational rights/allowances (e.g. permission to work remotely) with liability/breach exemptions (e.g. waiver of delay penalties or breach of contract claims); KEEP BOTH as distinct obligations.
 3. NEVER summarize, roll-up, or group distinct bullet points into generic categories (e.g., do not group distinct out-of-scope exclusions into one 'Out of Scope Exclusions' item, and do not group distinct features like "audit logs" and "user management" into one "Security" item). Every distinct line item from the contract must remain a distinct item.
 4. NEVER group multiple project phases or milestones from a timeline table into a single item. Each phase/milestone (e.g. 'Kickoff', 'Solution Design', 'Go-Live') MUST remain a distinct item.
 5. Do NOT add prefixes like "Exclude:", "Out of Scope:", or "Deliverable:" to the "name".
 6. When merging, keep the most specific non-"General" "source_section".
 7. Do NOT classify items as in-scope or out-of-scope.
 8. Keep the "is_pure_milestone" flag as true if the item is purely a project phase or timeline event.
-9. If ANY item has a date, deadline, or schedule in its description, you MUST retain it in the merged "description".
+9. If ANY item has an explicit date, deadline, duration, or schedule in its description, you MUST retain it in the merged "description". NEVER overwrite or discard explicit contractual dates.
 
 Output STRICTLY as a JSON ARRAY of the consolidated items and nothing else (no markdown, no prose):
 [
