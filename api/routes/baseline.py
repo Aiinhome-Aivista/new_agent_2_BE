@@ -448,6 +448,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 run_id=run_id,
                 timestamp_str=timestamp_str,
                 logs_dir=logs_dir,
+                index_to_chunk={i: c.get("text", "") for i, c in enumerate(chunks)},
             )
 
             conn = get_valid_db_conn()

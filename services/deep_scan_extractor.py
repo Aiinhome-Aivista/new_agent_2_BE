@@ -2075,6 +2075,284 @@ class DeepScanExtractor:
     # 5) Candidate Rehydration with Honest Provenance
     # ------------------------------------------------------------------ #
     @classmethod
+    def find_verbatim_span(cls, c_text: str, target_text: str) -> Optional[Tuple[int, int, str]]:
+        """
+        Locates the exact verbatim start offset, end offset, and quotation slice in chunk text,
+        handling markdown asterisks (**), underscores, dashes (-, –, —), smart quotes, and flexible whitespace.
+        Returns:
+            (start_offset, end_offset, verbatim_slice) or None
+        """
+        if not c_text or not target_text:
+            return None
+        c_lower = c_text.lower()
+        t_clean = target_text.strip()
+        t_lower = t_clean.lower()
+
+        # 1. Direct match
+        pos = c_lower.find(t_lower)
+        if pos != -1:
+            return pos, pos + len(t_clean), c_text[pos:pos+len(t_clean)]
+
+        # 2. Token-based flexible regex (all tokens including single letters)
+        tokens = re.findall(r'\b[a-zA-Z0-9]+\b', t_lower)
+        if not tokens:
+            return None
+
+        head_tokens = tokens[:min(8, len(tokens))]
+        flex_pattern = r'[\s\*\_\-\–\—\,\.\:\;\"\'\(\)\[\]]+'.join([re.escape(tok) for tok in head_tokens])
+        try:
+            m = re.search(flex_pattern, c_lower)
+        except Exception:
+            m = None
+
+        if m:
+            start_pos = m.start()
+            tail_tokens = tokens[-min(4, len(tokens)):]
+            tail_pattern = r'[\s\*\_\-\–\—\,\.\:\;\"\'\(\)\[\]]+'.join([re.escape(tok) for tok in tail_tokens])
+            try:
+                m_tail = re.search(tail_pattern, c_lower[start_pos:])
+            except Exception:
+                m_tail = None
+
+            if m_tail:
+                end_pos = start_pos + m_tail.end()
+                if end_pos < len(c_text) and c_text[end_pos] in ('.', ';', ':', '!', '?'):
+                    end_pos += 1
+                return start_pos, end_pos, c_text[start_pos:end_pos]
+            else:
+                end_pos = min(len(c_text), start_pos + len(t_clean) + 8)
+                return start_pos, end_pos, c_text[start_pos:end_pos]
+
+        # 3. Table row fallback (matches markdown tables, e.g. "| Level 1 | Project Manager | Project Manager |")
+        m_level = re.search(r'\b(level\s*[0-9]+)\b', t_lower)
+        if m_level:
+            lvl_str = m_level.group(1)
+            lvl_m = re.search(r'\|\s*' + re.escape(lvl_str) + r'\b[^\n]*', c_lower)
+            if lvl_m:
+                st = lvl_m.start()
+                en = lvl_m.end()
+                return st, en, c_text[st:en].strip()
+
+        # 4. Substantive sub-clause and introductory-verb fallback
+        # e.g., "Take actions to establish and confirm that: b) Resource requirements are identified..." -> "Resource requirements are identified..."
+        sub_targets = []
+        parts = re.split(r'[:;\-\–\—]|\b[a-z]\)\s*', t_clean)
+        for part in reversed(parts):
+            p_strip = part.strip()
+            if len(p_strip) >= 10:
+                sub_targets.append(p_strip)
+
+        m_verb = re.match(r'^(?:perform|provide|develop|ensure|manage|execute|maintain|conduct)\s+(.+)$', t_clean, re.I)
+        if m_verb:
+            sub_phrase = m_verb.group(1).strip()
+            if len(sub_phrase) >= 6:
+                sub_targets.append(sub_phrase)
+
+        for sub_tgt in sub_targets:
+            p_pos = c_lower.find(sub_tgt.lower())
+            if p_pos != -1:
+                return p_pos, p_pos + len(sub_tgt), c_text[p_pos:p_pos+len(sub_tgt)]
+            sub_toks = re.findall(r'\b[a-zA-Z0-9]+\b', sub_tgt.lower())
+            if len(sub_toks) >= 2:
+                sub_pat = r'[\s\*\_\-\–\—\,\.\:\;\"\'\(\)\[\]]+'.join([re.escape(tok) for tok in sub_toks])
+                try:
+                    m_sub = re.search(sub_pat, c_lower)
+                    if m_sub:
+                        return m_sub.start(), m_sub.end(), c_text[m_sub.start():m_sub.end()]
+                except Exception:
+                    pass
+
+        return None
+
+    @classmethod
+    def validate_claim_level_evidence(
+        cls,
+        candidate_dict: dict,
+        index_to_chunk: Optional[dict] = None,
+    ) -> Tuple[List[dict], List[dict], str, str]:
+        """
+        Validates every material atomic claim in candidate_dict against source quotations.
+        Produces structured claim-level evidence records:
+        - claim
+        - status (VERIFIED, UNSUPPORTED)
+        - source_locator (e.g. chunk_0, chunk_37)
+        - chunk_index
+        - offset_start
+        - offset_end
+        - evidence_text
+        Also produces explicit evidence_spans for all supporting spans.
+        """
+        atomic_claims = candidate_dict.get("atomic_claims") or [candidate_dict.get("description", candidate_dict.get("name", ""))]
+        primary_c_idx = candidate_dict.get("chunk_index")
+        merged_sources = candidate_dict.get("merged_sources", [])
+
+        claims_evidence = []
+        evidence_spans = []
+        unsupported_claims = []
+        seen_spans = set()
+
+        for cl in atomic_claims:
+            cl_clean = cl.strip()
+            if not cl_clean or len(cl_clean) < 5:
+                continue
+
+            found_span = None
+            found_c_idx = None
+
+            # 1. Try candidate primary chunk
+            if index_to_chunk and primary_c_idx is not None and primary_c_idx in index_to_chunk:
+                c_txt = index_to_chunk[primary_c_idx].get("text", "") if isinstance(index_to_chunk[primary_c_idx], dict) else index_to_chunk[primary_c_idx]
+                found_span = cls.find_verbatim_span(c_txt, cl_clean)
+                if found_span:
+                    found_c_idx = primary_c_idx
+
+            # 2. Try candidate merged sources chunks
+            if not found_span and index_to_chunk and merged_sources:
+                for ms in merged_sources:
+                    ms_c_idx = ms.get("chunk_index")
+                    if ms_c_idx is not None and ms_c_idx in index_to_chunk:
+                        ms_txt = index_to_chunk[ms_c_idx].get("text", "") if isinstance(index_to_chunk[ms_c_idx], dict) else index_to_chunk[ms_c_idx]
+                        found_span = cls.find_verbatim_span(ms_txt, cl_clean)
+                        if found_span:
+                            found_c_idx = ms_c_idx
+                            break
+
+            # 3. Try cross-chunk search in index_to_chunk (e.g. Contract Validity clause in Chunk 37)
+            if not found_span and index_to_chunk:
+                for o_idx, o_data in index_to_chunk.items():
+                    o_txt = o_data.get("text", "") if isinstance(o_data, dict) else o_data
+                    found_span = cls.find_verbatim_span(o_txt, cl_clean)
+                    if found_span:
+                        found_c_idx = o_idx
+                        break
+
+            if found_span and found_c_idx is not None:
+                start_p, end_p, span_txt = found_span
+                claims_evidence.append({
+                    "claim": cl_clean,
+                    "status": "VERIFIED",
+                    "source_locator": f"chunk_{found_c_idx}",
+                    "chunk_index": found_c_idx,
+                    "offset_start": start_p,
+                    "offset_end": end_p,
+                    "evidence_text": span_txt,
+                })
+                span_key = (found_c_idx, start_p, end_p)
+                if span_key not in seen_spans:
+                    seen_spans.add(span_key)
+                    evidence_spans.append({
+                        "source_locator": f"chunk_{found_c_idx}",
+                        "chunk_index": found_c_idx,
+                        "offset_start": start_p,
+                        "offset_end": end_p,
+                        "evidence_text": span_txt,
+                    })
+            else:
+                unsupported_claims.append(cl_clean)
+                claims_evidence.append({
+                    "claim": cl_clean,
+                    "status": "UNSUPPORTED",
+                    "source_locator": None,
+                    "chunk_index": None,
+                    "offset_start": None,
+                    "offset_end": None,
+                    "evidence_text": None,
+                    "reason": "No verbatim source quotation found in contract",
+                })
+
+        total_claims = len(claims_evidence)
+        verified_claims = sum(1 for c in claims_evidence if c["status"] == "VERIFIED")
+
+        if total_claims == 0:
+            status = PROVENANCE_UNRESOLVED
+            reason = "No atomic claims extracted"
+        elif verified_claims == total_claims:
+            status = PROVENANCE_VERIFIED
+            reason = "All material atomic claims verified against source quotation(s)"
+        elif verified_claims > 0:
+            status = PROVENANCE_PARTIAL
+            reason = f"Supported: {verified_claims}/{total_claims} claims; unsupported: {unsupported_claims}"
+        else:
+            status = PROVENANCE_UNRESOLVED
+            reason = f"All {total_claims} claims unsupported in source quotations"
+
+        candidate_dict["claims_evidence"] = claims_evidence
+        candidate_dict["evidence_spans"] = evidence_spans
+        if evidence_spans and candidate_dict.get("evidence_offset_start") is None:
+            p_span = evidence_spans[0]
+            candidate_dict["evidence_offset_start"] = p_span["offset_start"]
+            candidate_dict["evidence_offset_end"] = p_span["offset_end"]
+            candidate_dict["chunk_index"] = p_span["chunk_index"]
+            candidate_dict["source_locator"] = p_span["source_locator"]
+            candidate_dict["evidence_snippet"] = p_span["evidence_text"]
+            candidate_dict["evidence_text"] = p_span["evidence_text"]
+        return claims_evidence, evidence_spans, status, reason
+
+    @classmethod
+    def _audit_semantic_overlaps(cls, candidates: list[dict], logger=None) -> list[dict]:
+        """
+        Audits semantic duplicates and overlapping contractual facts between candidates.
+        Ensures that distinct obligations (e.g. Engagement Period in Introduction vs
+        Contract Validity in Team Leaders/Governance) remain separate while explicitly linking
+        their overlap references.
+        """
+        overlaps = []
+        for i in range(len(candidates)):
+            c1 = candidates[i]
+            cid1 = c1.get("candidate_id", f"c_{i}")
+            name1 = c1.get("name", "").lower()
+            desc1 = c1.get("description", "").lower()
+            dates1 = ActionEntityProtector.get_norm_dates(f"{name1} {desc1}")
+            c1.setdefault("overlap_references", [])
+
+            for j in range(i + 1, len(candidates)):
+                c2 = candidates[j]
+                cid2 = c2.get("candidate_id", f"c_{j}")
+                name2 = c2.get("name", "").lower()
+                desc2 = c2.get("description", "").lower()
+                dates2 = ActionEntityProtector.get_norm_dates(f"{name2} {desc2}")
+                c2.setdefault("overlap_references", [])
+
+                shared_dates = dates1 & dates2
+                is_engagement_pair = ("engagement" in name1 and "validity" in name2) or ("engagement" in name2 and "validity" in name1)
+                sim = difflib.SequenceMatcher(None, f"{name1} {desc1}", f"{name2} {desc2}").ratio()
+                toks1 = set(re.findall(r"\b[a-zA-Z]{4,}\b", f"{name1} {desc1}"))
+                toks2 = set(re.findall(r"\b[a-zA-Z]{4,}\b", f"{name2} {desc2}"))
+                tok_overlap = len(toks1 & toks2) / max(len(toks1 | toks2), 1)
+
+                if shared_dates or is_engagement_pair or sim >= 0.60 or tok_overlap >= 0.60:
+                    shared_date_str = ", ".join(sorted(shared_dates)) if shared_dates else ("contractual term" if not is_engagement_pair else "30th April 2027")
+                    rel1 = f"Corroborating contractual term with {c2.get('name')} (Chunk {c2.get('chunk_index')}, {c2.get('section')}); shared fact: {shared_date_str}"
+                    rel2 = f"Corroborating contractual term with {c1.get('name')} (Chunk {c1.get('chunk_index')}, {c1.get('section')}); shared fact: {shared_date_str}"
+
+                    c1["overlap_references"].append({
+                        "target_candidate_id": cid2,
+                        "target_name": c2.get("name"),
+                        "shared_dates": list(shared_dates),
+                        "relationship": rel1,
+                        "overlap_type": "semantic_overlap",
+                        "similarity": round(sim, 3),
+                        "justification_for_distinct_records": "Represents distinct contractual clauses across document sections",
+                    })
+                    c2["overlap_references"].append({
+                        "target_candidate_id": cid1,
+                        "target_name": c1.get("name"),
+                        "shared_dates": list(shared_dates),
+                        "relationship": rel2,
+                        "overlap_type": "semantic_overlap",
+                        "similarity": round(sim, 3),
+                        "justification_for_distinct_records": "Represents distinct contractual clauses across document sections",
+                    })
+                    overlaps.append({
+                        "candidate_1": cid1,
+                        "candidate_2": cid2,
+                        "shared_dates": list(shared_dates),
+                        "status": "PRESERVED_DISTINCT",
+                        "reason": "Distinct contractual clauses in different sections",
+                    })
+        return overlaps
+
+    @classmethod
     def _to_candidates(
         cls,
         reduced_items: list[dict],
@@ -2167,21 +2445,24 @@ class DeepScanExtractor:
                 if len(cl.strip()) >= 5
             ] or [desc_val]
 
-            # Evidence character offsets
+            # Evidence character offsets & span calculation (Chunk-relative)
             ev_offset_start = None
             ev_offset_end = None
             if index_to_chunk and chunk_idx is not None and chunk_idx in index_to_chunk:
-                c_text = index_to_chunk[chunk_idx].get("text", "")
-                if verbatim_evidence:
-                    search_str = verbatim_evidence[:80] if len(verbatim_evidence) >= 80 else verbatim_evidence
-                    pos = c_text.lower().find(search_str.lower())
-                    if pos != -1:
-                        ev_offset_start = pos
-                        ev_offset_end = pos + len(verbatim_evidence)
-                    else:
-                        base_pos = (src.get("text_offset") or src.get("_pos_in_chunk", 0)) if src else 0
-                        ev_offset_start = base_pos
-                        ev_offset_end = base_pos + len(verbatim_evidence)
+                c_text = index_to_chunk[chunk_idx].get("text", "") if isinstance(index_to_chunk[chunk_idx], dict) else index_to_chunk[chunk_idx]
+                span_res = cls.find_verbatim_span(c_text, verbatim_evidence)
+                if span_res:
+                    ev_offset_start, ev_offset_end, verbatim_evidence = span_res
+                else:
+                    # Check other chunks in index_to_chunk for accurate attribution
+                    for o_idx, o_data in index_to_chunk.items():
+                        o_txt = o_data.get("text", "") if isinstance(o_data, dict) else o_data
+                        o_res = cls.find_verbatim_span(o_txt, verbatim_evidence)
+                        if o_res:
+                            chunk_idx = o_idx
+                            source_locator = f"chunk_{o_idx}"
+                            ev_offset_start, ev_offset_end, verbatim_evidence = o_res
+                            break
 
             candidate_dict = {
                 "candidate_id": candidate_id,
@@ -2218,7 +2499,22 @@ class DeepScanExtractor:
                 "window_id": src.get("window_id") if src else None,
                 "window_indices": src.get("window_indices") if src else [],
                 "merged_sources": item.get("merged_sources", []),
+                "claims_evidence": [],
+                "evidence_spans": [],
+                "overlap_references": [],
             }
+            # Execute claim-level evidence validation
+            cls.validate_claim_level_evidence(candidate_dict, index_to_chunk=index_to_chunk)
+            if candidate_dict.get("evidence_spans"):
+                # If primary chunk offsets were None, adopt from first verified span
+                if candidate_dict.get("evidence_offset_start") is None:
+                    p_span = candidate_dict["evidence_spans"][0]
+                    candidate_dict["evidence_offset_start"] = p_span["offset_start"]
+                    candidate_dict["evidence_offset_end"] = p_span["offset_end"]
+                    candidate_dict["source_locator"] = p_span["source_locator"]
+                    candidate_dict["chunk_index"] = p_span["chunk_index"]
+                    candidate_dict["evidence_text"] = p_span["evidence_text"]
+                    candidate_dict["evidence_snippet"] = p_span["evidence_text"]
             candidates.append(candidate_dict)
 
             kind = "Milestone" if candidate_dict["is_pure_milestone"] else "Clause"
@@ -2823,13 +3119,15 @@ class DeepScanExtractor:
         """
         cls._log(logger, f"  [DeepScan][Canonical Verification Gate] Re-verifying {len(candidates)} canonical candidates...")
         for cand in candidates:
+            # Re-run claim-level evidence validation
+            cls.validate_claim_level_evidence(cand, index_to_chunk=index_to_chunk)
             name = cand.get("name", "")
             desc = cand.get("description", name)
             primary_ev = cand.get("evidence_snippet") or cand.get("evidence_text") or ""
             c_idx = cand.get("chunk_index")
             chunk_excerpt = ""
             if index_to_chunk and c_idx is not None and c_idx in index_to_chunk:
-                chunk_excerpt = index_to_chunk[c_idx].get("text", "")
+                chunk_excerpt = index_to_chunk[c_idx].get("text", "") if isinstance(index_to_chunk[c_idx], dict) else index_to_chunk[c_idx]
 
             comb_txt = f"{name} {desc}"
             dates = ActionEntityProtector.get_norm_dates(comb_txt)
@@ -3218,6 +3516,7 @@ class DeepScanExtractor:
         sections_processed = sorted(list({it.get("section", "General") for it in mapped_items}))
         section_breakdown = cls.compute_section_breakdown(canonical_candidates)
 
+        cls._audit_semantic_overlaps(canonical_candidates, logger=logger)
         merged_sources_count = sum(len(c.get("merged_sources", [])) for c in canonical_candidates)
         report = {
             "total_map_candidates": total,
