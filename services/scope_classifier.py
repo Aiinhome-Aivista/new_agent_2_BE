@@ -28,21 +28,24 @@ class ScopeClassifier:
     @classmethod
     def _apply_section_failsafe(cls, candidate: dict, original_scope_type: str = "UNCERTAIN", original_conf: float = 0.0, original_evidence: str = ""):
         cand_section = candidate.get("section", "General")
-        step3_ev = candidate.get("evidence_text") or candidate.get("evidence_snippet")
+        step3_ev = candidate.get("evidence_snippet") or candidate.get("evidence_text")
         if cand_section in cls.OUT_OF_SCOPE_SECTIONS:
             candidate["scope_type"] = "OUT_OF_SCOPE"
             candidate["confidence"] = 0.95
-            candidate["evidence_text"] = step3_ev or f"Item explicitly specified under '{cand_section}' section of the contract."
+            if not candidate.get("evidence_snippet"):
+                candidate["evidence_snippet"] = step3_ev or f"Item explicitly specified under '{cand_section}' section of the contract."
             candidate["classification_evidence"] = f"Item explicitly specified under '{cand_section}' section of the contract."
         elif cand_section in cls.IN_SCOPE_SECTIONS:
             candidate["scope_type"] = "IN_SCOPE"
             candidate["confidence"] = 0.90
-            candidate["evidence_text"] = step3_ev or f"Item specified under '{cand_section}' section of the contract."
+            if not candidate.get("evidence_snippet"):
+                candidate["evidence_snippet"] = step3_ev or f"Item specified under '{cand_section}' section of the contract."
             candidate["classification_evidence"] = f"Item specified under '{cand_section}' section of the contract."
         else:
             candidate["scope_type"] = original_scope_type
             candidate["confidence"] = original_conf
-            candidate["evidence_text"] = step3_ev or original_evidence or "No specific supporting evidence found in the contract."
+            if not candidate.get("evidence_snippet"):
+                candidate["evidence_snippet"] = step3_ev or original_evidence or "No specific supporting evidence found in the contract."
             candidate["classification_evidence"] = original_evidence or "No specific supporting evidence found in the contract."
 
     @classmethod
@@ -296,7 +299,9 @@ class ScopeClassifier:
                     else:
                         candidate_ref["scope_type"] = scope_type
                         candidate_ref["confidence"] = confidence
-                        candidate_ref["evidence_text"] = evidence_text
+                        candidate_ref["classification_evidence"] = evidence_text
+                        if not candidate_ref.get("evidence_snippet"):
+                            candidate_ref["evidence_snippet"] = candidate_ref.get("evidence_text")
             except Exception as e:
                 print(f"Failed to classify batch {i}: {e}")
                 for item in batch_slice:

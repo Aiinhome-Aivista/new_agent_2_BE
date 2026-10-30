@@ -28,12 +28,17 @@ class DocumentRepository:
         cursor.close()
         return docs
 
+    _master_doc_types_cache: Optional[List[Dict[str, Any]]] = None
+
     @staticmethod
     def get_master_document_types(db: mysql.connector.connection.MySQLConnection) -> List[Dict[str, Any]]:
+        if DocumentRepository._master_doc_types_cache is not None:
+            return DocumentRepository._master_doc_types_cache
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT name, label, description FROM master_document_types")
         types = cursor.fetchall()
         cursor.close()
+        DocumentRepository._master_doc_types_cache = types
         return types
 
     @staticmethod

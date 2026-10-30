@@ -58,9 +58,8 @@ class ScopeSectionDetector:
                 r"(?:"
                 r"client\s+(?:responsibilit(?:y|ies)|obligations?|prerequisites?)"
                 r"|customer\s+(?:responsibilit(?:y|ies)|obligations?)"
-                r"|gl\s+responsibilit(?:y|ies)"
-                r"|responsibilit(?:y|ies):\s*(?:gl|client|customer)"
-                r"|(?:gl|client|customer)\s+responsibilit(?:y|ies)"
+                r"|responsibilit(?:y|ies):\s*(?:client|customer|your|[a-z0-9_\-]+)"
+                r"|(?:client|customer|your|[a-z0-9_\-]+)\s+responsibilit(?:y|ies)"
                 r"|client\s+(?:inputs?|dependencies|will\s+provide)"
                 r"|client\s+obligations"
                 r")",
@@ -82,6 +81,7 @@ class ScopeSectionDetector:
                 r"|description\s+of\s+responsibilities"
                 r"|responsibilit(?:y|ies):?\s*(?:our|vendor|service\s+provider|consultant|[a-z0-9_\s]+)"
                 r"|responsibilit(?:y|ies)\b"
+                r"|appendix\s*[\-\–\—\s\ufffd]*1\b"
                 r")",
                 re.MULTILINE,
             ),
@@ -256,9 +256,10 @@ class ScopeSectionDetector:
                 r"|governance\s+structure"
                 r"|project\s+organisation\s+structure"
                 r"|reporting\s+cadence"
-                r"|(?:your\s+|google\s+)?project\s+manager"
-                r"|(?:your\s+|google\s+)?project\s+director"
+                r"|(?:your|our|client|vendor|[a-z0-9_\-]+)?\s*project\s+manager"
+                r"|(?:your|our|client|vendor|[a-z0-9_\-]+)?\s*project\s+director"
                 r"|team\s+leaders?"
+                r"|on\s+[a-z0-9\s'\.\-_]+\s+side:?"
                 r")",
                 re.MULTILINE,
             ),
@@ -431,6 +432,17 @@ class ScopeSectionDetector:
         """
         clean_header = re.sub(r"^[#\*\-\s\d\.\ :]+", "", heading_text).strip()
         
+        # Explicit handling for specific EL contact / signatory sections and appendices
+        h_norm = re.sub(r"[\ufffd\u2018\u2019\u201c\u201d]", "'", heading_text)
+        h_norm = re.sub(r"[\u2013\u2014]", "-", h_norm).lower().strip()
+        # Contact notice blocks under "Designated Contact Persons for Parties to the Agreement":
+        # Contain postal addresses, phone numbers, and email contacts for legal notices — administrative terms belonging to "General"
+        if re.search(r"\bon\s+[a-z0-9\s'\.\-_]+\s+side:?", h_norm):
+            return "General", 1.0
+        # Appendix 1: "Project Organization and Roles & Responsibilities:"
+        if re.search(r"\bappendix\s*[\-\s]*1\b", h_norm):
+            return "Responsibilities", 1.0
+
         for section_name, pattern in cls.SECTION_PATTERNS:
             if pattern.search(heading_text) or (clean_header and pattern.search(clean_header)):
                 return section_name, 1.0

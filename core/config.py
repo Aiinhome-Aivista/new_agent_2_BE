@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     
     API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8000
+    API_PORT: int = 8080
     API_PREFIX: str = "/api"
     
     FRONTEND_ORIGIN: str = "*"
@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     EVAL_AUTO_JUDGE_ONLINE: bool = False
 
     class Config:
-        env_file = ".env"
+        env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
         extra = "ignore"
 
 settings = Settings()

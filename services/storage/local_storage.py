@@ -5,6 +5,20 @@ from core.config import settings
 from .base import BaseStorageProvider
 
 class LocalStorageProvider(BaseStorageProvider):
+    def _resolve_path(self, storage_key: str) -> str:
+        if os.path.exists(storage_key):
+            return storage_key
+        # Check relative to backend directory
+        backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        candidate = os.path.join(backend_dir, storage_key)
+        if os.path.exists(candidate):
+            return candidate
+        # Check relative to current working directory
+        cwd_candidate = os.path.join(os.getcwd(), storage_key)
+        if os.path.exists(cwd_candidate):
+            return cwd_candidate
+        return storage_key
+
     def _get_local_path(self, project_id: int, project_name: str, filename: str) -> str:
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name) if project_name else "Project"
         project_folder = f"{project_id}_{safe_name}"
@@ -35,15 +49,17 @@ class LocalStorageProvider(BaseStorageProvider):
         return storage_key
 
     def delete_file(self, storage_key: str) -> None:
-        if os.path.exists(storage_key):
+        resolved = self._resolve_path(storage_key)
+        if os.path.exists(resolved):
             try:
-                os.remove(storage_key)
-                print(f"[StorageService] Deleted local file: {storage_key}")
+                os.remove(resolved)
+                print(f"[StorageService] Deleted local file: {resolved}")
             except Exception as e:
-                print(f"[StorageService] Warning: Failed to delete local file {storage_key}: {e}")
+                print(f"[StorageService] Warning: Failed to delete local file {resolved}: {e}")
 
     def download_to_temp_file(self, storage_key: str, temp_path: str) -> str:
-        if os.path.exists(storage_key):
-            shutil.copyfile(storage_key, temp_path)
+        resolved = self._resolve_path(storage_key)
+        if os.path.exists(resolved):
+            shutil.copyfile(resolved, temp_path)
             return temp_path
-        raise Exception(f"Local file not found: {storage_key}")
+        raise Exception(f"Local file not found: {storage_key} (checked: {resolved})")
