@@ -1388,14 +1388,23 @@ def get_baseline_versions(project_id: int, current_user: dict = Depends(get_curr
     return {"success": True, "data": baselines}
 
 @router.post("/approve")
-def approve_baseline(project_id: int, current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "ADMIN"])), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
+def approve_baseline(
+    project_id: int,
+    allow_override: bool = Query(False),
+    current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "ADMIN"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
     verify_project_access(project_id, current_user, db)
     
     baseline = BaselineRepository.get_draft_baseline(db, project_id)
     if not baseline:
         raise HTTPException(status_code=404, detail="No draft baseline found")
         
-    BaselineRepository.approve_baseline(db, baseline["id"], current_user["id"])
+    try:
+        BaselineRepository.approve_baseline(db, baseline["id"], current_user["id"], allow_override=allow_override)
+    except ValueError as val_err:
+        raise HTTPException(status_code=422, detail=str(val_err))
+        
     BaselineRepository.update_project_monitoring_status(db, project_id, 'ACTIVE')
     db.commit()
     

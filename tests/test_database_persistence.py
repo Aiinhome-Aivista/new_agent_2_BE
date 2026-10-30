@@ -8,6 +8,10 @@ from services.final_baseline_service import FinalBaselineService
 from repositories.baseline_repository import BaselineRepository
 
 
+TEST_PROJECT_ID = int(os.environ.get("TEST_PROJECT_ID", "126"))
+TEST_DOCUMENT_ID = int(os.environ.get("TEST_DOCUMENT_ID", "264"))
+
+
 @pytest.fixture(scope="module")
 def db_conn():
     conn = get_db_connection()
@@ -24,8 +28,8 @@ def test_persist_draft_baseline_persists_all_canonical_candidates(db_conn):
     4. Persists AI-generated deadlines and provenance on all eligible work items.
     5. Reconciles database readback against the authoritative final baseline artifact.
     """
-    project_id = 124
-    document_id = 262
+    project_id = TEST_PROJECT_ID
+    document_id = TEST_DOCUMENT_ID
 
     res = FinalBaselineService.persist_draft_baseline_to_db(
         db_conn=db_conn,
@@ -57,7 +61,7 @@ def test_database_readback_verification_matches_artifact(db_conn):
     """
     Validates that database readback matches the authoritative JSON artifact.
     """
-    project_id = 124
+    project_id = TEST_PROJECT_ID
     readback = FinalBaselineService.readback_and_verify_persisted_baseline(
         db_conn=db_conn,
         project_id=project_id,
@@ -75,8 +79,8 @@ def test_persistence_idempotency_prevents_duplicate_baselines(db_conn):
     Validates idempotency: Re-executing persistence on an existing draft updates
     the records cleanly without creating duplicate baselines or duplicate scope items.
     """
-    project_id = 124
-    document_id = 262
+    project_id = TEST_PROJECT_ID
+    document_id = TEST_DOCUMENT_ID
 
     # Run persistence twice
     res1 = FinalBaselineService.persist_draft_baseline_to_db(db_conn, project_id, document_id)
@@ -103,7 +107,7 @@ def test_pending_review_items_gated_with_review_status(db_conn):
     Validates that pending review candidates have UNCERTAIN scope_type
     and PENDING_REVIEW approval status in the database.
     """
-    project_id = 124
+    project_id = TEST_PROJECT_ID
     cur = db_conn.cursor(dictionary=True)
     cur.execute(
         "SELECT status_change_tag, scope_type, baseline_approval_status, plan_assumptions "
@@ -127,7 +131,7 @@ def test_milestone_dates_and_dag_dependencies_in_db(db_conn):
     Validates that project_milestones has dated milestones and unresolved dates,
     and milestone_dependencies has valid acyclic edges.
     """
-    project_id = 124
+    project_id = TEST_PROJECT_ID
     cur = db_conn.cursor(dictionary=True)
     cur.execute("SELECT name, planned_date FROM project_milestones WHERE project_id = %s ORDER BY sequence", (project_id,))
     milestones = cur.fetchall()

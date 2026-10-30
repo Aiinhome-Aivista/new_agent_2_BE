@@ -234,9 +234,15 @@ class Step10Inspector:
 
         # ── 6. Risks, Ambiguities, & Initial Contractual Assessment ──
         logger.section("6. Risks and Ambiguities Synthesis")
-        ctr_risks = (initial_risk_assessment.get("risk_items", []) if initial_risk_assessment else [])
         s7_findings = step7_artifact.get("findings", [])
         schedule_conflicts = step8_artifact.get("schedule_conflicts", [])
+        doc_quality_findings = [
+            f for f in s7_findings 
+            if any(k in (f.get("finding_type") or f.get("category") or "").upper() for k in ("TYPO", "SPELLING", "FORMAT"))
+        ]
+        ctr_risks = [f for f in s7_findings if f not in doc_quality_findings]
+        if not ctr_risks and initial_risk_assessment:
+            ctr_risks = initial_risk_assessment.get("risk_items", [])
 
         risks_and_ambiguities = {
             "assessment_label": "INITIAL_CONTRACTUAL_ASSESSMENT",
@@ -364,7 +370,7 @@ class Step10Inspector:
             "risk_metrics": {
                 "initial_contractual_risks": len(ctr_risks),
                 "contractual_risk_count": len(ctr_risks),
-                "document_quality_finding_count": len([f for f in s7_findings if any(k in (f.get("category") or "").upper() for k in ("TYPO", "SPELLING", "FORMAT"))]),
+                "document_quality_finding_count": len(doc_quality_findings),
                 "unresolved_conflicts": len(schedule_conflicts),
                 "schedule_estimate_overrun_count": len([c for c in schedule_conflicts if c.get("conflict_type") == "ESTIMATED_OVERRUN"]),
                 "source_confirmed_contractual_conflict_count": len([c for c in schedule_conflicts if c.get("is_contractual_conflict") is True]),
@@ -442,6 +448,7 @@ class Step10Inspector:
                 "commitment_count": len(commitments),
                 "contractual_risks_count": len(ctr_risks),
                 "contractual_risk_count": len(ctr_risks),
+                "document_quality_finding_count": len(doc_quality_findings),
                 "schedule_estimate_overrun_count": len([c for c in schedule_conflicts if c.get("conflict_type") == "ESTIMATED_OVERRUN"]),
                 "source_confirmed_contractual_conflict_count": len([c for c in schedule_conflicts if c.get("is_contractual_conflict") is True]),
                 "readiness_status": readiness_status,

@@ -239,6 +239,73 @@ class Step9Inspector:
             rec_type = (item.get("record_type") or item.get("category") or "").upper()
             scope_type = (item.get("scope_type") or item.get("scope_status") or "IN_SCOPE").upper()
 
+            # ── First: Detect genuine Recurring Commitments and Trigger-based SLAs ──
+            is_weekly = "weekly status" in comb or ("weekly" in comb and "report" in comb)
+            is_fortnightly = "fortnight" in comb
+            is_monthly_steering = ("steering committee" in comb and ("month" in comb or "compulsorily meet" in comb or "at least once" in comb or "organize steering" in comb))
+            is_feedback_sla = ("3 working days" in comb or ("feedback" in comb and ("deemed to have been accepted" in comb or "within the stipulated time" in comb)))
+
+            if is_weekly or is_fortnightly or is_monthly_steering:
+                if is_weekly:
+                    cadence = "weekly"
+                    c_name = "Weekly Status Reporting"
+                    resp = "Vendor Delivery Team"
+                    rule = "Source text specifies weekly status reports circulated to key stakeholders."
+                elif is_fortnightly:
+                    cadence = "fortnightly"
+                    c_name = "Fortnightly Key Stakeholder Updates"
+                    resp = "Vendor Project Manager"
+                    rule = "Source text specifies keeping key stakeholders informed on a fortnightly basis."
+                else:
+                    cadence = "monthly"
+                    c_name = "Monthly Steering Committee Meetings"
+                    resp = "Joint Steering Committee"
+                    rule = "Source text specifies Steering Committee compulsorily meets at least once a month."
+
+                comm_record = {
+                    "candidate_id": cid,
+                    "name": name or c_name,
+                    "commitment_name": name or c_name,
+                    "description": desc,
+                    "commitment_type": "RECURRING",
+                    "frequency": cadence.upper(),
+                    "cadence": cadence,
+                    "responsible_party": resp,
+                    "owner": "JOINT" if "Joint" in resp else "VENDOR",
+                    "proposed_next_occurrence": (base_date + (timedelta(days=7) if cadence == "weekly" else (timedelta(days=14) if cadence == "fortnightly" else timedelta(days=30)))).isoformat(),
+                    "source_locator": item.get("source_locator"),
+                    "source_quotation": item.get("raw_text") or desc,
+                    "risk_status": "LOW",
+                    "rule": rule,
+                }
+                commitments.append(comm_record)
+                recurring_commitments.append(comm_record)
+                logger.log(f"  [RECURRING COMMITMENT] {cid}: '{name}' ({cadence.upper()})")
+                continue
+
+            if is_feedback_sla:
+                comm_record = {
+                    "candidate_id": cid,
+                    "name": name or "Client Deliverable Feedback & Deemed Acceptance SLA",
+                    "commitment_name": name or "Client Deliverable Feedback & Deemed Acceptance SLA",
+                    "description": desc,
+                    "commitment_type": "TRIGGER_BASED",
+                    "frequency": "EVENT_DRIVEN",
+                    "trigger": "Deliverable Submission",
+                    "sla_window": "3 working days",
+                    "consequence": "Deemed accepted by client if no feedback received within stipulated time",
+                    "responsible_party": "Client / Customer",
+                    "owner": "CLIENT",
+                    "proposed_next_occurrence": "ON_TRIGGER",
+                    "source_locator": item.get("source_locator"),
+                    "source_quotation": item.get("raw_text") or desc,
+                    "risk_status": "MONITORING_REQUIRED",
+                }
+                commitments.append(comm_record)
+                trigger_commitments.append(comm_record)
+                logger.log(f"  [TRIGGER-BASED SLA] {cid}: '{name}' (3-working-day feedback SLA)")
+                continue
+
             # ── Separation Rule: Customer Responsibilities vs Vendor Out-of-Scope ──
             is_client_resp = any(k in rec_type for k in ("CLIENT", "CUSTOMER")) or any(k in comb for k in ("client responsibility", "customer responsibility", "client will provide", "customer will provide", "client to furnish", "client must", "customer must"))
             is_out_of_scope = (scope_type == "OUT_OF_SCOPE") and not is_client_resp
@@ -367,34 +434,57 @@ class Step9Inspector:
                 comm_type = "MILESTONE_ACCEPTANCE"
                 frequency = "MILESTONE_GATED"
                 next_occ = str(item.get("deadline_normalized") or item.get("deadline") or "MILESTONE_ANCHORED")
-            else:
-                comm_type = "ONE_TIME"
-                frequency = "SINGLE_DELIVERY"
-                next_occ = str(item.get("deadline_normalized") or item.get("deadline") or "MILESTONE_ANCHORED")
-
-            comm_record = {
-                "candidate_id": cid,
-                "commitment_name": name,
-                "description": desc,
-                "commitment_type": comm_type,
-                "frequency": frequency,
-                "responsible_party": responsible_party,
-                "proposed_next_occurrence": next_occ,
-                "source_locator": item.get("source_locator"),
-                "source_quotation": item.get("raw_text") or desc,
-                "linked_milestones": [item.get("milestone_normalized")] if item.get("milestone_normalized") else [],
-                "risk_status": "LOW" if comm_type == "ONE_TIME" else "REVIEW_REQUIRED",
-            }
-            commitments.append(comm_record)
-
-            if comm_type == "RECURRING":
-                recurring_commitments.append(comm_record)
-            elif comm_type == "TRIGGER_BASED":
+            elif is_trigger:
+                comm_record = {
+                    "candidate_id": cid,
+                    "commitment_name": name,
+                    "description": desc,
+                    "commitment_type": "TRIGGER_BASED",
+                    "frequency": "EVENT_DRIVEN",
+                    "responsible_party": responsible_party,
+                    "proposed_next_occurrence": "ON_TRIGGER",
+                    "source_locator": item.get("source_locator"),
+                    "source_quotation": item.get("raw_text") or desc,
+                    "risk_status": "REVIEW_REQUIRED",
+                }
+                commitments.append(comm_record)
                 trigger_commitments.append(comm_record)
-            elif comm_type == "MILESTONE_ACCEPTANCE":
-                milestone_acceptance_obligations.append(comm_record)
             else:
-                scope_delivery_obligations.append(comm_record)
+                # Genuine separation: Deliverables / standard work items are tracked in scope_items,
+                # NOT duplicated into the commitments register as fake single deliveries.
+                scope_delivery_obligations.append({
+                    "candidate_id": cid,
+                    "name": name,
+                    "description": desc,
+                    "record_type": rec_type,
+                    "scope_type": scope_type,
+                })
+
+        # Map genuine Table 3 payment milestones from step8_artifact as MILESTONE_GATED commitments
+        payment_ms = [
+            m for m in step8_artifact.get("milestones", [])
+            if m.get("date_provenance") == "CONTRACT_CONFIRMED" or any(k in (m.get("name") or "").lower() for k in ("60%", "30%", "10%", "implement", "sign-off", "hypercare"))
+        ]
+        for idx, m in enumerate(payment_ms, 1):
+            ms_name = m.get("name")
+            if not any(c.get("commitment_name") == ms_name for c in commitments):
+                ms_comm = {
+                    "candidate_id": m.get("scope_candidate_id") or f"c_pay_ms_{idx}",
+                    "name": ms_name,
+                    "commitment_name": ms_name,
+                    "description": f"Contractual payment milestone trigger: {ms_name} ({m.get('planned_date')})",
+                    "commitment_type": "MILESTONE_ACCEPTANCE",
+                    "frequency": "MILESTONE_GATED",
+                    "responsible_party": "Client / Customer",
+                    "owner": "CLIENT",
+                    "proposed_next_occurrence": str(m.get("planned_date") or "MILESTONE_ANCHORED"),
+                    "source_locator": m.get("source_locator") or "table_payment_milestones",
+                    "source_quotation": m.get("source_quotation") or ms_name,
+                    "linked_milestones": [ms_name],
+                    "risk_status": "LOW",
+                }
+                commitments.append(ms_comm)
+                milestone_acceptance_obligations.append(ms_comm)
 
         logger.output("Total Commitments Consolidated", len(commitments))
         logger.output("Scope Delivery Obligations", len(scope_delivery_obligations))

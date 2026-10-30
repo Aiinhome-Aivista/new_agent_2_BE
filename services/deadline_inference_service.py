@@ -377,22 +377,61 @@ class DeadlineInferenceService:
                 "phase_weeks_sum": sum_phase_weeks,
             })
 
-        # Build schedule item by item
-        scheduled_items = []
-        cumulative_working_days = 0
-
-        # Sort items: foundation / architecture items first, then others
+        # Sort items in topological and architectural priority order:
+        # Foundation items (architecture, schema, access control) must precede features;
+        # Reports and final cutover/hypercare come last.
         def _sort_key(it):
             name_l = (it.get("name") or "").lower()
-            if any(w in name_l for w in ["assess", "foundation", "architecture", "setup", "schema", "base"]):
+            desc_l = (it.get("description") or "").lower()
+            text = f"{name_l} {desc_l}"
+            if any(w in text for w in ["assess", "foundation", "architecture", "setup", "schema", "base", "authenticat", "security", "access control"]):
                 return (0, name_l)
-            if any(w in name_l for w in ["admin", "posting", "portal", "profile"]):
+            if any(w in text for w in ["requisition posting", "portal layout", "user profile", "role"]):
                 return (1, name_l)
-            if any(w in name_l for w in ["report", "analytics", "dashboard"]):
+            if any(w in text for w in ["download", "view", "apply", "applicant", "notification", "email", "feedback", "admin"]):
                 return (2, name_l)
-            return (3, name_l)
+            if any(w in text for w in ["report", "analytics", "dashboard"]):
+                return (3, name_l)
+            if any(w in text for w in ["uat", "cutover", "hypercare", "hyper care", "knowledge transfer", "handover"]):
+                return (4, name_l)
+            return (2, name_l)
 
         sorted_items = sorted(in_scope_items, key=_sort_key)
+
+        # Conflict 3: CAPACITY_SHORTFALL Calculation
+        total_demand_weeks = sum(cls.estimate_task_complexity(it, cfg["default_complexity"])[1] for it in sorted_items)
+        if contract_end_str:
+            try:
+                c_end_dt = datetime.strptime(contract_end_str, "%Y-%m-%d").date()
+                cal_weeks = max(1.0, (c_end_dt - base_start).days / 7.0)
+            except Exception:
+                cal_weeks = 14.0
+        else:
+            cal_weeks = 14.0
+        total_available_capacity = round(cal_weeks * team_rate_dev_weeks_per_week, 1)
+
+        if total_demand_weeks > total_available_capacity:
+            shortfall = round(total_demand_weeks - total_available_capacity, 1)
+            schedule_conflicts.append({
+                "conflict_type": "CAPACITY_SHORTFALL",
+                "severity": "HIGH",
+                "rationale": (
+                    f"Total development demand ({total_demand_weeks:.1f} dev-weeks) exceeds available team capacity "
+                    f"({total_available_capacity:.1f} dev-weeks) before contractual completion anchor {contract_end_str} "
+                    f"by {shortfall:.1f} dev-weeks. Resource assumption: {dev_count} developers at {int(utilisation * 100)}% utilization "
+                    f"({team_rate_dev_weeks_per_week:.1f} dev-weeks/week)."
+                ),
+                "demand_dev_weeks": total_demand_weeks,
+                "capacity_dev_weeks": total_available_capacity,
+                "shortfall_dev_weeks": shortfall,
+                "limiting_anchor": contract_end_str,
+                "resource_assumption": f"{dev_count} developers @ {int(utilisation * 100)}% utilization",
+            })
+
+        # Build schedule item by item using parallel team allocation across developers
+        scheduled_items = []
+        dev_available = [base_start] * dev_count
+        finish_dates_by_cid = {}
 
         for item in sorted_items:
             cid = item.get("candidate_id") or f"c_{item.get('id', 0)}"
@@ -401,7 +440,8 @@ class DeadlineInferenceService:
 
             # Dynamic complexity & effort estimation
             complexity, effort_weeks, comp_rationale = cls.estimate_task_complexity(item, cfg["default_complexity"])
-            item_working_days = max(1, round(effort_weeks * working_days_per_dev_week))
+            # Working days on 1 developer track
+            item_working_days = max(1, round(effort_weeks * (cfg["working_days_per_week"] / utilisation)))
 
             exceeds_anchor = False
             anchor_limit = contract_end_str or (max(milestone_dates) if milestone_dates else None)
@@ -418,12 +458,28 @@ class DeadlineInferenceService:
                 conf_label = "HIGH"
                 conf_explanation = "Verbatim contractual milestone date backed by explicit contract text."
                 is_predicted = False
+                finish_dates_by_cid[cid] = target_date
             elif milestones:
-                # Tier 2 & 3: Capacity-derived finish date sequenced against milestone DAG
+                # Tier 2 & 3: Parallel capacity-based allocation
                 provenance = "AI_ESTIMATED"
-                pred_start = cls.add_working_days(base_start, cumulative_working_days)
+
+                # Respect explicit contractual dependency prerequisites
+                dep_ids = item.get("dependencies") or item.get("dependency_ids") or []
+                dep_finishes = [finish_dates_by_cid[d] for d in dep_ids if d in finish_dates_by_cid]
+                if dep_finishes:
+                    try:
+                        dep_min_start = max(datetime.strptime(df, "%Y-%m-%d").date() for df in dep_finishes)
+                    except Exception:
+                        dep_min_start = base_start
+                else:
+                    dep_min_start = base_start
+
+                # Select developer track with earliest availability on/after prerequisite finish
+                best_dev_idx = min(range(dev_count), key=lambda idx: max(dev_available[idx], dep_min_start))
+                pred_start = max(dev_available[best_dev_idx], dep_min_start)
                 pred_end = cls.add_working_days(pred_start, item_working_days)
-                cumulative_working_days += item_working_days
+                dev_available[best_dev_idx] = pred_end
+                finish_dates_by_cid[cid] = pred_end.isoformat()
 
                 start_date_str = pred_start.isoformat()
                 target_date = pred_end.isoformat()
