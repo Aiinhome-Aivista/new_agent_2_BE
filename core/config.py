@@ -81,6 +81,7 @@ class Settings(BaseSettings):
     AWS_S3_AGENT_FOLDER: str = ""
     
     # ── Azure Blob Integration ────────────────────────────────────────────────
+    AZURE_STORAGE_ACCOUNT: str = ""
     AZURE_STORAGE_CONNECTION_STRING: str = ""
     AZURE_CONTAINER_NAME: str = ""
     
