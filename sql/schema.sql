@@ -64,7 +64,9 @@ created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT fk_project_users_user
         FOREIGN KEY (user_id)
         REFERENCES users(id)
-        ON DELETE CASCADE
+        ON DELETE CASCADE,
+
+    KEY idx_project_users_user_proj (user_id, project_id)
 );
 
 CREATE TABLE stakeholders (
@@ -192,7 +194,9 @@ llm_prompt_version VARCHAR(50) NULL,
     CONSTRAINT fk_baseline_document
         FOREIGN KEY (source_document_id)
         REFERENCES documents(id)
-        ON DELETE SET NULL
+        ON DELETE SET NULL,
+
+    KEY idx_scope_baselines_proj_status (project_id, status)
 );
 
 CREATE TABLE scope_items (
@@ -594,6 +598,12 @@ CREATE INDEX idx_alerts_project ON alerts(project_id);
 CREATE INDEX idx_workflow_project ON workflow_runs(project_id);
 CREATE INDEX idx_episodic_project ON episodic_memory(project_id, created_at);
 CREATE INDEX idx_audit_project ON audit_logs(project_id, created_at);
+CREATE INDEX idx_scope_baselines_proj_status ON scope_baselines(project_id, status);
+CREATE INDEX idx_tracker_items_proj_status ON tracker_items(project_id, status);
+CREATE INDEX idx_tracker_items_proj_risk_cat ON tracker_items(project_id, risk_category, status);
+CREATE INDEX idx_tracker_items_source_doc ON tracker_items(source_document_id);
+CREATE INDEX idx_project_users_user_proj ON project_users(user_id, project_id);
+CREATE INDEX idx_risk_eval_project ON risk_evaluations(project_id, id);
 
 CREATE TABLE `alert_rule_config` (
   `severity` varchar(20) NOT NULL,
@@ -808,8 +818,32 @@ CREATE TABLE `tracker_items` (
   `graph_role` varchar(40) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT 'Graph-derived role: ROOT_CAUSE, EXECUTION_BLOCKER, DOWNSTREAM_ACTIVITY, etc.',
   `canonical_id` varchar(40) COLLATE utf8mb4_unicode_ci DEFAULT NULL COMMENT 'Canonical entity ID from EntityResolver registry',
   `risk_severity_score` int DEFAULT NULL COMMENT 'Risk severity score independent of execution_priority_score',
-  PRIMARY KEY (`id`)
+  PRIMARY KEY (`id`),
+  KEY `idx_tracker_items_proj_status` (`project_id`, `status`),
+  KEY `idx_tracker_items_proj_risk_cat` (`project_id`, `risk_category`, `status`),
+  KEY `idx_tracker_items_source_doc` (`source_document_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE OR REPLACE VIEW `risk_tracker_items` AS 
+SELECT 
+    id, 
+    project_id, 
+    source_document_id,
+    item_type,
+    title,
+    title AS deliverable, 
+    title AS name, 
+    status, 
+    risk_score, 
+    risk_level,
+    risk_category,
+    risk_status,
+    execution_status,
+    execution_priority_score, 
+    priority_order,
+    recommended_action, 
+    reasoning 
+FROM tracker_items;
 
 CREATE TABLE `execution_priority_band_config` (
   `band_id` int NOT NULL AUTO_INCREMENT,

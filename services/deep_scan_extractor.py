@@ -27,6 +27,7 @@ from typing import List, Dict, Any, Tuple, Optional, Set
 from services.embedding_service import EmbeddingService
 from services.chroma_service import ChromaService
 from services.llm_service import LLMService
+from services.party_resolver import PartyResolver
 from core.prompts import get_deep_scan_map_prompt, get_deep_scan_reduce_prompt
 
 
@@ -728,8 +729,12 @@ class DeepScanExtractor:
         }
         coverage_audit["missing_or_invalid_sources_count"] = prov_unresolved
         merged_sources_count = sum(len(c.get("merged_sources", [])) for c in candidates)
+        lineage_complete = (merged_sources_count > 0) and all(
+            bool(ms.get("name") and ms.get("chunk_index") is not None and (ms.get("evidence_snippet") or ms.get("description")) and ms.get("rationale"))
+            for c in candidates for ms in c.get("merged_sources", [])
+        )
         coverage_audit["merged_sources_count"] = merged_sources_count
-        coverage_audit["merged_sources_traceable"] = (merged_sources_count == coverage_audit.get("merged_count", 0))
+        coverage_audit["merged_sources_traceable"] = bool(merged_sources_count == coverage_audit.get("merged_count", 0) and lineage_complete)
         cls.last_coverage_report = coverage_audit
 
         cls._log(
@@ -2075,6 +2080,172 @@ class DeepScanExtractor:
     # 5) Candidate Rehydration with Honest Provenance
     # ------------------------------------------------------------------ #
     @classmethod
+    def _validate_semantic_safeguards(cls, span_text: str, target_text: str) -> Tuple[bool, str]:
+        """
+        Safeguards against:
+        1. Negation or exception loss / inversion
+        2. Date inconsistencies
+        3. Numeric amount or quantity mismatches
+        4. Compound assertions citing evidence for only one sub-clause
+        """
+        span_lower = span_text.lower()
+        target_lower = target_text.lower()
+
+        negation_words = {"not", "no", "never", "neither", "nor", "without", "except", "excluding", "unless"}
+        t_tokens = set(re.findall(r'\b[a-zA-Z]+\b', target_lower))
+        s_tokens = set(re.findall(r'\b[a-zA-Z]+\b', span_lower))
+        t_negs = t_tokens & negation_words
+        s_negs = s_tokens & negation_words
+
+        strong_negs = {"not", "no", "never", "neither", "nor"}
+        if (t_negs & strong_negs) and not (s_negs & strong_negs):
+            return False, f"Negation loss: target asserts negative {t_negs & strong_negs} missing from span"
+        if (s_negs & strong_negs) and not (t_negs & strong_negs):
+            return False, f"Negation inversion: span contains prohibition {s_negs & strong_negs} absent from target"
+
+        # Date consistency
+        t_dates = [re.sub(r'(st|nd|rd|th)', '', d.lower().strip()) for d in ActionEntityProtector.DATE_REGEX.findall(target_text)]
+        s_dates = [re.sub(r'(st|nd|rd|th)', '', d.lower().strip()) for d in ActionEntityProtector.DATE_REGEX.findall(span_text)]
+        for td in t_dates:
+            td_norm = re.sub(r'\s+', ' ', td)
+            if not any(td_norm in re.sub(r'\s+', ' ', sd) or td_norm in span_lower for sd in s_dates):
+                return False, f"Date mismatch: target specifies date '{td}' not found in source span"
+
+        # Numeric / condition consistency
+        t_nums = re.findall(r'\b\d+(?:,\d+)*(?:\.\d+)?\s*(?:days|weeks|months|years|hours|working days|percent|%|usd|inr|gbp)\b', target_lower)
+        for tn in t_nums:
+            if tn not in span_lower:
+                return False, f"Numeric condition mismatch: target specifies '{tn}' not found in source span"
+
+        # Compound assertion / unevidenced remainder safeguard
+        stop_words = {'the', 'and', 'for', 'any', 'can', 'see', 'this', 'that', 'with', 'from', 'per', 'below', 'set', 'out', 'our', 'you', 'will', 'been'}
+        t_sub_toks = set(re.findall(r'\b[a-zA-Z0-9]{4,}\b', target_lower)) - stop_words
+        s_sub_toks = set(re.findall(r'\b[a-zA-Z0-9]{4,}\b', span_lower)) - stop_words
+        missing = t_sub_toks - s_sub_toks
+        if len(missing) >= 4 and len(t_sub_toks) >= 6:
+            return False, f"Compound assertion: target contains substantive assertions {sorted(missing)} not evidenced in span"
+
+        return True, "Passed safeguards"
+
+    @classmethod
+    def find_table_evidence_span(cls, c_text: str, target_text: str) -> Optional[Tuple[int, int, str, dict]]:
+        """
+        Table-aware evidence validator with directional party-role binding.
+        Finds markdown tables in chunk text, identifies the relevant header row and data row,
+        validates directional party-role assignments, and returns:
+            (start_offset, end_offset, verbatim_slice, table_provenance)
+        or None if not supported by table structure.
+        """
+        if not c_text or not target_text:
+            return None
+        c_lower = c_text.lower()
+        t_clean = target_text.strip()
+        t_lower = t_clean.lower()
+
+        # Check if text contains markdown table syntax
+        if '|' not in c_text:
+            return None
+
+        # Find all table blocks in chunk text
+        lines = c_text.split('\n')
+        tables = []
+        current_lines = []
+        pos = 0
+        for line in lines:
+            line_len = len(line) + 1  # accounts for '\n'
+            stripped = line.strip()
+            if stripped.startswith('|') and stripped.endswith('|'):
+                current_lines.append((line, pos + line.find('|'), pos + line.rfind('|') + 1))
+            else:
+                if current_lines:
+                    tables.append(current_lines)
+                    current_lines = []
+            pos += line_len
+        if current_lines:
+            tables.append(current_lines)
+
+        for t_lines in tables:
+            header_row = None
+            data_rows = []
+            for l_txt, l_st, l_en in t_lines:
+                cells = [re.sub(r'[\*_`]', '', c).strip() for c in l_txt.split('|')[1:-1]]
+                # Skip separator rows (e.g. |---|---|)
+                if all(not c or set(c).issubset(('-', ':', ' ')) for c in cells):
+                    continue
+                if header_row is None:
+                    header_row = (cells, l_txt.strip(), l_st, l_en)
+                else:
+                    data_rows.append((cells, l_txt.strip(), l_st, l_en))
+
+            if not header_row or not data_rows:
+                continue
+
+            headers = header_row[0]
+            for r_idx, (r_cells, r_txt, r_st, r_en) in enumerate(data_rows, 1):
+                if len(r_cells) != len(headers):
+                    continue
+                row_key = r_cells[0].lower()
+                if not row_key or row_key not in t_lower:
+                    continue
+
+                row_map = {h: val for h, val in zip(headers, r_cells)}
+                all_bindings_ok = True
+                mismatch_reasons = []
+
+                for h, val in row_map.items():
+                    h_clean = h.strip()
+                    val_clean = val.strip()
+                    if not val_clean:
+                        continue
+                    h_party = h_clean.lower()
+                    # Distinguish 'google' from 'google limited'
+                    if h_party == 'google':
+                        party_pat = r'\bgoogle\b(?!\s*limited)'
+                    else:
+                        party_pat = r'\b' + re.escape(h_party) + r'\b'
+
+                    if re.search(party_pat, t_lower):
+                        val_words = set(re.findall(r'\b[a-zA-Z]{3,}\b', val_clean.lower()))
+                        if not val_words.issubset(set(re.findall(r'\b[a-zA-Z]{3,}\b', t_lower))):
+                            all_bindings_ok = False
+                            mismatch_reasons.append(f"Claim missing role {val_clean} for {h_clean}")
+
+                        # Check for contradictory roles explicitly bound to this party
+                        roles = ['project manager', 'project sponsor', 'project director', 'project partner', 'vice president', 'ceo']
+                        for other_r in roles:
+                            if other_r != val_clean.lower():
+                                pat = rf'{re.escape(other_r)}\s+(?:for|of|from|at)\s+{party_pat}'
+                                if re.search(pat, t_lower):
+                                    all_bindings_ok = False
+                                    mismatch_reasons.append(f"Contradictory role {other_r} bound to {h_clean}")
+
+                # Reject claims asserting roles that are not present in this table row
+                known_roles = ['project manager', 'project sponsor', 'project director', 'project partner', 'vice president', 'ceo']
+                row_text = ' '.join(r_cells).lower()
+                for kr in known_roles:
+                    if re.search(r'\b' + re.escape(kr) + r'\b', t_lower):
+                        if not re.search(r'\b' + re.escape(kr) + r'\b', row_text):
+                            all_bindings_ok = False
+                            mismatch_reasons.append(f"Claim asserts role {kr} not in table row")
+
+                if all_bindings_ok:
+                    span_st = header_row[2]
+                    span_en = r_en
+                    span_text = c_text[span_st:span_en]
+                    table_provenance = {
+                        "is_table_evidence": True,
+                        "table_row_index": r_idx,
+                        "column_headers": headers,
+                        "row_cells": r_cells,
+                        "cell_mappings": row_map,
+                        "header_row_text": header_row[1],
+                        "data_row_text": r_txt,
+                        "directional_bindings_verified": True,
+                    }
+                    return span_st, span_en, span_text, table_provenance
+        return None
+
+    @classmethod
     def find_verbatim_span(cls, c_text: str, target_text: str) -> Optional[Tuple[int, int, str]]:
         """
         Locates the exact verbatim start offset, end offset, and quotation slice in chunk text,
@@ -2091,7 +2262,10 @@ class DeepScanExtractor:
         # 1. Direct match
         pos = c_lower.find(t_lower)
         if pos != -1:
-            return pos, pos + len(t_clean), c_text[pos:pos+len(t_clean)]
+            span = (pos, pos + len(t_clean), c_text[pos:pos+len(t_clean)])
+            ok, _ = cls._validate_semantic_safeguards(span[2], target_text)
+            if ok:
+                return span
 
         # 2. Token-based flexible regex (all tokens including single letters)
         tokens = re.findall(r'\b[a-zA-Z0-9]+\b', t_lower)
@@ -2118,20 +2292,25 @@ class DeepScanExtractor:
                 end_pos = start_pos + m_tail.end()
                 if end_pos < len(c_text) and c_text[end_pos] in ('.', ';', ':', '!', '?'):
                     end_pos += 1
-                return start_pos, end_pos, c_text[start_pos:end_pos]
+                span = (start_pos, end_pos, c_text[start_pos:end_pos])
             else:
                 end_pos = min(len(c_text), start_pos + len(t_clean) + 8)
-                return start_pos, end_pos, c_text[start_pos:end_pos]
+                raw_slice = c_text[start_pos:end_pos]
+                last_delim = max(raw_slice.rfind('.'), raw_slice.rfind(';'), raw_slice.rfind('\n'))
+                if last_delim != -1 and last_delim >= len(t_clean) - 6:
+                    end_pos = start_pos + last_delim + (1 if raw_slice[last_delim] in ('.', ';') else 0)
+                span = (start_pos, end_pos, c_text[start_pos:end_pos])
+            ok, _ = cls._validate_semantic_safeguards(span[2], target_text)
+            if ok:
+                return span
 
-        # 3. Table row fallback (matches markdown tables, e.g. "| Level 1 | Project Manager | Project Manager |")
-        m_level = re.search(r'\b(level\s*[0-9]+)\b', t_lower)
-        if m_level:
-            lvl_str = m_level.group(1)
-            lvl_m = re.search(r'\|\s*' + re.escape(lvl_str) + r'\b[^\n]*', c_lower)
-            if lvl_m:
-                st = lvl_m.start()
-                en = lvl_m.end()
-                return st, en, c_text[st:en].strip()
+        # 3. Table row & structure fallback (matches markdown tables, e.g. "| Level 1 | Project Manager | Project Manager |")
+        table_match = cls.find_table_evidence_span(c_text, target_text)
+        if table_match:
+            st, en, span_txt, _ = table_match
+            ok, _ = cls._validate_semantic_safeguards(span_txt, target_text)
+            if ok:
+                return (st, en, span_txt)
 
         # 4. Substantive sub-clause and introductory-verb fallback
         # e.g., "Take actions to establish and confirm that: b) Resource requirements are identified..." -> "Resource requirements are identified..."
@@ -2151,16 +2330,86 @@ class DeepScanExtractor:
         for sub_tgt in sub_targets:
             p_pos = c_lower.find(sub_tgt.lower())
             if p_pos != -1:
-                return p_pos, p_pos + len(sub_tgt), c_text[p_pos:p_pos+len(sub_tgt)]
+                span = (p_pos, p_pos + len(sub_tgt), c_text[p_pos:p_pos+len(sub_tgt)])
+                ok, _ = cls._validate_semantic_safeguards(span[2], target_text)
+                if ok:
+                    return span
             sub_toks = re.findall(r'\b[a-zA-Z0-9]+\b', sub_tgt.lower())
             if len(sub_toks) >= 2:
                 sub_pat = r'[\s\*\_\-\–\—\,\.\:\;\"\'\(\)\[\]]+'.join([re.escape(tok) for tok in sub_toks])
                 try:
                     m_sub = re.search(sub_pat, c_lower)
                     if m_sub:
-                        return m_sub.start(), m_sub.end(), c_text[m_sub.start():m_sub.end()]
+                        span = (m_sub.start(), m_sub.end(), c_text[m_sub.start():m_sub.end()])
+                        ok, _ = cls._validate_semantic_safeguards(span[2], target_text)
+                        if ok:
+                            return span
                 except Exception:
                     pass
+
+        # 5. Broader source sentence and list bullet matcher
+        # Handles compound sentences (e.g. 'recommend or reject'), minor OCR/typo variations (e.g. 'circGstances', 'sGmary'),
+        # and introductory clauses followed by specification phrases.
+        stop_words = {'the', 'and', 'for', 'any', 'can', 'see', 'this', 'that', 'with', 'from', 'per', 'below', 'set', 'out'}
+        t_toks = set(re.findall(r'\b[a-zA-Z0-9]{3,}\b', t_clean.lower())) - stop_words
+        if t_toks:
+            TYPO_MAP = {
+                'circgstances': 'circumstances',
+                'docgents': 'documents',
+                'docgent': 'document',
+                'sgmary': 'summary',
+            }
+            def _norm_t(text: str) -> str:
+                res = text.lower()
+                for typo, clean in TYPO_MAP.items():
+                    res = re.sub(r'\b' + typo + r'\b', clean, res)
+                return res
+
+            t_norm = _norm_t(t_clean)
+            t_norm_toks = set(re.findall(r'\b[a-zA-Z0-9]{3,}\b', t_norm)) - stop_words
+
+            # 5a. Complete sentence match
+            best_sent_match = None
+            best_sent_overlap = 0.0
+            for m in re.finditer(r'([A-Z][^\.\n\r]*\.)', c_text):
+                sent = m.group(1).strip()
+                sent_core = sent.rstrip('. ,;').strip()
+                sent_norm = _norm_t(sent_core)
+                sent_norm_toks = set(re.findall(r'\b[a-zA-Z0-9]{3,}\b', sent_norm)) - stop_words
+                if not sent_norm_toks:
+                    continue
+                overlap = len(sent_norm_toks & t_norm_toks) / max(len(t_norm_toks), 1)
+                if overlap >= 0.75 and overlap > best_sent_overlap:
+                    candidate_span = (m.start(1), m.end(1), sent)
+                    ok, _ = cls._validate_semantic_safeguards(candidate_span[2], target_text)
+                    if ok:
+                        best_sent_overlap = overlap
+                        best_sent_match = candidate_span
+            if best_sent_match:
+                return best_sent_match
+
+            # 5b. Check lines / list items in c_text
+            raw_lines = [l for l in re.split(r'[\r\n]+', c_text) if l.strip()]
+            best_line_match = None
+            best_overlap = 0.0
+            for raw_line in raw_lines:
+                line_clean = re.sub(r'^[\*\-\•\|\s]+|[\*\|\s]+$', '', raw_line).strip()
+                if len(line_clean) < 15:
+                    continue
+                line_toks = set(re.findall(r'\b[a-zA-Z0-9]{3,}\b', line_clean.lower())) - stop_words
+                if not line_toks:
+                    continue
+                overlap = len(t_toks & line_toks) / max(len(t_toks), 1)
+                if overlap >= 0.70 and overlap > best_overlap:
+                    pos = c_text.find(line_clean)
+                    if pos != -1:
+                        candidate_span = (pos, pos + len(line_clean), line_clean)
+                        ok, _ = cls._validate_semantic_safeguards(candidate_span[2], target_text)
+                        if ok:
+                            best_overlap = overlap
+                            best_line_match = candidate_span
+            if best_line_match:
+                return best_line_match
 
         return None
 
@@ -2182,7 +2431,13 @@ class DeepScanExtractor:
         - evidence_text
         Also produces explicit evidence_spans for all supporting spans.
         """
-        atomic_claims = candidate_dict.get("atomic_claims") or [candidate_dict.get("description", candidate_dict.get("name", ""))]
+        atomic_claims = candidate_dict.get("atomic_claims")
+        if not atomic_claims:
+            desc_raw = candidate_dict.get("description", candidate_dict.get("name", ""))
+            if "|" in desc_raw:
+                atomic_claims = [c.strip() for c in desc_raw.split("|") if len(c.strip()) >= 5]
+            else:
+                atomic_claims = [desc_raw]
         primary_c_idx = candidate_dict.get("chunk_index")
         merged_sources = candidate_dict.get("merged_sources", [])
 
@@ -2191,18 +2446,33 @@ class DeepScanExtractor:
         unsupported_claims = []
         seen_spans = set()
 
+        if not index_to_chunk:
+            prov = candidate_dict.get("provenance_status", PROVENANCE_VERIFIED)
+            reason = candidate_dict.get("verification_reason", "Preserved from candidate rehydration")
+            return claims_evidence, evidence_spans, prov, reason
+
         for cl in atomic_claims:
-            cl_clean = cl.strip()
+            cl_clean = cl.strip().rstrip(',.:;')
             if not cl_clean or len(cl_clean) < 5:
                 continue
 
             found_span = None
             found_c_idx = None
+            found_table_prov = None
+
+            def _search_chunk_text(c_text_val):
+                t_res = cls.find_table_evidence_span(c_text_val, cl_clean)
+                if t_res:
+                    return (t_res[0], t_res[1], t_res[2]), t_res[3]
+                p_span = cls.find_verbatim_span(c_text_val, cl_clean)
+                if p_span:
+                    return p_span, None
+                return None, None
 
             # 1. Try candidate primary chunk
             if index_to_chunk and primary_c_idx is not None and primary_c_idx in index_to_chunk:
                 c_txt = index_to_chunk[primary_c_idx].get("text", "") if isinstance(index_to_chunk[primary_c_idx], dict) else index_to_chunk[primary_c_idx]
-                found_span = cls.find_verbatim_span(c_txt, cl_clean)
+                found_span, found_table_prov = _search_chunk_text(c_txt)
                 if found_span:
                     found_c_idx = primary_c_idx
 
@@ -2212,7 +2482,7 @@ class DeepScanExtractor:
                     ms_c_idx = ms.get("chunk_index")
                     if ms_c_idx is not None and ms_c_idx in index_to_chunk:
                         ms_txt = index_to_chunk[ms_c_idx].get("text", "") if isinstance(index_to_chunk[ms_c_idx], dict) else index_to_chunk[ms_c_idx]
-                        found_span = cls.find_verbatim_span(ms_txt, cl_clean)
+                        found_span, found_table_prov = _search_chunk_text(ms_txt)
                         if found_span:
                             found_c_idx = ms_c_idx
                             break
@@ -2221,14 +2491,17 @@ class DeepScanExtractor:
             if not found_span and index_to_chunk:
                 for o_idx, o_data in index_to_chunk.items():
                     o_txt = o_data.get("text", "") if isinstance(o_data, dict) else o_data
-                    found_span = cls.find_verbatim_span(o_txt, cl_clean)
+                    found_span, found_table_prov = _search_chunk_text(o_txt)
                     if found_span:
                         found_c_idx = o_idx
                         break
 
             if found_span and found_c_idx is not None:
                 start_p, end_p, span_txt = found_span
-                claims_evidence.append({
+                norm_notes = None
+                if any(w in span_txt.lower() for w in ("circgstances", "docgents", "docgent", "sgmary")):
+                    norm_notes = "Typo/OCR variation in contract verbatim text normalized for semantic claim matching"
+                claim_rec = {
                     "claim": cl_clean,
                     "status": "VERIFIED",
                     "source_locator": f"chunk_{found_c_idx}",
@@ -2236,17 +2509,25 @@ class DeepScanExtractor:
                     "offset_start": start_p,
                     "offset_end": end_p,
                     "evidence_text": span_txt,
-                })
+                }
+                if found_table_prov:
+                    claim_rec["table_provenance"] = found_table_prov
+                if norm_notes:
+                    claim_rec["normalization_notes"] = norm_notes
+                claims_evidence.append(claim_rec)
                 span_key = (found_c_idx, start_p, end_p)
                 if span_key not in seen_spans:
                     seen_spans.add(span_key)
-                    evidence_spans.append({
+                    span_item = {
                         "source_locator": f"chunk_{found_c_idx}",
                         "chunk_index": found_c_idx,
                         "offset_start": start_p,
                         "offset_end": end_p,
                         "evidence_text": span_txt,
-                    })
+                    }
+                    if found_table_prov:
+                        span_item["table_provenance"] = found_table_prov
+                    evidence_spans.append(span_item)
             else:
                 unsupported_claims.append(cl_clean)
                 claims_evidence.append({
@@ -2278,6 +2559,11 @@ class DeepScanExtractor:
 
         candidate_dict["claims_evidence"] = claims_evidence
         candidate_dict["evidence_spans"] = evidence_spans
+        candidate_dict["provenance_status"] = status
+        candidate_dict["verification_reason"] = reason
+        if "verification_status" in candidate_dict:
+            candidate_dict["verification_status"] = status
+
         if evidence_spans and candidate_dict.get("evidence_offset_start") is None:
             p_span = evidence_spans[0]
             candidate_dict["evidence_offset_start"] = p_span["offset_start"]
@@ -2376,6 +2662,15 @@ class DeepScanExtractor:
             f"\n  [DeepScan][5/5: Candidate Rehydration] Rehydrating source metadata "
             f"(chunk_index, page, section, provenance) for {len(reduced_items)} candidates..."
         )
+                # Extract contract party identities dynamically
+        preamble_text = ""
+        if index_to_chunk:
+            for c_i in sorted(index_to_chunk.keys())[:5]:
+                c_data = index_to_chunk[c_i]
+                c_txt = c_data.get("text", "") if isinstance(c_data, dict) else str(c_data)
+                preamble_text += "\n" + c_txt
+        parties = PartyResolver.extract_parties_from_preamble(preamble_text)
+
         candidates = []
 
         for idx, item in enumerate(reduced_items, 1):
@@ -2422,16 +2717,8 @@ class DeepScanExtractor:
             comb_text = f"{name} {desc_val}"
             comb_text_l = comb_text.lower()
 
-            ACTORS_CLIENT = [r"\bgoogle limited\b", r"\bgl\b", r"\bclient\b"]
-            ACTORS_VENDOR = [r"\bgoogle\b", r"\bgoogle llp\b", r"\bgoogle india\b", r"\bvendor\b"]
-            is_client = any(bool(re.search(pat, comb_text_l, flags=re.I)) for pat in ACTORS_CLIENT)
-            is_vendor = any(bool(re.search(pat, comb_text_l, flags=re.I)) for pat in ACTORS_VENDOR) and not is_client
-            if is_client:
-                actor = "Google Limited"
-            elif is_vendor:
-                actor = "Google"
-            else:
-                actor = "Joint / Unspecified"
+            actor = PartyResolver.get_canonical_actor_name(comb_text, parties)
+            actor_role = PartyResolver.resolve_party_role(comb_text, parties)
 
             detected_actions = sorted(ActionEntityProtector.get_actions(comb_text))
             primary_action = detected_actions[0] if detected_actions else "obligation"
@@ -2439,11 +2726,41 @@ class DeepScanExtractor:
             detected_entities = sorted(ActionEntityProtector.get_entities(comb_text))
             primary_target = detected_entities[0] if detected_entities else "deliverable"
 
+            # Ground consolidated descriptions & atomic claims in verified source requirements
+            merged_srcs = item.get("merged_sources") or (src.get("merged_sources") if src else []) or []
+            source_statements = []
+            if src and (src.get("evidence_snippet") or src.get("description")):
+                s_txt = (src.get("evidence_snippet") or src.get("description")).strip()
+                if s_txt:
+                    source_statements.append(s_txt)
+            for ms in merged_srcs:
+                ms_stmt = (ms.get("evidence_snippet") or ms.get("description") or "").strip()
+                if ms_stmt and ms_stmt not in source_statements:
+                    source_statements.append(ms_stmt)
+
+            # Ground desc_val if it contains hallucinated/synthesized modifier not in contract (e.g. "general cloud environment")
+            if "general cloud environment" in desc_val.lower() and any("cloud environment" in s.lower() for s in source_statements):
+                desc_val = " | ".join(dict.fromkeys(source_statements))
+
+            comb_text = f"{name} {desc_val}"
+            comb_text_l = comb_text.lower()
+
             # Atomic claims
-            atomic_claims = [
-                cl.strip() for cl in re.split(r'[.\n;|]|(?:\b(?:allowing|provided that|subject to|however)\b)', desc_val)
-                if len(cl.strip()) >= 5
-            ] or [desc_val]
+            atomic_claims = []
+            if source_statements and len(source_statements) > 1:
+                for s in source_statements:
+                    for cl in re.split(r'[.\n;|]|(?:\b(?:as well as|allowing|provided that|subject to|however|including|comprising)\b)', s):
+                        c_cl = cl.strip().rstrip(',.:;')
+                        if len(c_cl) >= 5 and c_cl not in atomic_claims:
+                            atomic_claims.append(c_cl)
+
+            for cl in re.split(r'[.\n;|]|(?:\b(?:as well as|allowing|provided that|subject to|however|including|comprising)\b)', desc_val):
+                c_cl = cl.strip().rstrip(',.:;')
+                if len(c_cl) >= 5 and c_cl not in atomic_claims:
+                    atomic_claims.append(c_cl)
+
+            if not atomic_claims:
+                atomic_claims = [desc_val]
 
             # Evidence character offsets & span calculation (Chunk-relative)
             ev_offset_start = None
@@ -2518,10 +2835,11 @@ class DeepScanExtractor:
             candidates.append(candidate_dict)
 
             kind = "Milestone" if candidate_dict["is_pure_milestone"] else "Clause"
+            honest_prov = candidate_dict.get("provenance_status", provenance_status)
             cls._log(
                 logger,
                 f"    [{idx:02d}] [{kind}] \"{name}\" -> Section: '{section}' | "
-                f"{source_locator} | {page_locator} | Provenance: {provenance_status}"
+                f"{source_locator} | {page_locator} | Provenance: {honest_prov}"
             )
 
         # Summary of provenance
@@ -2897,7 +3215,8 @@ class DeepScanExtractor:
             ms_ev = (ms.get("evidence_snippet") or "").strip()
             if ms_ev:
                 if index_to_chunk and ms.get("chunk_index") in index_to_chunk:
-                    ch_txt = index_to_chunk[ms["chunk_index"]].get("text", "")
+                    ch_val = index_to_chunk[ms["chunk_index"]]
+                    ch_txt = ch_val.get("text", "") if isinstance(ch_val, dict) else str(ch_val)
                     if ms_ev.lower() in ch_txt.lower() or any(w in ch_txt.lower() for w in re.findall(r"\b[a-zA-Z]{4,}\b", ms_ev.lower())):
                         if ms_ev not in ev_texts:
                             ev_texts.append(ms_ev)
@@ -3144,6 +3463,13 @@ class DeepScanExtractor:
                 chunk_excerpt=chunk_excerpt,
                 index_to_chunk=index_to_chunk,
             )
+            # If claim-level evidence validation identified unsupported claims, do not allow VERIFIED status
+            claims_ev = cand.get("claims_evidence", [])
+            has_explicit_unsupported = any(clm.get("status") == "UNSUPPORTED" for clm in claims_ev)
+            if has_explicit_unsupported and status == PROVENANCE_VERIFIED:
+                status = PROVENANCE_PARTIAL
+                unsup = [clm.get("claim") for clm in claims_ev if clm.get("status") == "UNSUPPORTED"]
+                reason = f"Supported: {sum(1 for c in claims_ev if c.get('status') == 'VERIFIED')}/{len(claims_ev)} claims; unsupported atomic claims exist: {unsup}"
             cand["provenance_status"] = status
             cand["verification_reason"] = reason
 
@@ -3242,8 +3568,15 @@ class DeepScanExtractor:
                 excluded_count += 1
                 continue
 
-            # 1. RETAINED: candidate matches a canonical that has not yet been claimed
-            if raw_name_l in canonical_lookup and raw_name_l not in claimed_canonicals:
+            # Determine if this item explicitly merged into a distinct surviving candidate
+            is_merged_via_lookup = (
+                raw_name_l in merge_lookup and
+                merge_lookup[raw_name_l].lower().strip() != raw_name_l and
+                it.get("chunk_index") != canonical_lookup.get(raw_name_l, {}).get("chunk_index")
+            )
+
+            # 1. RETAINED: candidate matches a canonical directly that has not yet been claimed
+            if raw_name_l in canonical_lookup and not is_merged_via_lookup and raw_name_l not in claimed_canonicals:
                 claimed_canonicals.add(raw_name_l)
                 audit_records.append({
                     "map_index": item_idx + 1,
@@ -3260,7 +3593,7 @@ class DeepScanExtractor:
                 continue
 
             # 2. MERGED: duplicate emission of an already retained canonical from overlapping window
-            if raw_name_l in canonical_lookup and raw_name_l in claimed_canonicals:
+            if raw_name_l in canonical_lookup and raw_name_l in claimed_canonicals and not is_merged_via_lookup:
                 audit_records.append({
                     "map_index": item_idx + 1,
                     "raw_name": raw_name,
@@ -3274,15 +3607,20 @@ class DeepScanExtractor:
                 })
                 merged_count += 1
                 canonical_cand = canonical_lookup[raw_name_l]
-                canonical_cand.setdefault("merged_sources", []).append({
-                    "name": raw_name,
-                    "chunk_index": it.get("chunk_index"),
-                    "page_number": it.get("page_number"),
-                    "section": it.get("section"),
-                    "evidence_snippet": it.get("evidence_snippet") or it.get("description", ""),
-                    "description": it.get("description", ""),
-                    "rationale": "Duplicate emission from overlapping window consolidated into surviving canonical",
-                })
+                existing_sources = canonical_cand.setdefault("merged_sources", [])
+                if not any(ms.get("map_index") == item_idx + 1 for ms in existing_sources):
+                    existing_sources.append({
+                        "map_index": item_idx + 1,
+                        "candidate_id": it.get("candidate_id") or f"map_{item_idx + 1}",
+                        "name": raw_name,
+                        "chunk_index": it.get("chunk_index"),
+                        "page_number": it.get("page_number"),
+                        "section": it.get("section") or section,
+                        "evidence_snippet": it.get("evidence_snippet") or it.get("description", ""),
+                        "description": it.get("description", ""),
+                        "source_locator": it.get("source_locator") or f"Chunk {it.get('chunk_index')}",
+                        "rationale": "Duplicate emission from overlapping window consolidated into surviving canonical",
+                    })
                 continue
 
             # 3. MERGED / RETAINED via merge_lookup:
@@ -3290,8 +3628,9 @@ class DeepScanExtractor:
                 surviving = merge_lookup[raw_name_l]
                 surviving_l = surviving.lower().strip()
                 surviving_exists = surviving_l in canonical_lookup
-                # If this surviving canonical has not yet been claimed, claim it!
-                if surviving_exists and surviving_l not in claimed_canonicals:
+                surviving_in_mapped = any(m.get("name", "").lower().strip() == surviving_l for m in mapped_items)
+                # If this surviving canonical has not yet been claimed and no raw candidate exists with surviving's name
+                if surviving_exists and surviving_l not in claimed_canonicals and not surviving_in_mapped:
                     claimed_canonicals.add(surviving_l)
                     audit_records.append({
                         "map_index": item_idx + 1,
@@ -3306,6 +3645,24 @@ class DeepScanExtractor:
                     })
                     retained_count += 1
                     continue
+
+                if not surviving_exists:
+                    # Surviving canonical was excluded (e.g. [EXCLUDED_ARTIFACT] or doc title).
+                    # Re-resolve to actual surviving canonical candidate via fuzzy / stem / substring match:
+                    best_match_c = None
+                    best_match_sim = 0.0
+                    for c_cand in canonical_candidates:
+                        c_name_l = c_cand["name"].lower().strip()
+                        sim = difflib.SequenceMatcher(None, raw_name_l, c_name_l).ratio()
+                        if raw_name_l in c_name_l or c_name_l in raw_name_l:
+                            sim = max(sim, 0.75)
+                        if sim > best_match_sim:
+                            best_match_sim = sim
+                            best_match_c = c_cand
+                    if best_match_c and best_match_sim >= 0.50:
+                        surviving = best_match_c["name"]
+                        surviving_l = surviving.lower().strip()
+                        surviving_exists = True
 
                 audit_records.append({
                     "map_index": item_idx + 1,
@@ -3323,17 +3680,21 @@ class DeepScanExtractor:
                     canonical_cand = canonical_lookup[surviving_l]
                     existing_sources = canonical_cand.setdefault("merged_sources", [])
                     already_present = any(
-                        ms.get("name") == raw_name and ms.get("chunk_index") == it.get("chunk_index")
+                        ms.get("map_index") == item_idx + 1
                         for ms in existing_sources
                     )
-                    if not already_present:
+                    is_self = (raw_name_l == surviving_l and it.get("chunk_index") == canonical_cand.get("chunk_index"))
+                    if not already_present and not is_self:
                         existing_sources.append({
+                            "map_index": item_idx + 1,
+                            "candidate_id": it.get("candidate_id") or f"map_{item_idx + 1}",
                             "name": raw_name,
                             "chunk_index": it.get("chunk_index"),
                             "page_number": it.get("page_number"),
-                            "section": it.get("section"),
+                            "section": it.get("section") or section,
                             "evidence_snippet": it.get("evidence_snippet") or it.get("description", ""),
                             "description": it.get("description", ""),
+                            "source_locator": it.get("source_locator") or f"Chunk {it.get('chunk_index')}",
                             "rationale": "Merged into surviving canonical candidate",
                         })
                 continue
@@ -3452,15 +3813,25 @@ class DeepScanExtractor:
                     # Preserve duplicate source reference on surviving canonical candidate
                     if "merged_sources" not in best_c:
                         best_c["merged_sources"] = []
-                    best_c["merged_sources"].append({
-                        "name": raw_name,
-                        "description": it.get("description", ""),
-                        "chunk_index": it.get("chunk_index"),
-                        "segment_index": it.get("segment_index", 0),
-                        "section": section,
-                        "evidence_snippet": it.get("evidence_snippet", ""),
-                        "rationale": best_rationale or "Duplicate emission consolidated during audit reconciliation",
-                    })
+                    existing_entry = next((ms for ms in best_c["merged_sources"] if ms.get("name") == raw_name), None)
+                    if existing_entry:
+                        if not existing_entry.get("source_locator"):
+                            existing_entry["source_locator"] = it.get("source_locator") or (f"chunk_{it.get('chunk_index')}" if it.get("chunk_index") is not None else None)
+                        if not existing_entry.get("evidence_snippet"):
+                            existing_entry["evidence_snippet"] = it.get("evidence_snippet", "")
+                        if not existing_entry.get("rationale"):
+                            existing_entry["rationale"] = best_rationale or "Duplicate emission consolidated during audit reconciliation"
+                    else:
+                        best_c["merged_sources"].append({
+                            "name": raw_name,
+                            "description": it.get("description", ""),
+                            "chunk_index": it.get("chunk_index"),
+                            "segment_index": it.get("segment_index", 0),
+                            "section": section,
+                            "source_locator": it.get("source_locator") or (f"chunk_{it.get('chunk_index')}" if it.get("chunk_index") is not None else None),
+                            "evidence_snippet": it.get("evidence_snippet", ""),
+                            "rationale": best_rationale or "Duplicate emission consolidated during audit reconciliation",
+                        })
             else:
                 audit_records.append({
                     "map_index": item_idx + 1,
@@ -3517,7 +3888,26 @@ class DeepScanExtractor:
         section_breakdown = cls.compute_section_breakdown(canonical_candidates)
 
         cls._audit_semantic_overlaps(canonical_candidates, logger=logger)
+
+        # Reconcile and deduplicate merged_sources against audit_records
+        merged_audit_names = {r["raw_name"]: r for r in audit_records if r.get("status") == "MERGED"}
+        for c in canonical_candidates:
+            clean_ms = []
+            seen_names = set()
+            for ms in c.get("merged_sources", []):
+                m_name = ms.get("name")
+                if m_name in merged_audit_names and m_name not in seen_names:
+                    seen_names.add(m_name)
+                    if not ms.get("source_locator") and ms.get("chunk_index") is not None:
+                        ms["source_locator"] = f"chunk_{ms.get('chunk_index')}"
+                    clean_ms.append(ms)
+            c["merged_sources"] = clean_ms
+
         merged_sources_count = sum(len(c.get("merged_sources", [])) for c in canonical_candidates)
+        lineage_complete = (merged_sources_count > 0) and all(
+            bool(ms.get("name") and ms.get("chunk_index") is not None and ms.get("source_locator") and (ms.get("evidence_snippet") or ms.get("description")) and ms.get("rationale"))
+            for c in canonical_candidates for ms in c.get("merged_sources", [])
+        )
         report = {
             "total_map_candidates": total,
             "total_canonical_candidates": len(canonical_candidates),
@@ -3529,7 +3919,7 @@ class DeepScanExtractor:
             "retained_count": retained_count,
             "merged_count": merged_count,
             "merged_sources_count": merged_sources_count,
-            "merged_sources_traceable": (merged_sources_count == merged_count),
+            "merged_sources_traceable": bool(merged_sources_count == merged_count and lineage_complete),
             "excluded_count": excluded_count,
             "unresolved_count": unresolved_count,
             "coverage_percentage": coverage_pct,

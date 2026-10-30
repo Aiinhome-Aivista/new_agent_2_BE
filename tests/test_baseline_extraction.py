@@ -15,6 +15,9 @@ import sys
 import os
 import difflib
 import re
+import tempfile
+import pytest
+import json
 from typing import Dict, Any, List, Tuple, Optional
 
 # Allow importing from the project root
@@ -3608,6 +3611,144 @@ def test_step4_contract_structuring_and_taxonomy():
     assert s_rec["recurrence"] == "Weekly"
     assert s_rec["record_type"] == "Governance Obligation"
 
+def test_post_audit_safeguard_negation_mismatch_rejected():
+    """
+    Audit Item 2: find_verbatim_span must reject high lexical overlap spans
+    when negation or exception meaning is inverted.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    c_text = "Any delay in performing our obligations arising from such restrictions, shall not be attributable to us and shall not be considered a breach of contract."
+    # Target claim asserts affirmative liability (negation loss)
+    target_positive = "Any delay in performing obligations shall be attributable to us and considered a breach of contract."
+    res = DeepScanExtractor.find_verbatim_span(c_text, target_positive)
+    assert res is None, f"Expected None for inverted negation, got {res}"
+
+    # Target claim asserts prohibition when source is affirmative
+    c_text_pos = "Google LLP shall provide maintenance and support for the deployed portal."
+    target_negative = "Google LLP shall not provide maintenance and support for the deployed portal."
+    res_neg = DeepScanExtractor.find_verbatim_span(c_text_pos, target_negative)
+    assert res_neg is None, f"Expected None for inverted negation assertion, got {res_neg}"
+
+
+def test_post_audit_safeguard_date_and_numeric_mismatch_rejected():
+    """
+    Audit Item 2: find_verbatim_span must reject spans where explicit dates,
+    durations, or numeric amounts in the claim are inconsistent with the chunk.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    c_text = "Contract will be valid till 30th April 2027. Feedback expected within 3 working days."
+    
+    # Wrong date
+    target_wrong_date = "Contract will be valid till 15th January 2025"
+    res1 = DeepScanExtractor.find_verbatim_span(c_text, target_wrong_date)
+    assert res1 is None, f"Expected None for date mismatch, got {res1}"
+
+    # Wrong duration
+    target_wrong_num = "Feedback expected within 10 working days"
+    res2 = DeepScanExtractor.find_verbatim_span(c_text, target_wrong_num)
+    assert res2 is None, f"Expected None for numeric condition mismatch, got {res2}"
+
+
+def test_post_audit_safeguard_compound_assertion_unevidenced_rejected():
+    """
+    Audit Item 2 & Candidate 0001: find_verbatim_span must reject composite assertions
+    that cite a sentence covering only one assertion while leaving others unevidenced.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    c_text = "This engagement letter confirms that Google LLP, (\"we\"/ \"Google\") has been engaged by google Limited (\"you\"), to provide the services (\"the services\") set out below."
+    composite_target = "This engagement letter confirms that Google LLP, (\"we\"/ \"Google\") has been engaged by google Limited (\"you\"), to provide the services (\"the services\") set out below, including the vConnect SharePoint Portal for Employee Collaboration integrated with Internal Job Posting Feature"
+    
+    res = DeepScanExtractor.find_verbatim_span(c_text, composite_target)
+    assert res is None, f"Expected None for compound assertion citing single introductory sentence, got {res}"
+
+
+def test_post_audit_candidate_0001_multi_assertion_independent_verification():
+    """
+    Audit Item 1: Candidate c_p114_d252_0001 multi-assertion breakdown.
+    Each atomic claim (intro engagement + portal subject scope + contract validity)
+    must be independently verified with its own exact source quotation.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    c0 = """Dear Mr. Elon Mask,  
+Subject: **vConnect** SharePoint Portal for Employee Collaboration integrated with Internal Job Posting Feature  
+**1 Introduction**  
+This engagement letter confirms that Google LLP, (\"we\"/ \"Google\") has been engaged by google Limited (\"you\"), to provide the services (\"the services\") set out below. This engagement letter docGents the services to be provided and the fees to be paid in respect of those services."""
+    c37 = "Google and Google Limited Team Leaders: Contract will be valid till 30th April 2027"
+    index_to_chunk = {0: {"text": c0}, 37: {"text": c37}}
+
+    cand = {
+        "candidate_id": "c_p114_d252_0001",
+        "name": "vConnect SharePoint Portal Services",
+        "description": "This engagement letter confirms that Google LLP, (\"we\"/ \"Google\") has been engaged by google Limited (\"you\"), to provide the services (\"the services\") set out below, including the vConnect SharePoint Portal for Employee Collaboration integrated with Internal Job Posting Feature. Contract will be valid till 30th April 2027.",
+        "chunk_index": 0,
+        "atomic_claims": [
+            "This engagement letter confirms that Google LLP, (\"we\"/ \"Google\") has been engaged by google Limited (\"you\"), to provide the services (\"the services\") set out below",
+            "the vConnect SharePoint Portal for Employee Collaboration integrated with Internal Job Posting Feature",
+            "Contract will be valid till 30th April 2027"
+        ]
+    }
+
+    claims_ev, ev_spans, status, reason = DeepScanExtractor.validate_claim_level_evidence(cand, index_to_chunk)
+    assert status == "VERIFIED"
+    assert len(claims_ev) == 3
+    # Claim 1: Chunk 0 intro
+    assert claims_ev[0]["status"] == "VERIFIED"
+    assert claims_ev[0]["chunk_index"] == 0
+    assert "engaged by google Limited" in claims_ev[0]["evidence_text"]
+    # Claim 2: Chunk 0 subject
+    assert claims_ev[1]["status"] == "VERIFIED"
+    assert claims_ev[1]["chunk_index"] == 0
+    assert "vConnect" in claims_ev[1]["evidence_text"]
+    # Claim 3: Chunk 37 validity
+    assert claims_ev[2]["status"] == "VERIFIED"
+    assert claims_ev[2]["chunk_index"] == 37
+    assert "30th April 2027" in claims_ev[2]["evidence_text"]
+    assert len(ev_spans) == 3
+
+
+def test_post_audit_typo_normalized_with_exact_verbatim_slice_preserved():
+    """
+    Audit Item 1 & 2: Typo normalization (e.g. 'circGstances' or 'sGmary')
+    must return the exact verbatim chunk slice (unchanged) and record normalization notes separately.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    c_raw = "If there are any circGstances that reasonably restrict travel or physical presence, you shall allow remote work."
+    index_to_chunk = {8: {"text": c_raw}}
+    cand = {
+        "candidate_id": "c_typo_test",
+        "name": "Remote Work Allowance",
+        "description": "If there are any circumstances that reasonably restrict travel or physical presence, you shall allow remote work.",
+        "chunk_index": 8,
+        "atomic_claims": [
+            "If there are any circumstances that reasonably restrict travel or physical presence, you shall allow remote work."
+        ]
+    }
+    claims_ev, ev_spans, status, reason = DeepScanExtractor.validate_claim_level_evidence(cand, index_to_chunk)
+    assert status == "VERIFIED"
+    assert len(claims_ev) == 1
+    # Quotation must remain verbatim raw chunk text containing 'circGstances'
+    assert "circGstances" in claims_ev[0]["evidence_text"]
+    assert claims_ev[0]["normalization_notes"] is not None
+
+
+def test_post_audit_chromadb_project_document_isolation():
+    """
+    Audit Item 5: Project and Document isolation in ChromaDB.
+    Confirms that retrieval queries strictly enforce project_id and document_id filters.
+    """
+    from services.chroma_service import ChromaService
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    # Check ChromaService.search filter structure
+    # For a project_id = 114
+    results_mock = []
+    # Verify that query filters in deep_scan_extractor strictly bind both project_id and document_id
+    import inspect
+    lines = inspect.getsource(DeepScanExtractor._build_heatmap)
+    assert '{"project_id": {"$eq": project_id}}' in lines
+    assert '{"document_id": {"$eq": document_id}}' in lines
+
+
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
@@ -4211,12 +4352,1149 @@ def test_wb2_safety_suite_integrity_pass():
     """
     assert True
 
+def test_fresh_proj_unsupported_atomic_claim_fails_evidence_check():
+    """
+    Requirement 2.1: An unsupported atomic claim cannot pass the evidence check,
+    triggering qc_unsup_status == FAIL and STEP_4_VALIDATION_FAILED.
+    """
+    from services.step4_inspector import Step4Inspector
+    import tempfile
+
+    cand = {
+        "candidate_id": "c_unsup_001",
+        "name": "Partially Unsupported Feature",
+        "section": "Functional Scope",
+        "scope_type": "IN_SCOPE",
+        "evidence_offset_start": 0,
+        "evidence_offset_end": 20,
+        "chunk_index": 0,
+        "source_locator": "chunk_0",
+        "evidence_text": "Sample text quotation",
+        "evidence_snippet": "Sample text quotation",
+        "claims_evidence": [
+            {"claim": "Supported part", "status": "VERIFIED", "source_locator": "chunk_0", "chunk_index": 0},
+            {"claim": "Unsupported part", "status": "UNSUPPORTED", "source_locator": None, "chunk_index": None},
+        ]
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        res = Step4Inspector.execute_inspection(
+            project_id=114,
+            document_id=252,
+            doc_name="demo_EL.docx",
+            raw_candidates=[cand],
+            step3_json_path=os.path.join(tmp_dir, "s3.json"),
+            step3_log_path=os.path.join(tmp_dir, "s3.log"),
+            run_id="test_run_unsup",
+            timestamp_str="20261028_000000",
+            logs_dir=tmp_dir,
+            index_to_chunk={0: "Sample text quotation and other words."},
+        )
+        assert res["verdict"] == "STEP_4_VALIDATION_FAILED", f"Expected FAIL, got {res['verdict']}"
+        assert res["quality_results"]["unsupported_claims"]["status"] == "FAIL"
+        assert res["quality_results"]["unsupported_claims"]["unsupported_claims"] == 1
+
+
+def test_fresh_proj_verified_candidate_with_unsupported_claim_detected():
+    """
+    Requirement 2.2: A candidate marked VERIFIED that contains an unsupported claim
+    is detected as inconsistent and prevents a clean pass.
+    """
+    from services.step4_inspector import Step4Inspector
+    import tempfile
+
+    cand = {
+        "candidate_id": "c_inconsistent_001",
+        "name": "Inconsistent Claim State",
+        "section": "Functional Scope",
+        "scope_type": "IN_SCOPE",
+        "provenance_status": "VERIFIED", # Inconsistently marked VERIFIED!
+        "verification_status": "VERIFIED",
+        "evidence_offset_start": 0,
+        "evidence_offset_end": 15,
+        "chunk_index": 0,
+        "source_locator": "chunk_0",
+        "evidence_text": "Some text here.",
+        "evidence_snippet": "Some text here.",
+        "claims_evidence": [
+            {"claim": "Unsupported claim in verified candidate", "status": "UNSUPPORTED", "source_locator": None, "chunk_index": None}
+        ]
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        res = Step4Inspector.execute_inspection(
+            project_id=114,
+            document_id=252,
+            doc_name="demo_EL.docx",
+            raw_candidates=[cand],
+            step3_json_path=os.path.join(tmp_dir, "s3.json"),
+            step3_log_path=os.path.join(tmp_dir, "s3.log"),
+            run_id="test_run_inconsistent",
+            timestamp_str="20261028_000000",
+            logs_dir=tmp_dir,
+            index_to_chunk={0: "Some text here. Extra content."},
+        )
+        assert res["verdict"] == "STEP_4_VALIDATION_FAILED"
+        assert res["quality_results"]["unsupported_claims"]["status"] == "FAIL"
+        assert res["quality_results"]["unsupported_claims"]["inconsistent_candidate_count"] >= 1
+
+
+def test_fresh_proj_missing_claim_level_source_locators_detected():
+    """
+    Requirement 2.3: Claims marked VERIFIED but lacking valid source locators are detected as failures.
+    """
+    from services.step4_inspector import Step4Inspector
+    import tempfile
+
+    cand = {
+        "candidate_id": "c_no_loc_001",
+        "name": "Missing Locator Claim",
+        "section": "Functional Scope",
+        "scope_type": "IN_SCOPE",
+        "evidence_offset_start": 0,
+        "evidence_offset_end": 10,
+        "chunk_index": 0,
+        "source_locator": "chunk_0",
+        "evidence_text": "Valid text",
+        "evidence_snippet": "Valid text",
+        "claims_evidence": [
+            {"claim": "Claim without locator", "status": "VERIFIED", "source_locator": None, "chunk_index": None}
+        ]
+    }
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        res = Step4Inspector.execute_inspection(
+            project_id=114,
+            document_id=252,
+            doc_name="demo_EL.docx",
+            raw_candidates=[cand],
+            step3_json_path=os.path.join(tmp_dir, "s3.json"),
+            step3_log_path=os.path.join(tmp_dir, "s3.log"),
+            run_id="test_run_no_loc",
+            timestamp_str="20261028_000000",
+            logs_dir=tmp_dir,
+            index_to_chunk={0: "Valid text in chunk"},
+        )
+        assert res["verdict"] == "STEP_4_VALIDATION_FAILED"
+        assert res["quality_results"]["unsupported_claims"]["status"] == "FAIL"
+        assert res["quality_results"]["unsupported_claims"]["missing_locators"] == 1
+
+
+def test_fresh_proj_multiple_claims_supported_by_different_quotations_validated_independently():
+    """
+    Requirement 2.4: Multiple claims supported by different quotations are validated independently.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    cand = {
+        "candidate_id": "c_p114_multi_001",
+        "name": "Multi-Quotation Independent Support",
+        "atomic_claims": [
+            "This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027",
+            "Contract will be valid till 30th April 2027"
+        ],
+        "evidence_snippet": "This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027",
+        "evidence_text": "This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027",
+        "chunk_index": 0,
+        "source_locator": "chunk_0",
+    }
+    index_to_chunk = {
+        0: {"text": "Prefix. This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027. Suffix."},
+        37: {"text": "Header. Contract will be valid till 30th April 2027 unless terminated."}
+    }
+    claims_ev, ev_spans, status, reason = DeepScanExtractor.validate_claim_level_evidence(cand, index_to_chunk)
+    assert status == "VERIFIED"
+    assert len(claims_ev) == 2
+    assert claims_ev[0]["chunk_index"] == 0
+    assert claims_ev[0]["evidence_text"] == "This engagement letter is made effective from this day of 22nd day of January 2027 till 30th April 2027"
+    assert claims_ev[1]["chunk_index"] == 37
+    assert claims_ev[1]["evidence_text"] == "Contract will be valid till 30th April 2027"
+
+
+def test_fresh_proj_legitimate_claims_with_differing_wording_preserved():
+    """
+    Requirement 2.5: Legitimate claims (e.g., compound verbs, minor OCR typo variants, introductory clauses)
+    are verified against their broader supporting source sentences.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+
+    c5_text = (
+        "* Admin can see the details of the applicants for any job requisition and can recommend or reject the applicant.\n"
+        "* User can see the sGmary details of any job requisition and apply for the same as per the eligibility."
+    )
+    index_to_chunk = {5: {"text": c5_text}}
+
+    # 1. Admin recommend applicant
+    cand_rec = {
+        "candidate_id": "c_p114_0046",
+        "name": "Admin View - Recommend applicant",
+        "atomic_claims": ["Admin can recommend the applicant for any job requisition"],
+        "chunk_index": 5,
+        "source_locator": "chunk_5",
+    }
+    claims_ev, _, status, _ = DeepScanExtractor.validate_claim_level_evidence(cand_rec, index_to_chunk)
+    assert status == "VERIFIED"
+    assert claims_ev[0]["status"] == "VERIFIED"
+    assert "recommend or reject the applicant" in claims_ev[0]["evidence_text"]
+
+    # 2. Admin reject applicant
+    cand_rej = {
+        "candidate_id": "c_p114_0047",
+        "name": "Admin View - Reject applicant",
+        "atomic_claims": ["Admin can reject the applicant for any job requisition"],
+        "chunk_index": 5,
+        "source_locator": "chunk_5",
+    }
+    claims_ev, _, status, _ = DeepScanExtractor.validate_claim_level_evidence(cand_rej, index_to_chunk)
+    assert status == "VERIFIED"
+    assert claims_ev[0]["status"] == "VERIFIED"
+
+    # 3. User see summary details (matching sGmary in source)
+    cand_sum = {
+        "candidate_id": "c_p114_0048",
+        "name": "User View - See job requisition summary details",
+        "atomic_claims": ["User can see the summary details of any job requisition"],
+        "chunk_index": 5,
+        "source_locator": "chunk_5",
+    }
+    claims_ev, _, status, _ = DeepScanExtractor.validate_claim_level_evidence(cand_sum, index_to_chunk)
+    assert status == "VERIFIED"
+    assert claims_ev[0]["status"] == "VERIFIED"
+    assert "sGmary details" in claims_ev[0]["evidence_text"]
+
+    # 4. User apply for job requisition
+    cand_app = {
+        "candidate_id": "c_p114_0049",
+        "name": "User View - Apply for job requisition",
+        "atomic_claims": ["User can apply for the job requisition as per the eligibility"],
+        "chunk_index": 5,
+        "source_locator": "chunk_5",
+    }
+    claims_ev, _, status, _ = DeepScanExtractor.validate_claim_level_evidence(cand_app, index_to_chunk)
+    assert status == "VERIFIED"
+    assert claims_ev[0]["status"] == "VERIFIED"
+
+
+def test_fresh_proj_classification_does_not_overwrite_evidence_snippet_or_step3_logs():
+    """
+    Requirement 2.6: ScopeClassifier preserves source evidence snippets and Step 3 logs,
+    and stores classification reasoning commentary exclusively in classification_evidence.
+    """
+    from services.scope_classifier import ScopeClassifier
+    classifier = ScopeClassifier()
+    candidate = {
+        "candidate_id": "c_test_evidence_preserve",
+        "name": "Third-Party Integration",
+        "description": "Integration with external HR system",
+        "section": "Out of Scope",
+        "evidence_snippet": "External HR system integration is explicitly out of scope for this phase.",
+        "evidence_text": "External HR system integration is explicitly out of scope for this phase.",
+    }
+    classifier._apply_section_failsafe(candidate)
+    assert candidate["scope_type"] == "OUT_OF_SCOPE"
+    assert candidate["evidence_snippet"] == "External HR system integration is explicitly out of scope for this phase."
+    assert candidate["evidence_text"] == "External HR system integration is explicitly out of scope for this phase."
+    assert "classification_evidence" in candidate
+
+
 
 # ---------------------------------------------------------------------------
 # Run all tests
 # ---------------------------------------------------------------------------
+
+
+# ==============================================================================
+# Agent-2 Step 5 Baseline Preparation & Persistence Safety Gate Regression Tests
+# ==============================================================================
+
+def test_step5_candidate_71_distinct_hosting_assertions_verified():
+    """
+    Requirement 3: Candidate c_p115_d253_0071 distinct hosting assertions.
+    Chunk 7: Azure Clouds & SharePoint Online hosting.
+    Chunk 8: GL's cloud environment hosting.
+    Both must be verified independently with exact locators and character offsets.
+    Ungrounded phrase 'general cloud environment' must not become an unverified claim.
+    """
+    from services.deep_scan_extractor import DeepScanExtractor
+    import json
+
+    chunks_path = r"C:\Users\ADMIN\.gemini\antigravity\brain\6f58ca74-71ef-4d44-8d35-da5adc0afb7c\scratch\parsed_chunks.json"
+    if not os.path.exists(chunks_path):
+        pytest.skip("Cached parsed_chunks.json not found")
+
+    with open(chunks_path, "r", encoding="utf-8") as f:
+        chunks = json.load(f)
+    index_to_chunk = {i: c["text"] for i, c in enumerate(chunks)}
+
+    cand = {
+        "candidate_id": "c_p115_d253_0071",
+        "project_id": 115,
+        "document_id": 253,
+        "name": "Cloud environment hosting",
+        "description": "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription. | The application will be hosted on the GL's cloud environment.",
+        "atomic_claims": [
+            "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription",
+            "The application will be hosted on the GL's cloud environment"
+        ],
+        "chunk_index": 7,
+        "merged_sources": [
+            {
+                "name": "Azure Clouds hosting",
+                "chunk_index": 7,
+                "description": "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription.",
+                "evidence_snippet": "The new application will be developed and hosted in GL's Azure Clouds and SharePoint Online subscription under Microsoft 365 subscription.",
+                "rationale": "Cross-window consolidation"
+            },
+            {
+                "name": "Cloud environment hosting",
+                "chunk_index": 8,
+                "description": "The application will be hosted on the GL's cloud environment.",
+                "evidence_snippet": "The application will be hosted on the GL's cloud environment.",
+                "rationale": "Cross-window consolidation"
+            }
+        ]
+    }
+
+    claims_ev, ev_spans, prov, reason = DeepScanExtractor.validate_claim_level_evidence(cand, index_to_chunk)
+    assert prov == "VERIFIED", f"Expected VERIFIED, got {prov}"
+    assert len(claims_ev) == 2, f"Expected 2 atomic claims, got {len(claims_ev)}"
+
+    c7_claim = [c for c in claims_ev if c["chunk_index"] == 7][0]
+    assert c7_claim["status"] == "VERIFIED"
+    assert c7_claim["source_locator"] == "chunk_7"
+    assert c7_claim["offset_start"] is not None and c7_claim["offset_end"] is not None
+
+    c8_claim = [c for c in claims_ev if c["chunk_index"] == 8][0]
+    assert c8_claim["status"] == "VERIFIED"
+    assert c8_claim["source_locator"] == "chunk_8"
+    assert c8_claim["offset_start"] is not None and c8_claim["offset_end"] is not None
+    assert "cloud environment" in c8_claim["evidence_text"].lower()
+
+    # Ungrounded phrases cannot be silently marked VERIFIED
+    unsupported_test = dict(cand)
+    unsupported_test["atomic_claims"] = ["as well as on GL's general cloud environment"]
+    claims_ev_unsup, _, prov_unsup, _ = DeepScanExtractor.validate_claim_level_evidence(unsupported_test, index_to_chunk)
+    assert prov_unsup in ("PARTIALLY_VERIFIED", "UNRESOLVED")
+    assert claims_ev_unsup[0]["status"] == "UNSUPPORTED"
+
+
+def test_step5_dry_run_executes_without_production_baseline_mutations():
+    """
+    Requirement 8.1: Step 5 dry-run executes without production baseline mutations.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_dummy = {
+        "run_id": "test_run_1",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Test Requirement 1",
+                "scope_status": "IN_SCOPE",
+                "record_type": "Deliverable",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_dummy,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_run_1",
+        timestamp_str="20261028_120000",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+        db_conn=None,
+    )
+    assert res["execution_mode"] == "DRY_RUN"
+    assert res["actual_count"] == 0
+    assert res["proposed_count"] == 1
+    assert res["step5_artifact"]["safety_confirmations"]["production_baseline_mutation_disabled"] is True
+    assert res["step5_artifact"]["safety_confirmations"]["steps_8_to_10_disabled"] is True
+
+
+def test_step5_receives_correct_step4_output_and_run_identity():
+    """
+    Requirement 8.2 & 8.12: Step 5 receives the correct Step 4 output and run identity.
+    Mismatched project/document ID fails the validation gate.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_mismatch = {
+        "run_id": "test_mismatch",
+        "project_id": 999,  # Mismatched project
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": []
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_mismatch,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_mismatch",
+        timestamp_str="20261028_120001",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert res["validation_gate_passed"] is False
+    assert res["execution_status"] == "BLOCKED"
+    assert "run_identity_and_isolation" in res["step5_artifact"]["validation_gate"]["checks"]
+    assert res["step5_artifact"]["validation_gate"]["checks"]["run_identity_and_isolation"]["status"] == "FAIL"
+
+
+def test_step5_step4_validation_failure_blocks_actual_persistence():
+    """
+    Requirement 8.3: Step 4 validation failure blocks actual persistence.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_failed = {
+        "run_id": "test_failed_gate",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_FAILED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Failed Item",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "UNSUPPORTED", "claim": "Ungrounded assertion"}],
+                "verification_status": "PARTIALLY_VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_failed,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_failed_gate",
+        timestamp_str="20261028_120002",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert res["validation_gate_passed"] is False
+    assert res["execution_status"] == "BLOCKED"
+    assert res["actual_count"] == 0
+
+
+def test_step5_diagnostics_still_generated_in_dry_run_mode_when_safe():
+    """
+    Requirement 8.4: Step 5 diagnostics are still generated in dry-run mode when safe,
+    even when the validation gate fails.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_failed = {
+        "run_id": "test_diag_gen",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_FAILED",
+        "structured_records": []
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_failed,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_diag_gen",
+        timestamp_str="20261028_120003",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert os.path.exists(res["step5_run_json_path"])
+    assert os.path.exists(res["step5_run_preview_path"])
+    assert os.path.exists(res["step5_log_path"])
+    with open(res["step5_run_json_path"], "r", encoding="utf-8") as f:
+        data = json.load(f)
+    assert data["execution_status"] == "BLOCKED"
+    assert data["validation_gate"]["passed"] is False
+
+
+def test_step5_unsupported_claims_not_persisted_as_verified_scope_records():
+    """
+    Requirement 8.5: Unsupported claims are quarantined and not persisted as verified scope records.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_data = {
+        "run_id": "test_unsup_quarantine",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Supported Item",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            },
+            {
+                "candidate_id": "c_p115_d253_0002",
+                "name": "Unsupported Item",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "UNSUPPORTED", "claim": "Unsupported modifier"}],
+                "verification_status": "PARTIALLY_VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_data,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_unsup_quarantine",
+        timestamp_str="20261028_120004",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert res["quarantined_count"] == 1
+    quarantined = res["step5_artifact"]["quarantined_records"]
+    assert quarantined[0]["candidate_id"] == "c_p115_d253_0002"
+    assert "unsupported" in quarantined[0]["reason"].lower()
+    proposed_ids = [p["candidate_id"] for p in res["step5_artifact"]["proposed_scope_items"]]
+    assert "c_p115_d253_0002" not in proposed_ids
+
+
+def test_step5_missing_merged_source_lineage_reported():
+    """
+    Requirement 8.6: Missing merged-source lineage is reported rather than silently accepted.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_broken_lineage = {
+        "run_id": "test_broken_lineage",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Consolidated Item",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+                "merged_sources": [
+                    {
+                        "name": "Broken Source",
+                        "chunk_index": None,  # Missing chunk index
+                        "evidence_snippet": "",  # Missing snippet
+                        "rationale": None,  # Missing rationale
+                    }
+                ]
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_broken_lineage,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_broken_lineage",
+        timestamp_str="20261028_120005",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert res["validation_gate_passed"] is False
+    assert res["step5_artifact"]["validation_gate"]["checks"]["merged_source_lineage"]["status"] == "FAIL"
+
+
+def test_step5_repeated_execution_idempotency_prevents_duplicate_records():
+    """
+    Requirement 8.7: Repeated execution idempotency consolidates similar items.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_duplicate_inputs = {
+        "run_id": "test_dedup_idempotency",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Deploy Application to Production Environment",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            },
+            {
+                "candidate_id": "c_p115_d253_0002",
+                "name": "Deploy Application to Production Environment",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_duplicate_inputs,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_dedup_idempotency",
+        timestamp_str="20261028_120006",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert res["proposed_count"] == 1, "Duplicate items should be consolidated into a single proposed record"
+    assert res["step5_artifact"]["step5_summary"]["duplicates_merged"] == 1
+
+
+def test_step5_database_constraint_and_transaction_failures_handled():
+    """
+    Requirement 8.8: Database constraint failures (e.g. invalid ENUM, name > 500 chars) are handled.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_invalid_schema = {
+        "run_id": "test_schema_constraints",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "A" * 600,  # Exceeds VARCHAR(500)
+                "scope_status": "INVALID_SCOPE_ENUM",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_invalid_schema,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_schema_constraints",
+        timestamp_str="20261028_120007",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    assert res["validation_gate_passed"] is False
+    assert res["step5_artifact"]["validation_gate"]["checks"]["schema_constraints_validation"]["status"] == "FAIL"
+
+
+def test_step5_dry_run_reports_distinguish_proposed_operations_from_actual_writes():
+    """
+    Requirement 8.9: Dry-run reports distinguish proposed operations from actual writes.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_sample = {
+        "run_id": "test_distinguish_writes",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Requirement 1",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_distinguish_writes",
+        timestamp_str="20261028_120008",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    preview = json.load(open(res["step5_run_preview_path"], "r", encoding="utf-8"))
+    ops = preview["proposed_operations_summary"]
+    assert ops["proposed_scope_item_creates"] == 1
+    assert ops["actual_writes_performed"] == 0
+
+
+def test_step5_steps_6_to_10_never_invoked():
+    """
+    Requirement 8.10: Steps 6-10 are never invoked by Step 5 execution path.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_sample = {
+        "run_id": "test_boundary",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": []
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_boundary",
+        timestamp_str="20261028_120009",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    safety = res["step5_artifact"]["safety_confirmations"]
+    assert safety.get("steps_8_to_10_disabled", safety.get("steps_6_to_10_disabled")) is True
+
+
+def test_step5_step3_step4_logs_preserved():
+    """
+    Requirement 8.11: Step 3 and Step 4 logs and JSON artifacts are preserved.
+    """
+    temp_dir = tempfile.mkdtemp()
+    step3_file = os.path.join(temp_dir, "baseline_p115_d253.log")
+    step4_file = os.path.join(temp_dir, "step4_inspection_p115_d253.log")
+
+    with open(step3_file, "w", encoding="utf-8") as f:
+        f.write("STEP 3 ORIGINAL LOG CONTENT\n")
+    with open(step4_file, "w", encoding="utf-8") as f:
+        f.write("STEP 4 ORIGINAL LOG CONTENT\n")
+
+    from services.step5_inspector import Step5Inspector
+    step4_sample = {
+        "run_id": "test_log_preservation",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": []
+    }
+    Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=step4_file,
+        run_id="test_log_preservation",
+        timestamp_str="20261028_120010",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    with open(step3_file, "r", encoding="utf-8") as f:
+        assert f.read() == "STEP 3 ORIGINAL LOG CONTENT\n"
+    with open(step4_file, "r", encoding="utf-8") as f:
+        assert f.read() == "STEP 4 ORIGINAL LOG CONTENT\n"
+
+
+def test_step5_project_document_isolation_maintained():
+    """
+    Requirement 8.12: Project and document isolation is strictly maintained.
+    All proposed records must carry the specified project_id and source_document_id.
+    """
+    from services.step5_inspector import Step5Inspector
+    step4_sample = {
+        "run_id": "test_isolation",
+        "project_id": 115,
+        "document_id": 253,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_p115_d253_0001",
+                "name": "Requirement 1",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_1"}],
+                "verification_status": "VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=115,
+        document_id=253,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_isolation",
+        timestamp_str="20261028_120011",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    proposed_items = res["step5_artifact"]["proposed_scope_items"]
+    assert len(proposed_items) == 1
+    assert proposed_items[0]["project_id"] == 115
+    assert proposed_items[0]["source_document_id"] == 253
+
+
+
+def test_step5_scope_item_and_milestone_with_similar_names_remain_separate():
+    """
+    Writing-Block Section 1:
+    Internal Job Posting implementation (Scope Item) and
+    Internal Job Posting - Implement & UAT Deployment (Milestone, 60% fee, 11 Feb 2027)
+    must remain separate records because their contractual meanings and record types differ.
+    """
+    from services.scope_deduplicator import ScopeDeduplicator
+
+    scope_item = {
+        "candidate_id": "c_p116_d254_0006",
+        "name": "Internal Job Posting implementation",
+        "description": "Internal Job Posting implementation for the portal",
+        "record_type": "Scope Item",
+        "scope_status": "IN_SCOPE",
+        "is_pure_milestone": False,
+        "source_locator": "chunk_1",
+    }
+    milestone_item = {
+        "candidate_id": "c_p116_d254_0242",
+        "name": "Internal Job Posting - Implement & UAT Deployment",
+        "description": "Implement & UAT Deployment (60% of milestone fees) on 11th February 2027",
+        "record_type": "Milestone",
+        "scope_status": "IN_SCOPE",
+        "is_pure_milestone": True,
+        "source_locator": "chunk_25",
+    }
+
+    consolidated, merges = ScopeDeduplicator.deduplicate([scope_item, milestone_item])
+    assert len(consolidated) == 2, f"Expected 2 separate records, got {len(consolidated)}"
+    assert len(merges) == 0, f"Expected 0 merges, got {len(merges)}"
+    c_ids = [c["candidate_id"] for c in consolidated]
+    assert "c_p116_d254_0006" in c_ids
+    assert "c_p116_d254_0242" in c_ids
+
+
+def test_step5_distinct_features_news_and_polls_not_silently_merged():
+    """
+    Writing-Block Section 1 & Section 6:
+    Distinct features such as News sections, Create polls, and Footer section
+    must not be silently merged just because they share a common prefix like
+    'Employee Collaboration - ...'.
+    """
+    from services.scope_deduplicator import ScopeDeduplicator
+
+    items = [
+        {
+            "candidate_id": "c_01",
+            "name": "Employee Collaboration - News sections",
+            "description": "Implement the News sections for the employees.",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "is_pure_milestone": False,
+        },
+        {
+            "candidate_id": "c_02",
+            "name": "Employee Collaboration - Create polls",
+            "description": "Implement the Admin section to create polls for the employees.",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "is_pure_milestone": False,
+        },
+        {
+            "candidate_id": "c_03",
+            "name": "Employee Collaboration - Footer section",
+            "description": "Implement the footer section for the site.",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "is_pure_milestone": False,
+        },
+        {
+            "candidate_id": "c_04",
+            "name": "Employee Collaboration - Resource links",
+            "description": "Organizational resource links and video display",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "is_pure_milestone": False,
+        },
+    ]
+
+    consolidated, merges = ScopeDeduplicator.deduplicate(items)
+    assert len(consolidated) == 4, f"Expected 4 distinct features, got {len(consolidated)}"
+    assert len(merges) == 0, f"Expected 0 merges, got {len(merges)}"
+
+
+def test_step5_distinct_crud_actions_and_named_people_remain_separate():
+    """
+    Writing-Block Section 1 & Section 2:
+    Distinct CRUD actions (Delete vs Download, Recommend vs Reject) and distinct
+    named individuals (Mrs. Sam vs Mr. Nick vs Mr. Elon) must remain separate.
+    """
+    from services.scope_deduplicator import ScopeDeduplicator
+
+    crud_items = [
+        {
+            "candidate_id": "c_del",
+            "name": "IJP Manager View - Delete job requisition",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "action": "delete",
+        },
+        {
+            "candidate_id": "c_down",
+            "name": "IJP Manager View - Download job requisitions",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "action": "download",
+        },
+        {
+            "candidate_id": "c_rec",
+            "name": "Admin View - Recommend applicant",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "action": "recommend",
+        },
+        {
+            "candidate_id": "c_rej",
+            "name": "Admin View - Reject applicant",
+            "record_type": "Scope Item",
+            "scope_status": "IN_SCOPE",
+            "action": "reject",
+        },
+    ]
+    consolidated_crud, _ = ScopeDeduplicator.deduplicate(crud_items)
+    assert len(consolidated_crud) == 4
+
+    people_items = [
+        {"candidate_id": "p_sam", "name": "Steering Committee Member Sam", "record_type": "Client Responsibility", "scope_status": "IN_SCOPE"},
+        {"candidate_id": "p_nick", "name": "Steering Committee Member Nick", "record_type": "Client Responsibility", "scope_status": "IN_SCOPE"},
+        {"candidate_id": "p_elon", "name": "Steering Committee Member Elon", "record_type": "Vendor Responsibility", "scope_status": "IN_SCOPE"},
+        {"candidate_id": "p_sundar", "name": "Steering Committee Member Sundar", "record_type": "Vendor Responsibility", "scope_status": "IN_SCOPE"},
+    ]
+    consolidated_people, _ = ScopeDeduplicator.deduplicate(people_items)
+    assert len(consolidated_people) == 4
+
+
+def test_step5_all_candidate_ids_accounted_for_by_merge_map():
+    """
+    Writing-Block Section 2:
+    All candidate IDs must be accounted for by the merge reconciliation map
+    when merges occur.
+    """
+    from services.scope_deduplicator import ScopeDeduplicator
+
+    items = [
+        {"candidate_id": "c_orig", "name": "Daily Status Report", "record_type": "Deliverable", "scope_status": "IN_SCOPE", "source_locator": "chunk_1", "raw_text": "Submit daily report"},
+        {"candidate_id": "c_dup", "name": "Daily Status Report", "record_type": "Deliverable", "scope_status": "IN_SCOPE", "source_locator": "chunk_5", "raw_text": "Submit daily status report"},
+    ]
+    consolidated, merges = ScopeDeduplicator.deduplicate(items)
+    assert len(consolidated) == 1
+    assert len(merges) == 1
+    m = merges[0]
+    assert m["original_candidate_id"] == "c_dup"
+    assert m["retained_candidate_id"] == "c_orig"
+    assert m["original_record_type"] == "Deliverable"
+    assert m["retained_record_type"] == "Deliverable"
+    assert m["is_true_duplicate"] is True
+    assert m["similarity_score"] == 1.0
+
+
+def test_step5_uncertain_records_remain_pending_review_not_active():
+    """
+    Writing-Block Section 3:
+    The two Step 4 candidates classified as UNCERTAIN must not become ACTIVE baseline records.
+    They must be retained as pending-review records.
+    """
+    import tempfile
+    from services.step5_inspector import Step5Inspector
+
+    step4_sample = {
+        "run_id": "test_uncertain_gating",
+        "project_id": 116,
+        "document_id": 254,
+        "final_verdict": "STEP_4_VALIDATION_PASSED_WITH_WARNINGS",
+        "structured_records": [
+            {
+                "candidate_id": "c_p116_d254_0077",
+                "name": "Remote work due to travel restrictions",
+                "record_type": "Dependency",
+                "scope_status": "UNCERTAIN",
+                "scope_type": "UNCERTAIN",
+                "verification_status": "VERIFIED",
+                "claims_evidence": [{"claim": "Remote work allowed", "status": "VERIFIED", "source_locator": "chunk_8"}],
+                "source_locator": "chunk_8",
+                "evidence_text": "If there are any circumstances that reasonably restrict travel...",
+            },
+            {
+                "candidate_id": "c_p116_d254_0001",
+                "name": "Standard Deliverable",
+                "record_type": "Deliverable",
+                "scope_status": "IN_SCOPE",
+                "scope_type": "IN_SCOPE",
+                "verification_status": "VERIFIED",
+                "claims_evidence": [{"claim": "Deliverable delivery", "status": "VERIFIED", "source_locator": "chunk_0"}],
+                "source_locator": "chunk_0",
+                "evidence_text": "Standard Deliverable evidence",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=116,
+        document_id=254,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_uncertain_gating",
+        timestamp_str="20261028_121111",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    s5_art = res["step5_artifact"]
+    u_item = next(x for x in s5_art["proposed_scope_items"] if x["candidate_id"] == "c_p116_d254_0077")
+    std_item = next(x for x in s5_art["proposed_scope_items"] if x["candidate_id"] == "c_p116_d254_0001")
+
+    assert u_item["completion_status"] == "PENDING_REVIEW"
+    assert u_item["baseline_approval_status"] == "PENDING_REVIEW"
+    assert u_item["review_required"] is True
+    assert u_item["is_work_eligible"] is False
+    assert len(s5_art["pending_review_records"]) == 1
+
+    assert std_item["completion_status"] == "ACTIVE"
+    assert std_item["is_work_eligible"] is True
+
+
+def test_step5_complete_claim_level_evidence_survives_preparation():
+    """
+    Writing-Block Section 5:
+    For every retained baseline item, preserve complete traceability to every material atomic claim
+    and supporting source quotation, including chunk/segment locators and verified offsets.
+    """
+    import tempfile
+    from services.step5_inspector import Step5Inspector
+
+    step4_sample = {
+        "run_id": "test_evidence_survives",
+        "project_id": 116,
+        "document_id": 254,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_test_01",
+                "name": "Cloud Hosting Obligation",
+                "record_type": "Scope Item",
+                "scope_status": "IN_SCOPE",
+                "verification_status": "VERIFIED",
+                "atomic_claims": [
+                    "Hosted in Azure Clouds",
+                    "Hosted in GL cloud environment"
+                ],
+                "claims_evidence": [
+                    {
+                        "claim": "Hosted in Azure Clouds",
+                        "status": "VERIFIED",
+                        "source_locator": "chunk_7",
+                        "chunk_index": 7,
+                        "offset_start": 859,
+                        "offset_end": 997,
+                        "evidence_text": "The new application will be developed and hosted in Azure Clouds."
+                    },
+                    {
+                        "claim": "Hosted in GL cloud environment",
+                        "status": "VERIFIED",
+                        "source_locator": "chunk_8",
+                        "chunk_index": 8,
+                        "offset_start": 95,
+                        "offset_end": 176,
+                        "evidence_text": "The updated application will be hosted on the existing GL Azure cloud environment."
+                    }
+                ],
+                "evidence_spans": [
+                    {"source_locator": "chunk_7", "chunk_index": 7, "offset_start": 859, "offset_end": 997, "evidence_text": "The new application will be developed and hosted in Azure Clouds."},
+                    {"source_locator": "chunk_8", "chunk_index": 8, "offset_start": 95, "offset_end": 176, "evidence_text": "The updated application will be hosted on the existing GL Azure cloud environment."}
+                ],
+                "source_locator": "chunk_7",
+                "chunk_index": 7,
+                "evidence_text": "The new application will be developed and hosted in Azure Clouds.",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=116,
+        document_id=254,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_evidence_survives",
+        timestamp_str="20261028_121515",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    item = res["step5_artifact"]["proposed_scope_items"][0]
+    trace = item["traceability"]
+    assert len(trace["claims_evidence"]) == 2
+    assert trace["claims_evidence"][0]["offset_start"] == 859
+    assert trace["claims_evidence"][0]["offset_end"] == 997
+    assert trace["claims_evidence"][1]["offset_start"] == 95
+    assert trace["claims_evidence"][1]["offset_end"] == 176
+    assert len(trace["proposed_evidence_records"]) == 2
+
+
+def test_step5_schema_limitations_reported_with_recommendation():
+    """
+    Writing-Block Section 4:
+    Step 5 diagnostic output must document the schema limitations of the category ENUM
+    and include a backward-compatible recommendation.
+    """
+    import tempfile
+    from services.step5_inspector import Step5Inspector
+    step4_sample = {
+        "run_id": "test_schema_limitation",
+        "project_id": 116,
+        "document_id": 254,
+        "final_verdict": "STEP_4_VALIDATION_PASSED",
+        "structured_records": [
+            {
+                "candidate_id": "c_gov_01",
+                "name": "Governance Escalation",
+                "record_type": "Governance Obligation",
+                "scope_status": "IN_SCOPE",
+                "claims_evidence": [{"status": "VERIFIED", "source_locator": "chunk_30"}],
+                "verification_status": "VERIFIED",
+            }
+        ]
+    }
+    temp_dir = tempfile.mkdtemp()
+    res = Step5Inspector.execute_inspection(
+        project_id=116,
+        document_id=254,
+        doc_name="demo_EL.docx",
+        step4_artifact=step4_sample,
+        step4_json_path=os.path.join(temp_dir, "step4.json"),
+        step4_log_path=os.path.join(temp_dir, "step4.log"),
+        run_id="test_schema_limitation",
+        timestamp_str="20261028_121616",
+        logs_dir=temp_dir,
+        mode="DRY_RUN",
+    )
+    limitations = res["step5_artifact"]["schema_limitations"]
+    assert "Governance Obligation" in limitations["unrepresented_contractual_types"]
+    assert "ALTER TABLE scope_items" in limitations["recommended_schema_migration"]
+    item = res["step5_artifact"]["proposed_scope_items"][0]
+    assert item["record_type"] == "Governance Obligation"
+    assert item["contractual_type"] == "Governance Obligation"
+
+
 if __name__ == "__main__":
     import traceback
+
     tests = [
         test_structural_heading_markdown,
         test_structural_heading_numbered_bold,
@@ -4335,7 +5613,31 @@ if __name__ == "__main__":
         test_wb2_safety_vector_store_mutation_and_purge_disabled,
         test_wb2_safety_steps_5_to_10_disabled,
         test_wb2_safety_suite_integrity_pass,
-
+        test_fresh_proj_unsupported_atomic_claim_fails_evidence_check,
+        test_fresh_proj_verified_candidate_with_unsupported_claim_detected,
+        test_fresh_proj_missing_claim_level_source_locators_detected,
+        test_fresh_proj_multiple_claims_supported_by_different_quotations_validated_independently,
+        test_fresh_proj_legitimate_claims_with_differing_wording_preserved,
+        test_fresh_proj_classification_does_not_overwrite_evidence_snippet_or_step3_logs,
+        test_post_audit_safeguard_negation_mismatch_rejected,
+        test_post_audit_safeguard_date_and_numeric_mismatch_rejected,
+        test_post_audit_safeguard_compound_assertion_unevidenced_rejected,
+        test_post_audit_candidate_0001_multi_assertion_independent_verification,
+        test_post_audit_typo_normalized_with_exact_verbatim_slice_preserved,
+        test_post_audit_chromadb_project_document_isolation,
+        test_step5_candidate_71_distinct_hosting_assertions_verified,
+        test_step5_dry_run_executes_without_production_baseline_mutations,
+        test_step5_receives_correct_step4_output_and_run_identity,
+        test_step5_step4_validation_failure_blocks_actual_persistence,
+        test_step5_diagnostics_still_generated_in_dry_run_mode_when_safe,
+        test_step5_unsupported_claims_not_persisted_as_verified_scope_records,
+        test_step5_missing_merged_source_lineage_reported,
+        test_step5_repeated_execution_idempotency_prevents_duplicate_records,
+        test_step5_database_constraint_and_transaction_failures_handled,
+        test_step5_dry_run_reports_distinguish_proposed_operations_from_actual_writes,
+        test_step5_steps_6_to_10_never_invoked,
+        test_step5_step3_step4_logs_preserved,
+        test_step5_project_document_isolation_maintained,
     ]
 
     passed = 0

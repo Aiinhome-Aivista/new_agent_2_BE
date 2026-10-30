@@ -365,8 +365,8 @@ def _is_non_entity(text: str) -> bool:
         return True
     if len(n) <= 2:
         return True
-    # Single generic word not matching anything
-    if len(n.split()) == 1 and not text.isupper():
+    # Single generic word not matching anything (only purely lowercase unpunctuated words)
+    if len(n.split()) == 1 and text.islower() and not ('_' in text):
         return True
     return False
 
@@ -480,6 +480,11 @@ class EntityResolver:
                 if len(shared) >= 2 and len_ratio >= 0.40:
                     prefix_candidates.append((entity, len_ratio))
 
+        # Ambiguity check: if multiple entities contain the reference, do not resolve prefix
+        containing_entities = [e for e in self._registry.all_entities() if norm_ref in e._norm_name or any(norm_ref in a for a in e._norm_aliases)]
+        if len(containing_entities) > 1:
+            prefix_candidates = []
+
         # Ambiguity check: if multiple prefix matches, do not auto-resolve
         if len(prefix_candidates) == 1:
             entity, conf = prefix_candidates[0]
@@ -531,11 +536,13 @@ class EntityResolver:
             name_tokens = set(entity._norm_name.split())
             shared = ref_tokens & name_tokens
             if len(shared) >= 2:
-                ctx_score = len(shared) / max(len(ref_tokens), len(name_tokens))
-                # For short names (<= 3 tokens), 2 shared tokens is a strong 66.7% match (e.g. "Production VPN Access" vs "Provide VPN Access")
-                threshold = 0.65 if (len(shared) >= 2 and max(len(ref_tokens), len(name_tokens)) <= 3) else self.LEXICAL_THRESHOLD
-                if ctx_score >= threshold:
-                    match_candidates.append((entity, ctx_score, "contextual"))
+                if ref_tokens.issubset(name_tokens):
+                    match_candidates.append((entity, 0.80, "full_token_subset"))
+                else:
+                    ctx_score = len(shared) / max(len(ref_tokens), len(name_tokens))
+                    threshold = 0.65 if (len(shared) >= 2 and max(len(ref_tokens), len(name_tokens)) <= 3) else self.LEXICAL_THRESHOLD
+                    if ctx_score >= threshold:
+                        match_candidates.append((entity, ctx_score, "contextual"))
 
         # Deduplicate candidates by entity (keep highest score per entity)
         best_per_entity: Dict[str, tuple] = {}

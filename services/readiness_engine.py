@@ -105,6 +105,12 @@ class ReadinessEngine:
         prereq_ids = list(bwd.get(node_id, []))
 
         if not prereq_ids:
+            if unresolved_count > 0:
+                return ReadinessResult(
+                    status="BLOCKED_UNRESOLVED_DEPENDENCY",
+                    all_and_satisfied=False,
+                    reason=f"Blocked by {unresolved_count} unresolved dependency/dependencies",
+                )
             return ReadinessResult(
                 status="NO_PREREQUISITES",
                 all_and_satisfied=True,

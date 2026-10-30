@@ -377,3 +377,41 @@ def download_document_markdown(
         if os.path.exists(temp_path):
             os.remove(temp_path)
 
+
+
+@router.get("/{document_id}/baseline/final")
+def get_document_final_baseline(
+    project_id: int,
+    document_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    from services.final_baseline_service import FinalBaselineService
+    res = FinalBaselineService.load_validated_final_baseline(
+        project_id=project_id,
+        document_id=document_id
+    )
+    if res.get("status") == "NOT_GENERATED":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=res.get("message", "Final baseline artifact not found or not ready yet.")
+        )
+    if res.get("status") == "BLOCKED":
+        return {
+            "success": False,
+            "status": "BLOCKED",
+            "message": res.get("message", "Baseline failed mandatory validation gates."),
+            "validation_errors": res.get("validation_errors", []),
+            "data": res.get("artifact")
+        }
+    if res.get("status") == "FAILED":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=res.get("message", "Baseline artifact corrupted or unparseable.")
+        )
+    return {
+        "success": True,
+        "status": "READY",
+        "data": res.get("artifact")
+    }

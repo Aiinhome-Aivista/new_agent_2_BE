@@ -12,7 +12,7 @@ def run_migrations_started_at():
     if not conn:
         return
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(buffered=True)
         cursor.execute("SHOW COLUMNS FROM documents LIKE 'processing_started_at'")
         col_exists = cursor.fetchone()
         if not col_exists:
@@ -34,20 +34,23 @@ def run_tracker_migrations():
     if not conn:
         return
     try:
-        cursor = conn.cursor()
+        cursor = conn.cursor(buffered=True)
         
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'risk_origin'")
-        if not cursor.fetchone():
+        rows = cursor.fetchall()
+                if not rows:
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_origin VARCHAR(255) NULL DEFAULT NULL")
             conn.commit()
             
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'previous_highest_score'")
-        if not cursor.fetchone():
+        rows = cursor.fetchall()
+                if not rows:
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN previous_highest_score INT NULL DEFAULT 0")
             conn.commit()
 
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'execution_status'")
-        if not cursor.fetchone():
+        rows = cursor.fetchall()
+                if not rows:
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(50) NULL DEFAULT 'NOT_STARTED'")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(50) NULL DEFAULT 'OPEN'")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(100) NULL DEFAULT 'DOWNSTREAM_ACTIVITY'")
@@ -57,6 +60,34 @@ def run_tracker_migrations():
             
         cursor.execute("ALTER TABLE tracker_items MODIFY COLUMN item_type enum('ACTIVITY','NEW_REQUEST','CHANGE_REQUEST','BLOCKER','ACTION_ITEM','DECISION','RISK_MENTIONED','DEPENDENCY') NOT NULL")
         conn.commit()
+
+        # Ensure compatibility view for projects route
+        try:
+            cursor.execute("""
+                CREATE OR REPLACE VIEW risk_tracker_items AS 
+                SELECT 
+                    id, 
+                    project_id, 
+                    source_document_id,
+                    item_type,
+                    title,
+                    title AS deliverable, 
+                    title AS name, 
+                    status, 
+                    risk_score, 
+                    risk_level,
+                    risk_category,
+                    risk_status,
+                    execution_status,
+                    execution_priority_score, 
+                    priority_order,
+                    recommended_action, 
+                    reasoning 
+                FROM tracker_items
+            """)
+            conn.commit()
+        except Exception:
+            pass
             
         cursor.close()
     except Exception:
@@ -69,7 +100,7 @@ def create_rag_tables():
     if not conn:
         print("RAG Table Setup: Failed to connect to database")
         return
-    cursor = conn.cursor()
+    cursor = conn.cursor(buffered=True)
     try:
         # Create sessions table
         cursor.execute("""
@@ -106,10 +137,44 @@ def create_rag_tables():
         cursor.close()
         conn.close()
 
+def run_performance_indexes():
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        cursor = conn.cursor(buffered=True)
+        indexes_to_add = [
+            ("audit_logs", "idx_audit_project", "(project_id, created_at)"),
+            ("tracker_items", "idx_tracker_items_proj_status", "(project_id, status)"),
+            ("tracker_items", "idx_tracker_items_proj_risk_cat", "(project_id, risk_category, status)"),
+            ("tracker_items", "idx_tracker_items_source_doc", "(source_document_id)"),
+            ("scope_baselines", "idx_scope_baselines_proj_status", "(project_id, status)"),
+            ("project_users", "idx_project_users_user_proj", "(user_id, project_id)"),
+            ("documents", "idx_documents_type", "(project_id, document_type)"),
+            ("risk_evaluations", "idx_risk_eval_project", "(project_id, id)"),
+        ]
+        
+        for table, index_name, columns in indexes_to_add:
+            try:
+                cursor.execute(f"SHOW INDEX FROM {table} WHERE Key_name = '{index_name}'")
+                rows = cursor.fetchall()
+                if not rows:
+                    cursor.execute(f"ALTER TABLE {table} ADD INDEX {index_name} {columns}")
+                    conn.commit()
+            except Exception:
+                pass  # Ignore if table missing or permissions restricted
+                
+        cursor.close()
+    except Exception:
+        pass
+    finally:
+        conn.close()
+
 if __name__ == "__main__":
     print("--- Starting Database Initialization ---")
     create_risk_config_tables()
     create_rag_tables()
     run_migrations_started_at()
     run_tracker_migrations()
+    run_performance_indexes()
     print("--- Database Initialization Complete ---")

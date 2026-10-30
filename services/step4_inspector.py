@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from services.scope_classifier import ScopeClassifier
+from services.party_resolver import PartyResolver
 
 
 class Step4Logger:
@@ -134,9 +135,9 @@ class Step4Inspector:
             record_type = "Deliverable"
         elif c.get("candidate_type") == "Milestone" or section == "Milestones":
             record_type = "Milestone"
-        elif section in {"Client Responsibilities", "Customer Responsibilities"} or c.get("actor") == "Google Limited":
+        elif section in {"Client Responsibilities", "Customer Responsibilities"} or c.get("actor_role") == "Client" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Client":
             record_type = "Client Responsibility"
-        elif section == "Responsibilities" or c.get("actor") == "Google":
+        elif section == "Responsibilities" or c.get("actor_role") == "Vendor" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Vendor":
             record_type = "Vendor Responsibility"
         elif section == "Assumptions":
             record_type = "Assumption"
@@ -158,8 +159,23 @@ class Step4Inspector:
         # 2. Scope Status
         scope_status = scope_type  # "IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"
 
-        # 3. Verification Status (preserved from Step 3)
-        verification_status = c.get("provenance_status", "VERIFIED")
+        # 3. Verification Status (derived honestly from atomic claim-level evidence)
+        claims_ev = c.get("claims_evidence", [])
+        if claims_ev:
+            has_unsupported = any(clm.get("status") == "UNSUPPORTED" for clm in claims_ev)
+            has_unresolved = any(clm.get("status") in {"UNRESOLVED", "PARTIALLY_VERIFIED"} for clm in claims_ev)
+            all_verified = all(clm.get("status") == "VERIFIED" for clm in claims_ev)
+            if has_unsupported:
+                # Cannot be VERIFIED when atomic claims remain unsupported
+                verification_status = "PARTIALLY_VERIFIED" if any(clm.get("status") == "VERIFIED" for clm in claims_ev) else "UNRESOLVED"
+            elif has_unresolved:
+                verification_status = "PARTIALLY_VERIFIED"
+            elif all_verified:
+                verification_status = "VERIFIED"
+            else:
+                verification_status = c.get("provenance_status", "UNRESOLVED")
+        else:
+            verification_status = c.get("provenance_status", "VERIFIED")
 
         # 4. Work Item Eligibility (Schedulable in planning)
         if scope_status == "IN_SCOPE" and record_type in {"Scope Item", "Deliverable", "Milestone", "Vendor Responsibility"}:
@@ -200,6 +216,7 @@ class Step4Inspector:
             recurrence = "One-time"
 
         c["record_type"] = record_type
+        c["scope_type"] = scope_type
         c["scope_status"] = scope_status
         c["verification_status"] = verification_status
         c["work_item_eligible"] = work_item_eligible
@@ -341,11 +358,56 @@ class Step4Inspector:
         quality_results["invalid_classifications"] = {"status": qc_class_status, "details": qc_class_msg}
         logger.quality_check("Classification Vocabulary Validation", qc_class_status, qc_class_msg)
 
-        # 6. Claims without adequate source evidence
-        unsupported = sum(1 for c in structured_records if c.get("verification_status") == "UNRESOLVED")
-        qc_unsup_status = "PASS" if unsupported == 0 else "FAIL"
-        qc_unsup_msg = f"0 unresolved claims; {sum(1 for c in structured_records if c.get('verification_status') == 'VERIFIED')} verified against quotations"
-        quality_results["unsupported_claims"] = {"status": qc_unsup_status, "details": qc_unsup_msg}
+        # 6. Claims without adequate source evidence (strictly derived from claim-level records)
+        all_claims = []
+        inconsistent_candidates = []
+        for c in structured_records:
+            c_claims = c.get("claims_evidence", [])
+            c_prov = c.get("provenance_status")
+            c_ver = c.get("verification_status")
+            if c_claims:
+                has_unsup = any(clm.get("status") == "UNSUPPORTED" for clm in c_claims)
+                if has_unsup and (c_prov == "VERIFIED" or c_ver == "VERIFIED"):
+                    inconsistent_candidates.append(c.get("candidate_id"))
+                all_claims.extend(c_claims)
+            else:
+                all_claims.append({
+                    "claim": c.get("description", c.get("name", "")),
+                    "status": "VERIFIED" if c_ver == "VERIFIED" else "UNRESOLVED",
+                    "source_locator": c.get("source_locator"),
+                    "chunk_index": c.get("chunk_index"),
+                })
+
+        total_claims_count = len(all_claims)
+        verified_claims_count = sum(1 for clm in all_claims if clm.get("status") == "VERIFIED" and clm.get("source_locator"))
+        unsupported_claims_count = sum(1 for clm in all_claims if clm.get("status") == "UNSUPPORTED")
+        unresolved_claims_count = sum(1 for clm in all_claims if clm.get("status") in {"UNRESOLVED", "PARTIALLY_VERIFIED"})
+        missing_locator_claims_count = sum(1 for clm in all_claims if clm.get("status") == "VERIFIED" and not clm.get("source_locator"))
+
+        if unsupported_claims_count > 0 or unresolved_claims_count > 0 or missing_locator_claims_count > 0 or len(inconsistent_candidates) > 0:
+            qc_unsup_status = "FAIL"
+            qc_unsup_msg = (
+                f"{unsupported_claims_count} unsupported claims, {unresolved_claims_count} unresolved claims, "
+                f"{missing_locator_claims_count} claims missing locators, {len(inconsistent_candidates)} inconsistent candidates "
+                f"out of {total_claims_count} total atomic claims ({verified_claims_count} verified)"
+            )
+        else:
+            qc_unsup_status = "PASS"
+            qc_unsup_msg = (
+                f"0 unsupported or unresolved claims across {total_claims_count} atomic claims; "
+                f"{verified_claims_count} verified with explicit source quotations and locators"
+            )
+
+        quality_results["unsupported_claims"] = {
+            "status": qc_unsup_status,
+            "details": qc_unsup_msg,
+            "total_claims": total_claims_count,
+            "verified_claims": verified_claims_count,
+            "unsupported_claims": unsupported_claims_count,
+            "unresolved_claims": unresolved_claims_count,
+            "missing_locators": missing_locator_claims_count,
+            "inconsistent_candidate_count": len(inconsistent_candidates),
+        }
         logger.quality_check("Claims Evidence Support Verification", qc_unsup_status, qc_unsup_msg)
 
         # 7. Conflation of distinct activities or entities (e.g. Applicant list vs details)
@@ -484,7 +546,8 @@ class Step4Inspector:
                 "production_baseline_mutation_disabled": True,
                 "vector_store_mutation_disabled": True,
                 "vector_store_purge_disabled": True,
-                "steps_5_to_10_disabled": True,
+                "step_10_disabled": True,
+                "steps_5_to_9_dry_run_inspection": True,
             },
             "step3_input_reference": {
                 "artifact_path": step3_json_path,
@@ -505,6 +568,10 @@ class Step4Inspector:
                 "scope_type_breakdown": scope_type_counts,
                 "record_type_breakdown": record_type_counts,
                 "accounting_reconciled": accounting_reconciled,
+                "total_atomic_claims": total_claims_count,
+                "verified_atomic_claims": verified_claims_count,
+                "unsupported_atomic_claims": unsupported_claims_count,
+                "unresolved_atomic_claims": unresolved_claims_count,
             },
             "quality_checks": quality_results,
             "structured_records": structured_records,
@@ -515,7 +582,7 @@ class Step4Inspector:
         with open(json_active_path, "w", encoding="utf-8") as f:
             json.dump(step4_artifact, f, indent=2, default=str)
 
-        logger.banner("STEP 4 INSPECTION COMPLETE — PIPELINE STOPPED AFTER STEP 4")
+        logger.banner("STEP 4 INSPECTION COMPLETE — ADVANCING TO STEP 5 SAFETY GATE")
         logger.process(f"Step 4 JSON artifact saved to: {json_active_path}")
         logger.process(f"Historical run artifact saved to: {json_run_path}")
         logger.process(f"Step 4 log saved to: {logger.run_log_path}")
@@ -534,4 +601,5 @@ class Step4Inspector:
             "step4_log_path": logger.run_log_path,
             "step4_active_log_path": logger.active_log_path,
             "verdict": final_verdict,
+            "step4_artifact": step4_artifact,
         }

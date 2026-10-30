@@ -90,7 +90,7 @@ def _supersede_previous_vector_versions(db_conn, project_id: int, current_docume
         print(f"[VectorVersioning] Non-fatal error during vector version cleanup: {e}")
 
 
-def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_EXTRACT):
+def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_EXTRACT, execution_mode: str = 'INSPECTION'):
     # Establish a fresh connection for the thread
     thread_conn = get_db_connection()
     if not thread_conn:
@@ -275,6 +275,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         logger.step_start(3, "Candidate Scope Extraction")
         logger.input("Sectioned Chunks Count", len(chunks_with_sections))
         logger.input("Extraction Mode", mode)
+        from services.deep_scan_extractor import DeepScanExtractor
         coverage_audit = {}
         if mode == DEEP_SCAN:
             logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap + Action/Entity Protection)...")
@@ -451,20 +452,264 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                 index_to_chunk={i: c.get("text", "") for i, c in enumerate(chunks)},
             )
 
+            # ── [INSPECTION MODE: STEP 5 BASELINE PREPARATION & PERSISTENCE SAFETY GATE] ──
+            # Step 4 is complete and its artifacts are preserved independently.
+            # Now execute Step 5 under inspection mode with dedicated Step 5 log and preview JSON artifacts.
+            from services.step5_inspector import Step5Inspector
+            step5_mode = os.getenv("STEP5_EXECUTION_MODE", "DRY_RUN")
+            step5_results = Step5Inspector.execute_inspection(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step4_artifact=step4_results.get("step4_artifact") or json.load(open(step4_results["step4_run_json_path"], "r", encoding="utf-8")),
+                step4_json_path=step4_results["step4_run_json_path"],
+                step4_log_path=step4_results["step4_log_path"],
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+                mode=step5_mode,
+                db_conn=None if step5_mode == "DRY_RUN" else thread_conn,
+            )
+
+            # ── [INSPECTION MODE: STEP 6 TRACEABILITY & COVERAGE AUDIT] ──
+            from services.step6_tracer import Step6Tracer
+            step6_results = Step6Tracer.execute_inspection(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step3_artifact=diagnostic_artifact,
+                step4_artifact=step4_results.get("step4_artifact") or {},
+                step5_artifact=step5_results.get("step5_artifact") or {},
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+            )
+
+            # ── [INSPECTION MODE: STEP 7 AMBIGUITY & GAP ANALYSIS] ──
+            from services.step7_analyzer import Step7Analyzer
+            step7_results = Step7Analyzer.execute_inspection(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step3_artifact=diagnostic_artifact,
+                step4_artifact=step4_results.get("step4_artifact") or {},
+                step5_artifact=step5_results.get("step5_artifact") or {},
+                step6_artifact=step6_results.get("step6_artifact") or {},
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+            )
+
+            # ── [INSPECTION MODE: STEP 8 PROJECT MILESTONES & DAG DEPENDENCIES] ──
+            emit("Building Milestone Dependencies (Inspection)", 85)
+            from services.step8_inspector import Step8Inspector
+            step8_results = Step8Inspector.execute_inspection(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step4_artifact=step4_results.get("step4_artifact") or {},
+                step5_artifact=step5_results.get("step5_artifact") or {},
+                step6_artifact=step6_results.get("step6_artifact") or {},
+                step7_artifact=step7_results.get("step7_artifact") or {},
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+                mode=step5_mode,
+            )
+
+            # ── [INSPECTION MODE: STEP 9 RECURRING COMMITMENTS DETECTION & EXPANSION] ──
+            emit("Detecting Recurring Commitments (Inspection)", 93)
+            from services.step9_inspector import Step9Inspector
+            step9_results = Step9Inspector.execute_inspection(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step4_artifact=step4_results.get("step4_artifact") or {},
+                step5_artifact=step5_results.get("step5_artifact") or {},
+                step8_artifact=step8_results.get("step8_artifact") or {},
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+                mode=step5_mode,
+            )
+
+            # ── [RISK ASSESSMENT LIFECYCLE: PHASE 1 INITIAL CONTRACTUAL ASSESSMENT] ──
+            emit("Generating Initial Contractual Risk Assessment", 95)
+            from services.risk_lifecycle_service import RiskLifecycleService
+            initial_risk_assessment = RiskLifecycleService.generate_initial_contractual_assessment(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step4_artifact=step4_results.get("step4_artifact") or {},
+                step7_artifact=step7_results.get("step7_artifact") or {},
+                step9_artifact=step9_results.get("step9_artifact") or {},
+                run_id=run_id,
+                logs_dir=logs_dir,
+            )
+
+            # ── [INSPECTION MODE: STEP 10 FINAL EL SYNTHESIS & DASHBOARD PAYLOAD] ──
+            emit("Synthesizing Final EL Analysis & Dashboard (Inspection)", 97)
+            from services.step10_inspector import Step10Inspector
+            step10_results = Step10Inspector.execute_synthesis(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                step4_artifact=step4_results.get("step4_artifact") or {},
+                step5_artifact=step5_results.get("step5_artifact") or {},
+                step6_artifact=step6_results.get("step6_artifact") or {},
+                step7_artifact=step7_results.get("step7_artifact") or {},
+                step8_artifact=step8_results.get("step8_artifact") or {},
+                step9_artifact=step9_results.get("step9_artifact") or {},
+                initial_risk_assessment=initial_risk_assessment,
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+                mode=step5_mode,
+            )
+
+            # ── [CONSOLIDATE GROUPED AUDIT ARTIFACTS: 3 LOGS & 3 JSONs] ──
+            emit("Consolidating Grouped Audit Artifacts", 98)
+            from services.grouped_artifact_service import GroupedArtifactService
+            step1_3_run_log = os.path.join(logs_dir, f"baseline_p{project_id}_d{document_id}_{timestamp_str}.log")
+            if not os.path.exists(step1_3_run_log) and hasattr(logger, "run_log_path") and os.path.exists(logger.run_log_path):
+                import shutil
+                try:
+                    shutil.copyfile(logger.run_log_path, step1_3_run_log)
+                except Exception:
+                    pass
+
+            step_data_map = {
+                1: {
+                    "name": "Step 1: Document Parsing & Text Extraction",
+                    "status": "COMPLETED",
+                    "log_path": step1_3_run_log if os.path.exists(step1_3_run_log) else getattr(logger, "run_log_path", None),
+                    "json_data": diagnostic_artifact.get("step1_document_parsing", {}),
+                    "source_artifact": f"baseline_inspection_p{project_id}_d{document_id}_{timestamp_str}.json",
+                    "duration": step1_time,
+                },
+                2: {
+                    "name": "Step 2: Scope Section Detection",
+                    "status": "COMPLETED",
+                    "log_path": step1_3_run_log if os.path.exists(step1_3_run_log) else getattr(logger, "run_log_path", None),
+                    "json_data": diagnostic_artifact.get("step2_section_detection", {}),
+                    "source_artifact": f"baseline_inspection_p{project_id}_d{document_id}_{timestamp_str}.json",
+                    "duration": step2_time,
+                },
+                3: {
+                    "name": "Step 3: Candidate Scope Extraction",
+                    "status": "COMPLETED",
+                    "log_path": step1_3_run_log if os.path.exists(step1_3_run_log) else getattr(logger, "run_log_path", None),
+                    "json_data": diagnostic_artifact.get("step3_candidate_extraction", {}),
+                    "source_artifact": f"baseline_inspection_p{project_id}_d{document_id}_{timestamp_str}.json",
+                    "duration": step3_time,
+                },
+                4: {
+                    "name": "Step 4: Candidate Scope Classification & Structuring",
+                    "status": step4_results.get("status", "COMPLETED"),
+                    "log_path": step4_results.get("step4_log_path"),
+                    "json_data": step4_results.get("step4_artifact", {}),
+                    "source_artifact": os.path.basename(step4_results.get("step4_run_json_path", "")),
+                },
+                5: {
+                    "name": "Step 5: Scope Baseline Preparation & Persistence Safety Gate",
+                    "status": step5_results.get("status", "COMPLETED"),
+                    "log_path": step5_results.get("step5_log_path"),
+                    "json_data": step5_results.get("step5_artifact", {}),
+                    "source_artifact": os.path.basename(step5_results.get("step5_run_json_path", "")),
+                },
+                6: {
+                    "name": "Step 6: Traceability & Coverage Audit",
+                    "status": step6_results.get("status", "COMPLETED"),
+                    "log_path": step6_results.get("step6_log_path"),
+                    "json_data": step6_results.get("step6_artifact", {}),
+                    "source_artifact": os.path.basename(step6_results.get("step6_run_json_path", "")),
+                },
+                7: {
+                    "name": "Step 7: Ambiguity & Gap Analysis",
+                    "status": step7_results.get("status", "COMPLETED"),
+                    "log_path": step7_results.get("step7_log_path"),
+                    "json_data": step7_results.get("step7_artifact", {}),
+                    "source_artifact": os.path.basename(step7_results.get("step7_run_json_path", "")),
+                },
+                8: {
+                    "name": "Step 8: Project Milestones & DAG Dependency Building",
+                    "status": step8_results.get("status", "COMPLETED"),
+                    "log_path": step8_results.get("step8_log_path"),
+                    "json_data": step8_results.get("step8_artifact", {}),
+                    "source_artifact": os.path.basename(step8_results.get("step8_run_json_path", "")),
+                },
+                9: {
+                    "name": "Step 9: Recurring Commitments Detection & Expansion",
+                    "status": step9_results.get("status", "COMPLETED"),
+                    "log_path": step9_results.get("step9_log_path"),
+                    "json_data": step9_results.get("step9_artifact", {}),
+                    "source_artifact": os.path.basename(step9_results.get("step9_run_json_path", "")),
+                },
+                10: {
+                    "name": "Step 10: Final EL Analysis and Dashboard Synthesis",
+                    "status": step10_results.get("status", "COMPLETED"),
+                    "log_path": step10_results.get("step10_log_path"),
+                    "json_data": step10_results.get("step10_artifact", {}),
+                    "source_artifact": os.path.basename(step10_results.get("step10_run_json_path", "")),
+                },
+            }
+            grouped_results = GroupedArtifactService.consolidate(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                run_id=run_id,
+                timestamp_str=timestamp_str,
+                logs_dir=logs_dir,
+                step_data=step_data_map,
+            )
+            logger.banner(f"PIPELINE RUN {run_id} COMPLETE: 3 GROUPED LOGS AND 3 GROUPED JSONS CONSOLIDATED")
+            logger.output("Grouped Artifacts Integrity Check", grouped_results.get("all_files_exist_and_verified"))
+
+            # Build, validate, and atomically save consolidated authoritative final baseline artifact
+            from services.final_baseline_service import FinalBaselineService
+            final_artifact = FinalBaselineService.build_final_baseline(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=doc.get("document_name", "demo_EL.docx"),
+                run_id=run_id,
+                execution_mode="PERSIST_DRAFT" if str(execution_mode).upper() == "PERSIST_DRAFT" else ("INSPECTION" if INSPECTION_MODE else "DRY_RUN"),
+                step_data=step_data_map,
+                logs_dir=logs_dir,
+            )
+            final_save_report = FinalBaselineService.save_atomic_and_verify(final_artifact)
+            logger.banner("AUTHORITATIVE FINAL EL BASELINE ARTIFACT SAVED AND VALIDATED")
+            logger.output("Final Artifact Path", final_save_report.get("final_artifact_path"))
+            logger.output("Final Artifact Status", final_save_report.get("artifact_status"))
+            logger.output("Readiness Status", final_save_report.get("readiness_status"))
+
+            # If execution mode is PERSIST_DRAFT, persist validated baseline to database
+            if str(execution_mode).upper() == "PERSIST_DRAFT":
+                try:
+                    conn_p = get_valid_db_conn()
+                    if conn_p:
+                        persist_report = FinalBaselineService.persist_draft_baseline_to_db(conn_p, project_id, document_id)
+                        logger.banner("DRAFT BASELINE DATABASE PERSISTENCE SUCCESSFUL")
+                        logger.output("Draft Baseline DB Persistence", f"ID: {persist_report.get('baseline_id')} (v{persist_report.get('version')}) - {persist_report.get('total_records_persisted')} records")
+                        BaselineRepository.update_project_monitoring_status(conn_p, project_id, 'BASELINE_PENDING_REVIEW')
+                except Exception as p_err:
+                    logger.log(f"Error during draft baseline database persistence: {p_err}", level="WARN")
+
             conn = get_valid_db_conn()
             if conn:
                 try:
                     with conn.cursor() as cur:
+                        step_label = 'Completed (Draft Persisted)' if str(execution_mode).upper() == 'PERSIST_DRAFT' else 'Inspection Complete (Steps 1-10)'
                         cur.execute(
                             "UPDATE documents SET processing_status = 'COMPLETED', processing_progress = 100, "
-                            "processing_step = 'Inspection Complete (Steps 1-4)', processing_error = NULL WHERE id = %s",
-                            (document_id,),
+                            "processing_step = %s, processing_error = NULL WHERE id = %s",
+                            (step_label, document_id),
                         )
                         conn.commit()
                 except Exception as db_err:
                     logger.log(f"Notice updating document inspection status: {db_err}", level="WARN")
 
-            emit("Inspection Complete (Steps 1-4)", 100)
+            completion_msg = "Draft Persisted to Database" if str(execution_mode).upper() == "PERSIST_DRAFT" else "Inspection Complete (Steps 1-10)"
+            emit(completion_msg, 100)
             return
         else:
             # ── Step 4: Candidate Scope Classification ──
@@ -951,6 +1196,15 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 
         BaselineRepository.update_project_monitoring_status(thread_conn, project_id, 'BASELINE_PENDING_REVIEW')
 
+        # If execution mode is PERSIST_DRAFT, persist validated baseline to database
+        if str(execution_mode).upper() == "PERSIST_DRAFT":
+            try:
+                from services.final_baseline_service import FinalBaselineService
+                persist_report = FinalBaselineService.persist_draft_baseline_to_db(thread_conn, project_id, document_id)
+                logger.output("Draft Baseline DB Persistence", f"ID: {persist_report.get('baseline_id')} (v{persist_report.get('version')}) - {persist_report.get('total_records_persisted')} records")
+            except Exception as p_err:
+                logger.log(f"Error during draft baseline database persistence: {p_err}", level="WARN")
+
         # Mark as COMPLETED
         upd2 = thread_conn.cursor()
         upd2.execute(
@@ -1025,6 +1279,8 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
 class ExtractRequest(BaseModel):
     # "QUICK" (default, existing deterministic hybrid) or "DEEP_SCAN" (Map-Reduce).
     mode: Optional[str] = QUICK_EXTRACT
+    # "INSPECTION" / "DRY_RUN" (read-only) or "PERSIST_DRAFT" (persists to DB)
+    execution_mode: Optional[str] = "INSPECTION" 
 
 
 @router.post("/extract")
@@ -1069,15 +1325,55 @@ def extract_baseline(
     db.commit()
     cursor.close()
 
+    exec_mode = (payload.execution_mode if payload and payload.execution_mode else "INSPECTION").upper()
+    if exec_mode not in ("INSPECTION", "DRY_RUN", "PERSIST_DRAFT"):
+        exec_mode = "INSPECTION"
+
     thread = threading.Thread(
         target=run_baseline_pipeline,
         args=(project_id, document_id, mode),
+        kwargs={"execution_mode": exec_mode},
         daemon=True
     )
     thread.start()
 
     mode_label = "Deep Scan" if mode == DEEP_SCAN else "Quick Extract"
     return {"success": True, "message": f"Baseline extraction started ({mode_label})", "data": {"baseline_id": None, "mode": mode}}
+
+
+@router.post("/persist-draft")
+def persist_draft_baseline(
+    project_id: int,
+    document_id: Optional[int] = Query(None),
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    from services.final_baseline_service import FinalBaselineService
+    
+    if not document_id:
+        cursor = db.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id FROM documents WHERE project_id = %s AND document_type IN ('EL', 'IFA') ORDER BY id DESC LIMIT 1",
+            (project_id,)
+        )
+        d_row = cursor.fetchone()
+        cursor.close()
+        if d_row:
+            document_id = d_row["id"]
+    
+    if not document_id:
+        raise HTTPException(status_code=400, detail="Cannot determine document ID for baseline persistence")
+        
+    result = FinalBaselineService.persist_draft_baseline_to_db(db, project_id, document_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=422, detail=result.get("message", "Draft baseline persistence failed"))
+        
+    return {
+        "success": True,
+        "message": f"Draft baseline v{result.get('version')} (ID #{result.get('baseline_id')}) persisted successfully to database.",
+        "data": result
+    }
 
 @router.get("/")
 def get_baseline(project_id: int, current_user: dict = Depends(get_current_user), db: mysql.connector.connection.MySQLConnection = Depends(get_db)):
@@ -2120,3 +2416,90 @@ def trigger_followup_reminders(
     res = run_followup_checks(target_date)
     return res
 
+
+
+@router.get("/step10-analysis")
+def get_step10_analysis(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    from services.final_baseline_service import FinalBaselineService
+    res = FinalBaselineService.load_validated_final_baseline(project_id=project_id)
+    if res.get("status") in ("SUCCESS", "BLOCKED"):
+        return {"success": True, "data": res.get("artifact") or res.get("dashboard_payload")}
+    return {
+        "success": True,
+        "data": {
+            "status": res.get("status", "NOT_GENERATED"),
+            "message": res.get("message", "Step 10 analysis has not been generated yet for this project."),
+            "dashboard_payload": None,
+        }
+    }
+
+
+@router.get("/final")
+def get_final_baseline(
+    project_id: int,
+    document_id: Optional[int] = Query(None),
+    run_id: Optional[str] = Query(None),
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    verify_project_access(project_id, current_user, db)
+    from services.final_baseline_service import FinalBaselineService
+    res = FinalBaselineService.load_validated_final_baseline(
+        project_id=project_id,
+        document_id=document_id,
+        run_id=run_id
+    )
+    if res.get("status") == "NOT_GENERATED":
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=res.get("message", "Final baseline artifact not found or not ready yet.")
+        )
+    if res.get("status") == "BLOCKED":
+        return {
+            "success": False,
+            "status": "BLOCKED",
+            "message": res.get("message", "Baseline failed mandatory validation gates."),
+            "validation_errors": res.get("validation_errors", []),
+            "data": res.get("artifact")
+        }
+    if res.get("status") == "FAILED":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=res.get("message", "Baseline artifact corrupted or unparseable.")
+        )
+    artifact = res.get("artifact") or {}
+    try:
+        from services.final_baseline_service import FinalBaselineService
+        db_readback = FinalBaselineService.readback_and_verify_persisted_baseline(db, project_id, artifact=artifact)
+        if db_readback.get("is_valid"):
+            artifact["database_persistence"] = {
+                "is_persisted": True,
+                "baseline_id": db_readback.get("baseline_id"),
+                "version": db_readback.get("version"),
+                "status": db_readback.get("status"),
+                "total_scope_items": db_readback.get("total_scope_items"),
+                "milestones_count": db_readback.get("milestones_count"),
+                "dag_dependencies_count": db_readback.get("dag_dependencies_count"),
+                "reconciled_with_artifact": db_readback.get("reconciled_with_artifact"),
+            }
+        else:
+            artifact["database_persistence"] = {
+                "is_persisted": False,
+                "message": db_readback.get("message", "Not persisted or incomplete in database.")
+            }
+    except Exception as dbe:
+        artifact["database_persistence"] = {
+            "is_persisted": False,
+            "error": str(dbe)
+        }
+
+    return {
+        "success": True,
+        "status": "READY",
+        "data": artifact
+    }

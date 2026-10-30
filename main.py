@@ -91,8 +91,9 @@ async def lifespan(app: FastAPI):
         pass
         
     try:
-        from init_db import run_tracker_migrations
+        from init_db import run_tracker_migrations, run_performance_indexes
         run_tracker_migrations()
+        run_performance_indexes()
     except Exception:
         pass
 
@@ -105,6 +106,24 @@ async def lifespan(app: FastAPI):
     try:
         from services.onedrive_inbox_service import ensure_onedrive_tables
         ensure_onedrive_tables()
+    except Exception:
+        pass
+
+    # 2.b Reset orphaned processing documents left interrupted by previous shutdowns
+    try:
+        from core.database import get_db_connection
+        conn = get_db_connection()
+        if conn and conn.is_connected():
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE documents 
+                SET processing_status = 'FAILED', 
+                    processing_error = 'Processing was interrupted by a backend restart. Please click re-process.'
+                WHERE processing_status IN ('PROCESSING', 'PARSING')
+            ''')
+            conn.commit()
+            cursor.close()
+            conn.close()
     except Exception:
         pass
 
@@ -200,12 +219,19 @@ if __name__ == "__main__":
             pass
 
     try:
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        watch_dirs = [
+            os.path.join(backend_dir, d)
+            for d in ["api", "services", "repositories", "core", "agents", "models"]
+            if os.path.isdir(os.path.join(backend_dir, d))
+        ]
         uvicorn.run(
             "main:app",
             host=settings.API_HOST or "0.0.0.0",
             port=int(settings.API_PORT or 8080),
             reload=True,
-            reload_excludes=["data/*", "*.log", "data/**/*", ".git/*"]
+            reload_dirs=watch_dirs,
+            reload_excludes=["data/*", "*.log", "data/**/*", ".git/*", "logs/*", "logs/**/*", "tests/*", "tests/**/*", "chroma_db/*", "chroma_db/**/*", "*.md", "*.json", "*.tmp"]
         )
     except KeyboardInterrupt:
         sys.exit(0)

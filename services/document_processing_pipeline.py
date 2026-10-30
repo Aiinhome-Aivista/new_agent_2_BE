@@ -83,4 +83,23 @@ class DocumentProcessingPipeline:
                 f.write(traceback.format_exc() + "\n")
             raise e
             
+        # ── Step 6: Risk Assessment Lifecycle Engine ──────────────────────────
+        try:
+            db_cursor.execute("SELECT document_name, document_type FROM documents WHERE id = %s", (document_id,))
+            doc_row = db_cursor.fetchone()
+            d_name = doc_row["document_name"] if isinstance(doc_row, dict) else (doc_row[0] if doc_row else f"Document_{document_id}")
+            d_type = doc_row["document_type"] if isinstance(doc_row, dict) else (doc_row[1] if doc_row else "STATUS_REPORT")
+            
+            from services.risk_lifecycle_service import RiskLifecycleService
+            RiskLifecycleService.process_report_risk_assessment(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=d_name,
+                doc_type=d_type,
+                report_text=text,
+                extractions=extraction_result,
+            )
+        except Exception as e:
+            print(f"Warning: RiskLifecycleService report assessment failed: {e}")
+
         _emit("Pipeline Complete", 100)
