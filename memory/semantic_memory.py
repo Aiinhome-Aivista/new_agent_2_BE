@@ -24,14 +24,11 @@ class SemanticMemory:
         cursor.execute("SELECT * FROM scope_items WHERE baseline_id = %s", (baseline["id"],))
         scope_items = cursor.fetchall()
         
-        cursor.execute("SELECT * FROM deliverables WHERE baseline_id = %s", (baseline["id"],))
-        deliverables = cursor.fetchall()
-        
         cursor.close()
         conn.close()
         
         return {
             "baseline": baseline,
             "scope_items": scope_items,
-            "deliverables": deliverables
+            "deliverables": []
         }

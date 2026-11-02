@@ -8,8 +8,16 @@ class ScopeClassifier:
     and then uses a small LLM prompt to classify it.
     """
     
-    IN_SCOPE_SECTIONS = {"In Scope", "Scope of Work", "Deliverables", "Responsibilities", "Milestones", "Recurring Commitments"}
-    OUT_OF_SCOPE_SECTIONS = {"Out of Scope", "Assumptions", "Client Responsibilities", "Customer Responsibilities"}
+    # Sections that are deterministically classified as IN_SCOPE or OUT_OF_SCOPE
+    # without needing an LLM call. Includes new sections for real-world ELs.
+    IN_SCOPE_SECTIONS = {
+        "In Scope", "Scope of Work", "Deliverables", "Responsibilities",
+        "Milestones", "Recurring Commitments",
+        # New sections added for narrative ELs (demo_EL type)
+        "Functional Scope", "Methodology", "Governance", "Support", "Acceptance",
+        "Assumptions", "Client Responsibilities", "Customer Responsibilities", "Dependencies",
+    }
+    OUT_OF_SCOPE_SECTIONS = {"Out of Scope", "Exclusions"}
     BAD_SECTIONS = OUT_OF_SCOPE_SECTIONS
 
     @classmethod
@@ -21,18 +29,25 @@ class ScopeClassifier:
     @classmethod
     def _apply_section_failsafe(cls, candidate: dict, original_scope_type: str = "UNCERTAIN", original_conf: float = 0.0, original_evidence: str = ""):
         cand_section = candidate.get("section", "General")
+        step3_ev = candidate.get("evidence_snippet") or candidate.get("evidence_text")
         if cand_section in cls.OUT_OF_SCOPE_SECTIONS:
             candidate["scope_type"] = "OUT_OF_SCOPE"
             candidate["confidence"] = 0.95
-            candidate["evidence_text"] = f"Item explicitly specified under '{cand_section}' section of the contract."
+            if not candidate.get("evidence_snippet"):
+                candidate["evidence_snippet"] = step3_ev or f"Item explicitly specified under '{cand_section}' section of the contract."
+            candidate["classification_evidence"] = f"Item explicitly specified under '{cand_section}' section of the contract."
         elif cand_section in cls.IN_SCOPE_SECTIONS:
             candidate["scope_type"] = "IN_SCOPE"
             candidate["confidence"] = 0.90
-            candidate["evidence_text"] = f"Item specified under '{cand_section}' section of the contract."
+            if not candidate.get("evidence_snippet"):
+                candidate["evidence_snippet"] = step3_ev or f"Item specified under '{cand_section}' section of the contract."
+            candidate["classification_evidence"] = f"Item specified under '{cand_section}' section of the contract."
         else:
             candidate["scope_type"] = original_scope_type
             candidate["confidence"] = original_conf
-            candidate["evidence_text"] = original_evidence or "No specific supporting evidence found in the contract."
+            if not candidate.get("evidence_snippet"):
+                candidate["evidence_snippet"] = step3_ev or original_evidence or "No specific supporting evidence found in the contract."
+            candidate["classification_evidence"] = original_evidence or "No specific supporting evidence found in the contract."
 
     @classmethod
     def prefilter_by_heading(cls, candidate: dict) -> dict | None:
@@ -44,11 +59,13 @@ class ScopeClassifier:
         cand_section = candidate.get("section", "General")
         
         # Unambiguous Out-of-Scope sections
+        step3_ev = candidate.get("evidence_text") or candidate.get("evidence_snippet")
         if cand_section in cls.OUT_OF_SCOPE_SECTIONS:
             c = dict(candidate)
             c["scope_type"] = "OUT_OF_SCOPE"
             c["confidence"] = 1.0
-            c["evidence_text"] = f"Deterministic section classification from '{cand_section}' heading."
+            c["evidence_text"] = step3_ev or f"Deterministic section classification from '{cand_section}' heading."
+            c["classification_evidence"] = f"Deterministic section classification from '{cand_section}' heading."
             return c
 
         # Unambiguous In-Scope sections
@@ -57,14 +74,13 @@ class ScopeClassifier:
             # If explicit exclusion signals exist, do not classify deterministically
             has_exclusion = any(sig in cand_text for sig in [
                 "not included", "excluded", "out of scope", "outside the scope",
-                "customer responsibility", "client responsibility",
-                "client will provide", "customer will provide"
             ])
             if not has_exclusion:
                 c = dict(candidate)
                 c["scope_type"] = "IN_SCOPE"
                 c["confidence"] = 1.0
-                c["evidence_text"] = f"Deterministic section classification from '{cand_section}' heading."
+                c["evidence_text"] = step3_ev or f"Deterministic section classification from '{cand_section}' heading."
+                c["classification_evidence"] = f"Deterministic section classification from '{cand_section}' heading."
                 return c
 
         # Ambiguous item needing LLM evaluation
@@ -166,11 +182,14 @@ class ScopeClassifier:
                 
             combined_evidence = "\n\n".join(evidence_texts)
             if not combined_evidence:
-                cand_sec = candidate.get("section", "General")
-                if cand_sec in cls.BAD_SECTIONS or cand_sec != "General":
-                    combined_evidence = cls._get_section_fallback_evidence(candidate)
+                if candidate.get("evidence_text"):
+                    combined_evidence = f"Evidence from Step 3 Provenance Verification:\n{candidate['evidence_text']}"
                 else:
-                    combined_evidence = "No specific supporting evidence found in the contract."
+                    cand_sec = candidate.get("section", "General")
+                    if cand_sec in cls.BAD_SECTIONS or cand_sec != "General":
+                        combined_evidence = cls._get_section_fallback_evidence(candidate)
+                    else:
+                        combined_evidence = "No specific supporting evidence found in the contract."
             
             deterministic_result = {}
                 
@@ -257,7 +276,9 @@ class ScopeClassifier:
                                   f"item name contains explicit exclusion language.")
                             candidate_ref["scope_type"] = scope_type
                             candidate_ref["confidence"] = confidence
-                            candidate_ref["evidence_text"] = evidence_text
+                            if not candidate_ref.get("evidence_text"):
+                                candidate_ref["evidence_text"] = evidence_text
+                            candidate_ref["classification_evidence"] = evidence_text
 
                     # NEVER apply IN_SCOPE failsafe to items under Out of Scope sections
                     elif cand_sec in cls.OUT_OF_SCOPE_SECTIONS and scope_type == "IN_SCOPE":
@@ -277,7 +298,9 @@ class ScopeClassifier:
                     else:
                         candidate_ref["scope_type"] = scope_type
                         candidate_ref["confidence"] = confidence
-                        candidate_ref["evidence_text"] = evidence_text
+                        candidate_ref["classification_evidence"] = evidence_text
+                        if not candidate_ref.get("evidence_snippet"):
+                            candidate_ref["evidence_snippet"] = candidate_ref.get("evidence_text")
             except Exception as e:
                 print(f"Failed to classify batch {i}: {e}")
                 for item in batch_slice:

@@ -1281,7 +1281,7 @@ class RiskEvaluationAgent:
 
                 db_cursor.execute("""
                     SELECT id, name FROM scope_items
-                    WHERE project_id = %s AND (deadline IS NOT NULL OR milestone IS NOT NULL)
+                    WHERE project_id = %s AND (deadline IS NOT NULL OR estimated_deadline IS NOT NULL OR milestone IS NOT NULL)
                 """, (project_id,))
                 scheduled_items = db_cursor.fetchall() or []
 
@@ -2079,14 +2079,14 @@ class RiskEvaluationAgent:
             if not p_date_str:
                 if result.get("planned_date"):
                     p_date_str = str(result["planned_date"])
-                elif matched_si and matched_si.get("deadline"):
-                    p_date_str = str(matched_si["deadline"])
+                elif matched_si and (matched_si.get("deadline") or matched_si.get("estimated_deadline")):
+                    p_date_str = str(matched_si.get("deadline") or matched_si.get("estimated_deadline"))
                 elif result.get("due_date"):
                     p_date_str = str(result["due_date"])
                 else:
                     for si in all_baseline_items:
-                        if _normalize(si.get("name", "")) == c_norm and si.get("deadline"):
-                            p_date_str = str(si["deadline"])
+                        if _normalize(si.get("name", "")) == c_norm and (si.get("deadline") or si.get("estimated_deadline")):
+                            p_date_str = str(si.get("deadline") or si.get("estimated_deadline"))
                             break
 
                 if p_date_str:
@@ -2275,8 +2275,8 @@ class RiskEvaluationAgent:
                 if not c_item.get('expected_date'):
                     t_norm = _normalize(c_item.get('title', ''))
                     for si in (scope_items or []):
-                        if _normalize(si.get('name', '')) == t_norm and (si.get('deadline') or si.get('planned_date')):
-                            d_val = str(si.get('deadline') or si.get('planned_date'))
+                        if _normalize(si.get('name', '')) == t_norm and (si.get('deadline') or si.get('estimated_deadline') or si.get('planned_date')):
+                            d_val = str(si.get('deadline') or si.get('estimated_deadline') or si.get('planned_date'))
                             c_item['expected_date'] = d_val
                             c_item['planned_date'] = d_val
                             c_item['deadline'] = d_val
@@ -2291,7 +2291,7 @@ class RiskEvaluationAgent:
                 si_norm = _normalize(si_name)
                 m_norm = _normalize(si.get('milestone_normalized') or si.get('milestone') or '')
                 if si_norm not in known_context_titles and (not m_norm or m_norm not in known_context_titles):
-                    deadline_val = si.get('deadline') or si.get('planned_date')
+                    deadline_val = si.get('deadline') or si.get('estimated_deadline') or si.get('planned_date')
                     if deadline_val:
                         open_items_for_context.append({
                             'title': si_name,
@@ -3099,7 +3099,7 @@ class RiskEvaluationAgent:
 
         # Synchronize scope_items status to COMPLETED for completed deliverables from MoM
         try:
-            from api.routes.baseline import _is_title_match
+            from core.helpers import is_title_match as _is_title_match
             import re
             from datetime import datetime, date as date_type
 
@@ -3127,7 +3127,7 @@ class RiskEvaluationAgent:
                 si_name = si["name"] if isinstance(si, dict) else si[1]
                 si_rec = bool(si.get("is_recurring") if isinstance(si, dict) else (si[3] if len(si) > 3 else False))
                 si_pid = si.get("parent_scope_item_id") if isinstance(si, dict) else (si[4] if len(si) > 4 else None)
-                si_dl = si.get("deadline") if isinstance(si, dict) else (si[5] if len(si) > 5 else None)
+                si_dl = (si.get("deadline") or si.get("estimated_deadline")) if isinstance(si, dict) else (si[5] or (si[6] if len(si) > 6 else None))
 
                 # Child occurrence of a recurring commitment
                 if si_rec and si_pid is not None:
@@ -3154,7 +3154,7 @@ class RiskEvaluationAgent:
                 # Standard non-recurring deliverable
                 return _is_title_match(res_name, si_name)
 
-            db_cursor.execute("SELECT id, name, completion_status, is_recurring, parent_scope_item_id, deadline FROM scope_items WHERE project_id = %s", (project_id,))
+            db_cursor.execute("SELECT id, name, completion_status, is_recurring, parent_scope_item_id, deadline, estimated_deadline FROM scope_items WHERE project_id = %s", (project_id,))
             current_scope_items = db_cursor.fetchall() or []
             
             for resolved in resolved_items:
@@ -3245,7 +3245,8 @@ class RiskEvaluationAgent:
 
         # Re-evaluate topological graph and recalculate execution queues
         try:
-            from api.routes.baseline import _rebuild_graph_and_recalculate
+            from services.risk_lifecycle_service import RiskLifecycleService
+            _rebuild_graph_and_recalculate = RiskLifecycleService.rebuild_graph_and_recalculate
             _rebuild_graph_and_recalculate(db_cursor, project_id, None)
         except Exception as e:
             print(f"Warning: Auto-recalc after document evaluation failed: {e}")

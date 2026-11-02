@@ -39,13 +39,19 @@ class DocumentProcessingPipeline:
         _emit("Deterministic Classification", 40)
         try:
             from services.pmo_classifier import PMOClassifier
-            from services.entity_normalizer_service import EntityNormalizerService
+            from services.normalization_service import NormalizationService
             
             # Load baseline canonical names
-            normalizer = EntityNormalizerService()
-            db_cursor.execute("SELECT name FROM scope_items WHERE project_id = %s", (project_id,))
-            baseline_titles = [r['name'] if isinstance(r, dict) else r[0] for r in db_cursor.fetchall()]
-            baseline_canonical_names = set(normalizer.normalize(t, project_id) for t in baseline_titles)
+            db_cursor.execute("SELECT name, scope_item_normalized FROM scope_items WHERE project_id = %s", (project_id,))
+            baseline_rows = db_cursor.fetchall() or []
+            baseline_canonical_names = set()
+            for r in baseline_rows:
+                name = r['name'] if isinstance(r, dict) else r[0]
+                norm = r['scope_item_normalized'] if isinstance(r, dict) else (r[1] if len(r) > 1 else None)
+                if name:
+                    baseline_canonical_names.add(NormalizationService.normalize_scope_item(name))
+                if norm:
+                    baseline_canonical_names.add(norm)
             
             # Apply deterministic classification
             items = extraction_result.get("activities", [])
@@ -83,4 +89,23 @@ class DocumentProcessingPipeline:
                 f.write(traceback.format_exc() + "\n")
             raise e
             
+        # ── Step 6: Risk Assessment Lifecycle Engine ──────────────────────────
+        try:
+            db_cursor.execute("SELECT document_name, document_type FROM documents WHERE id = %s", (document_id,))
+            doc_row = db_cursor.fetchone()
+            d_name = doc_row["document_name"] if isinstance(doc_row, dict) else (doc_row[0] if doc_row else f"Document_{document_id}")
+            d_type = doc_row["document_type"] if isinstance(doc_row, dict) else (doc_row[1] if doc_row else "STATUS_REPORT")
+            
+            from services.risk_lifecycle_service import RiskLifecycleService
+            RiskLifecycleService.process_report_risk_assessment(
+                project_id=project_id,
+                document_id=document_id,
+                doc_name=d_name,
+                doc_type=d_type,
+                report_text=text,
+                extractions=extraction_result,
+            )
+        except Exception as e:
+            print(f"Warning: RiskLifecycleService report assessment failed: {e}")
+
         _emit("Pipeline Complete", 100)

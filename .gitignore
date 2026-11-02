@@ -26,3 +26,4 @@ data/
 requirements.txt
 *.md
 *.txt
+logs/

@@ -6,7 +6,7 @@ class Settings(BaseSettings):
     APP_ENV: str = "development"
     
     API_HOST: str = "0.0.0.0"
-    API_PORT: int = 8000
+    API_PORT: int = 8080
     API_PREFIX: str = "/api"
     
     FRONTEND_ORIGIN: str = "*"
@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     CHROMA_PATH: str = "data/chroma_db"
     UPLOAD_PATH: str = "data/uploads"
     
+    # ── Vector Database Configuration ──────────────────────────────────────────
+    VECTOR_DB_PROVIDER: str = "DEFAULT"  # Options: DEFAULT (ChromaDB), CHROMA, LOCAL, AZURE
+    VECTOR_STORE_MODE: str = "chroma"
+    
+    # ── Azure AI Search / Azure Vector DB Settings ──────────────────────────────
+    AZURE_SEARCH_ENDPOINT: str = ""
+    AZURE_SEARCH_API_KEY: str = ""
+    AZURE_SEARCH_INDEX_NAME: str = "acse-documents-index"
+    AZURE_SEARCH_API_VERSION: str = "2024-07-01"
+    
     # ── Storage Configuration ──────────────────────────────────────────────────
     CLOUD_PROVIDER: str = "DEFAULT"
     STORAGE_MODE: str = "local"  # Deprecated in favor of CLOUD_PROVIDER, keeping for fallback
@@ -81,6 +91,7 @@ class Settings(BaseSettings):
     AWS_S3_AGENT_FOLDER: str = ""
     
     # ── Azure Blob Integration ────────────────────────────────────────────────
+    AZURE_STORAGE_ACCOUNT: str = ""
     AZURE_STORAGE_CONNECTION_STRING: str = ""
     AZURE_CONTAINER_NAME: str = ""
     
@@ -127,7 +138,7 @@ class Settings(BaseSettings):
     EVAL_AUTO_JUDGE_ONLINE: bool = False
 
     class Config:
-        env_file = ".env"
+        env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
         extra = "ignore"
 
 settings = Settings()

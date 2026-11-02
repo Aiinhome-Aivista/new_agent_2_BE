@@ -16,7 +16,8 @@ router = APIRouter()
 def _safe_recalculate(cursor_or_db, project_id: int, completed_title: Optional[str] = None) -> None:
     """Safely runs tracker graph recalculation across remaining active items."""
     try:
-        from api.routes.baseline import _rebuild_graph_and_recalculate
+        from services.risk_lifecycle_service import RiskLifecycleService
+        _rebuild_graph_and_recalculate = RiskLifecycleService.rebuild_graph_and_recalculate
         if hasattr(cursor_or_db, 'cursor'):
             with db_cursor(cursor_or_db) as cursor:
                 _rebuild_graph_and_recalculate(cursor, project_id, completed_title)
@@ -314,3 +315,70 @@ def dismiss_resolution_suggestion(
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"Failed to dismiss suggestion for item #{item_id}: {str(e)}")
+
+
+class ProjectCompletionRequest(BaseModel):
+    completion_evidence: str
+    authorized_by: Optional[str] = None
+
+@router.get("/lifecycle")
+def get_risk_lifecycle(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    try:
+        verify_project_access(project_id, current_user, db)
+        from services.risk_lifecycle_service import RiskLifecycleService
+        current_reg = RiskLifecycleService.get_current_risk_register(project_id)
+        snapshots = RiskLifecycleService.get_project_snapshots(project_id)
+        return {
+            "success": True,
+            "data": {
+                "current_register": current_reg,
+                "snapshots_count": len(snapshots),
+                "snapshots": snapshots,
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch risk lifecycle: {str(e)}")
+
+@router.get("/snapshots")
+def get_risk_snapshots(
+    project_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    try:
+        verify_project_access(project_id, current_user, db)
+        from services.risk_lifecycle_service import RiskLifecycleService
+        snapshots = RiskLifecycleService.get_project_snapshots(project_id)
+        return {"success": True, "data": snapshots}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch risk snapshots: {str(e)}")
+
+@router.post("/complete-project")
+def complete_project_risks(
+    project_id: int,
+    req: ProjectCompletionRequest,
+    current_user: dict = Depends(require_roles(["ADMIN", "ENGAGEMENT_MANAGER"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    try:
+        verify_project_access(project_id, current_user, db)
+        from services.risk_lifecycle_service import RiskLifecycleService
+        authorizer = req.authorized_by or current_user.get("name") or current_user.get("email") or "Authorized PM"
+        final_summary = RiskLifecycleService.finalize_project_risks(
+            project_id=project_id,
+            completion_evidence=req.completion_evidence,
+            authorized_by=authorizer
+        )
+        return {"success": True, "message": "Project risk lifecycle completed", "data": final_summary}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to complete project risk lifecycle: {str(e)}")

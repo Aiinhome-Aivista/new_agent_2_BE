@@ -31,6 +31,23 @@ def _clean_terminal_print(*args, **kwargs):
         "CRITICAL:",
         "Traceback",
         "[LLM",
+        "[BASELINE",
+        ">> [BASELINE",
+        "[*] STEP",
+        "[✓] STEP",
+        "[INPUT]",
+        "[OUTPUT]",
+        "[PROCESS]",
+        "[Scope",
+        "[ScopeSection",
+        "[Chunk",
+        "[SectionDetector",
+        "[DeepScan",
+        "[Milestone",
+        "[Recurring",
+        "[Document",
+        "[BulletExtractor]",
+        "[MilestoneRow]",
     )
     if any(sig in text for sig in allowed_signatures):
         _original_builtin_print(*args, **kwargs)
@@ -74,8 +91,9 @@ async def lifespan(app: FastAPI):
         pass
         
     try:
-        from init_db import run_tracker_migrations
+        from init_db import run_tracker_migrations, run_performance_indexes
         run_tracker_migrations()
+        run_performance_indexes()
     except Exception:
         pass
 
@@ -88,6 +106,24 @@ async def lifespan(app: FastAPI):
     try:
         from services.onedrive_inbox_service import ensure_onedrive_tables
         ensure_onedrive_tables()
+    except Exception:
+        pass
+
+    # 2.b Reset orphaned processing documents left interrupted by previous shutdowns
+    try:
+        from core.database import get_db_connection
+        conn = get_db_connection()
+        if conn and conn.is_connected():
+            cursor = conn.cursor()
+            cursor.execute('''
+                UPDATE documents 
+                SET processing_status = 'FAILED', 
+                    processing_error = 'Processing was interrupted by a backend restart. Please click re-process.'
+                WHERE processing_status IN ('PROCESSING', 'PARSING')
+            ''')
+            conn.commit()
+            cursor.close()
+            conn.close()
     except Exception:
         pass
 
@@ -125,6 +161,10 @@ raw_origins = [o.strip() for o in settings.FRONTEND_ORIGIN.split(",") if o.strip
 allow_origins = ["*"] if "*" in raw_origins else list(set(raw_origins + [
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
+    "http://localhost:5175",
+    "http://127.0.0.1:5175",
     "http://localhost:8080",
     "http://127.0.0.1:8080"
 ]))
@@ -132,6 +172,7 @@ allow_origins = ["*"] if "*" in raw_origins else list(set(raw_origins + [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=allow_origins,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -178,12 +219,19 @@ if __name__ == "__main__":
             pass
 
     try:
+        backend_dir = os.path.dirname(os.path.abspath(__file__))
+        watch_dirs = [
+            os.path.join(backend_dir, d)
+            for d in ["api", "services", "repositories", "core", "agents", "models"]
+            if os.path.isdir(os.path.join(backend_dir, d))
+        ]
         uvicorn.run(
             "main:app",
             host=settings.API_HOST or "0.0.0.0",
             port=int(settings.API_PORT or 8080),
             reload=True,
-            reload_excludes=["data/*", "*.log", "data/**/*", ".git/*"]
+            reload_dirs=watch_dirs,
+            reload_excludes=["data/*", "*.log", "data/**/*", ".git/*", "logs/*", "logs/**/*", "tests/*", "tests/**/*", "chroma_db/*", "chroma_db/**/*", "*.md", "*.json", "*.tmp"]
         )
     except KeyboardInterrupt:
         sys.exit(0)

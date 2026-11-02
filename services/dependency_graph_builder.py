@@ -432,6 +432,7 @@ class DependencyGraphBuilder:
         unresolved_by_source: Dict[str, List[dict]] = collections.defaultdict(list)
         # Validation counters (use list so closures can mutate)
         self_deps_counter = [0]
+        cycle_edges_rejected_counter = [0]
         # UAT-CYCLE FIX: Track dynamic adjacency incrementally to check cycles on dynamic edges only (Part A)
         dynamic_adjacency: Dict[str, List[str]] = collections.defaultdict(list)
 
@@ -456,7 +457,7 @@ class DependencyGraphBuilder:
                         continue
                     raw_str = str(raw_ref).strip()
 
-                    if _is_invalid_target(raw_str):
+                    if _is_invalid_target(raw_str) and not resolver.resolve(raw_str).resolved:
                         print(f"  [GraphValidator] REJECTED '{raw_str}' "
                               f"({direction_label} of '{cand.get('activity')}') "
                               f"— non-entity text")
@@ -535,6 +536,7 @@ class DependencyGraphBuilder:
                 # UAT-CYCLE FIX: Check cycle against dynamic_adjacency only before adding edge (Part A)
                 if _is_genuine_cycle(blocker_id, source_id, dynamic_adjacency):
                     print(f"  [GraphValidator] False cycle / reverse edge rejected: {blocker_id} -> {source_id}")
+                    cycle_edges_rejected_counter[0] += 1
                     continue
 
                 key = (blocker_id, source_id)
@@ -563,6 +565,7 @@ class DependencyGraphBuilder:
                 # UAT-CYCLE FIX: Check cycle against dynamic_adjacency only before adding edge (Part A)
                 if _is_genuine_cycle(source_id, blocked_id, dynamic_adjacency):
                     print(f"  [GraphValidator] False cycle / reverse edge rejected: {source_id} -> {blocked_id}")
+                    cycle_edges_rejected_counter[0] += 1
                     continue
 
                 key = (source_id, blocked_id)
@@ -609,7 +612,7 @@ class DependencyGraphBuilder:
         # Break cycles and count
         edges_before_cycle = len(valid_edges)
         valid_edges = _detect_and_break_cycles(fwd, bwd, valid_edges)
-        cycle_edges_rejected = edges_before_cycle - len(valid_edges)
+        cycle_edges_rejected = (edges_before_cycle - len(valid_edges)) + cycle_edges_rejected_counter[0]
 
         # Build edge_conditions map for ReadinessEngine: {(src, tgt): "AND"|"OR"}
         edge_conditions: Dict[Tuple[str, str], str] = {
@@ -807,6 +810,10 @@ class DependencyGraphBuilder:
             # ── Unresolved external dependencies (structured, not executable) ──
             cand["unresolved_dependencies"] = [
                 ur["raw_name"] for ur in unresolved_by_source.get(cid, [])
+            ]
+            cand["unresolved_external_dependencies"] = [
+                {"label": ur["raw_name"], "raw_name": ur["raw_name"], "canonical_id": None}
+                for ur in unresolved_by_source.get(cid, [])
             ]
 
         # ── GRAPH VALIDATION CONTRACT ─────────────────────────────────────────

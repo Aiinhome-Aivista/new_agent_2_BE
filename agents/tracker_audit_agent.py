@@ -143,7 +143,7 @@ def suggest_resolution(db_cursor, project_id: int, document_id: int,
                 break
             # Fuzzy fallback
             try:
-                from api.routes.baseline import _is_title_match
+                from core.helpers import is_title_match as _is_title_match
                 if _is_title_match(title, existing_title):
                     matched_id = existing_id
                     matched_reasoning = existing_reasoning
@@ -254,7 +254,7 @@ class TrackerAuditAgent:
                 break
             elif title and existing_title:
                 try:
-                    from api.routes.baseline import _is_title_match
+                    from core.helpers import is_title_match as _is_title_match
                     if _is_title_match(title, existing_title):
                         matched_row = row
                         break

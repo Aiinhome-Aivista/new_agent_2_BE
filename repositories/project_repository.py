@@ -26,12 +26,30 @@ class ProjectRepository:
         from datetime import datetime, date
         cursor = db.cursor(dictionary=True)
         
-        try:
-            cursor.execute("SELECT project_id, document_type FROM documents")
-            docs = cursor.fetchall()
-        except Exception:
-            docs = []
-            
+        target_pids = [p["id"] for p in projects if p.get("id") is not None]
+        if target_pids:
+            placeholders = ','.join(['%s'] * len(target_pids))
+            params = tuple(target_pids)
+            try:
+                cursor.execute(f"SELECT project_id, document_type FROM documents WHERE project_id IN ({placeholders})", params)
+                docs = cursor.fetchall()
+            except Exception:
+                docs = []
+                
+            try:
+                cursor.execute(f"SELECT project_id, status FROM scope_baselines WHERE project_id IN ({placeholders})", params)
+                baselines = cursor.fetchall()
+            except Exception:
+                baselines = []
+                
+            try:
+                cursor.execute(f"SELECT project_id, status FROM tracker_items WHERE project_id IN ({placeholders})", params)
+                tracker_items = cursor.fetchall()
+            except Exception:
+                tracker_items = []
+        else:
+            docs, baselines, tracker_items = [], [], []
+
         docs_by_project = {}
         for d in docs:
             pid = d["project_id"]
@@ -39,19 +57,7 @@ class ProjectRepository:
                 docs_by_project[pid] = set()
             docs_by_project[pid].add(d["document_type"])
             
-        try:
-            cursor.execute("SELECT project_id, status FROM scope_baselines")
-            baselines = cursor.fetchall()
-        except Exception:
-            baselines = []
-            
         approved_baselines_by_project = {b["project_id"] for b in baselines if b.get("status") == "APPROVED"}
-        
-        try:
-            cursor.execute("SELECT project_id, status FROM tracker_items")
-            tracker_items = cursor.fetchall()
-        except Exception:
-            tracker_items = []
             
         tracker_by_project = {}
         for ti in tracker_items:
