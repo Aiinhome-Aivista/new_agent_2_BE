@@ -10,7 +10,7 @@ class HybridRetrievalService:
     def get_reranker(cls):
         if cls._reranker is None and settings.ENABLE_RERANKER:
             from sentence_transformers import CrossEncoder
-            cls._reranker = CrossEncoder(settings.RERANKER_MODEL)
+            cls._reranker = CrossEncoder(settings.RERANKER_MODEL, device="cpu")
         return cls._reranker
 
     @staticmethod

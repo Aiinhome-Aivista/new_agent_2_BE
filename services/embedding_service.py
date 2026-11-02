@@ -7,7 +7,7 @@ class EmbeddingService:
     def get_model(cls):
         if cls._model is None:
             from sentence_transformers import SentenceTransformer
-            cls._model = SentenceTransformer(settings.EMBEDDING_MODEL)
+            cls._model = SentenceTransformer(settings.EMBEDDING_MODEL, device="cpu")
         return cls._model
 
     @classmethod
