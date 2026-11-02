@@ -91,14 +91,14 @@ def get_project(
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     try:
+        project = ProjectRepository.get_project_by_id(db, project_id)
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+
         if current_user["role"] not in ["ADMIN", "PMO_REVIEWER", "FINANCE_COMMERCIAL"]:
             assigned = ProjectRepository.check_user_project_assignment(db, project_id, current_user["id"])
             if not assigned:
                 raise HTTPException(status_code=403, detail="Not assigned to this project")
-                
-        project = ProjectRepository.get_project_by_id(db, project_id)
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found")
             
         if project.get("latest_sub_agent_results"):
             import json
