@@ -1,82 +1,69 @@
-from core.config import settings
-import os
-import threading
+from typing import List, Dict, Any, Optional
+from services.vector_store.factory import VectorStoreFactory
 
 class ChromaService:
-    _client = None
-    _collection = None
-    _lock = threading.RLock()
+    """
+    ChromaService facade for vector database interactions.
+    Delegates all operations dynamically to the active provider (ChromaDB or Azure AI Search)
+    resolved by VectorStoreFactory, ensuring 100% backward compatibility for all existing callers.
+    """
+
+    @classmethod
+    def get_provider(cls):
+        return VectorStoreFactory.get_provider()
 
     @classmethod
     def get_client(cls):
-        if cls._client is None:
-            with cls._lock:
-                if cls._client is None:
-                    import chromadb
-                    from chromadb.config import Settings as ChromaSettings
-                    db_path = os.path.abspath(settings.CHROMA_PATH)
-                    os.makedirs(db_path, exist_ok=True)
-                    cls._client = chromadb.PersistentClient(path=db_path, settings=ChromaSettings(anonymized_telemetry=False))
-        return cls._client
+        provider = cls.get_provider()
+        if hasattr(provider, "get_client"):
+            return provider.get_client()
+        return None
 
     @classmethod
     def get_collection(cls):
-        if cls._collection is None:
-            with cls._lock:
-                if cls._collection is None:
-                    client = cls.get_client()
-                    cls._collection = client.get_or_create_collection(name="acse_documents")
-        return cls._collection
+        return cls.get_provider().get_collection()
 
     @classmethod
-    def add_chunks(cls, project_id: int, document_id: int, document_name: str, document_type: str, chunks: list[dict], embeddings: list[list[float]]):
-        collection = cls.get_collection()
-        ids = []
-        metadatas = []
-        documents = []
-
-        for chunk in chunks:
-            chunk_id = f"proj_{project_id}_doc_{document_id}_chunk_{chunk['chunk_index']}"
-            ids.append(chunk_id)
-            documents.append(chunk["text"])
-            metadatas.append({
-                "project_id": project_id,
-                "document_id": document_id,
-                "document_name": document_name,
-                "document_type": document_type,
-                "page_number": chunk.get("page_number", -1) or -1, # chroma prefers numbers or strings, avoid None
-                "chunk_index": chunk["chunk_index"]
-            })
-            
-        if ids:
-            collection.add(
-                ids=ids,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                documents=documents
-            )
-
-    @classmethod
-    def search(cls, project_id: int, query_embedding: list[float], document_types: list[str] = None, top_k: int = 10):
-        collection = cls.get_collection()
-        where_filter = None
-        if document_types:
-            if len(document_types) == 1:
-                where_filter = {"$and": [{"project_id": project_id}, {"document_type": document_types[0]}]}
-            else:
-                where_filter = {"$and": [{"project_id": project_id}, {"document_type": {"$in": document_types}}]}
-        else:
-            where_filter = {"project_id": project_id}
-
-        results = collection.query(
-            query_embeddings=[query_embedding],
-            n_results=top_k,
-            where=where_filter,
-            include=["documents", "metadatas", "distances"]
+    def add_chunks(
+        cls,
+        project_id: int,
+        document_id: int,
+        document_name: str,
+        document_type: str,
+        chunks: list,
+        embeddings: list,
+    ) -> None:
+        return cls.get_provider().add_chunks(
+            project_id=project_id,
+            document_id=document_id,
+            document_name=document_name,
+            document_type=document_type,
+            chunks=chunks,
+            embeddings=embeddings,
         )
-        return results
 
     @classmethod
-    def delete_document_chunks(cls, document_id: int):
-        collection = cls.get_collection()
-        collection.delete(where={"document_id": document_id})
+    def search(
+        cls,
+        project_id: int,
+        query_embedding: list,
+        document_types: list = None,
+        top_k: int = 10,
+    ) -> Dict[str, Any]:
+        return cls.get_provider().search(
+            project_id=project_id,
+            query_embedding=query_embedding,
+            document_types=document_types,
+            top_k=top_k,
+        )
+
+    @classmethod
+    def delete_document_chunks(cls, document_id: int) -> None:
+        return cls.get_provider().delete_document_chunks(document_id)
+
+    @classmethod
+    def probe_document(cls, project_id: int, document_id: int) -> Dict[str, Any]:
+        return cls.get_provider().probe_document(project_id, document_id)
+
+# Unified alias
+VectorStoreService = ChromaService

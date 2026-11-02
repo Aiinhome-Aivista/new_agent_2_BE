@@ -68,6 +68,16 @@ class Settings(BaseSettings):
     CHROMA_PATH: str = "data/chroma_db"
     UPLOAD_PATH: str = "data/uploads"
     
+    # ── Vector Database Configuration ──────────────────────────────────────────
+    VECTOR_DB_PROVIDER: str = "DEFAULT"  # Options: DEFAULT (ChromaDB), CHROMA, LOCAL, AZURE
+    VECTOR_STORE_MODE: str = "chroma"
+    
+    # ── Azure AI Search / Azure Vector DB Settings ──────────────────────────────
+    AZURE_SEARCH_ENDPOINT: str = ""
+    AZURE_SEARCH_API_KEY: str = ""
+    AZURE_SEARCH_INDEX_NAME: str = "acse-documents-index"
+    AZURE_SEARCH_API_VERSION: str = "2024-07-01"
+    
     # ── Storage Configuration ──────────────────────────────────────────────────
     CLOUD_PROVIDER: str = "DEFAULT"
     STORAGE_MODE: str = "local"  # Deprecated in favor of CLOUD_PROVIDER, keeping for fallback
