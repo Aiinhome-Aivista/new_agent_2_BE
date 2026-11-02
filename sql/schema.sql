@@ -251,6 +251,10 @@ estimated_effort_low DECIMAL(6,2) NULL,
 estimated_effort_likely DECIMAL(6,2) NULL,
 estimated_effort_high DECIMAL(6,2) NULL,
 baseline_approval_status VARCHAR(20) NULL DEFAULT 'PENDING_REVIEW',
+record_category VARCHAR(60) NULL DEFAULT 'PROJECT_WORK',
+work_item_eligible TINYINT(1) NOT NULL DEFAULT 0,
+responsibility_owner VARCHAR(255) NULL DEFAULT 'VENDOR',
+delivery_owner VARCHAR(255) NULL DEFAULT 'VENDOR',
 
     CONSTRAINT fk_scope_item_baseline
         FOREIGN KEY (baseline_id)

@@ -470,6 +470,10 @@ class Step5Inspector:
                 "evidence_text": item.get("evidence_text") or item.get("evidence_snippet", ""),
                 "confidence": float(item.get("confidence") or 0.85),
                 "is_work_eligible": is_work_eligible,
+                "work_item_eligible": is_work_eligible,
+                "record_category": item.get("record_category") or ("PROJECT_WORK" if is_work_eligible else ("OUT_OF_SCOPE" if st == "OUT_OF_SCOPE" else ("PENDING_REVIEW" if is_uncertain else "CONTEXTUAL_INFORMATION"))),
+                "responsibility_owner": item.get("responsibility_owner") or ("CLIENT" if st == "OUT_OF_SCOPE" else "VENDOR"),
+                "delivery_owner": item.get("delivery_owner") or ("OUT_OF_SCOPE" if st == "OUT_OF_SCOPE" else "VENDOR"),
                 "traceability": {
                     "source_chunk": item.get("chunk_index"),
                     "segment_locator": item.get("segment_locator"),

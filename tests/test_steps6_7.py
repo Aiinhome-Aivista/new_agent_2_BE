@@ -510,7 +510,10 @@ def test_step_10_never_invoked():
     """
     Test 16: Verify inspection completion and safety marker in baseline.py.
     """
-    with open("api/routes/baseline.py", "r", encoding="utf-8") as f:
+    base_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "api", "routes", "baseline.py")
+    if not os.path.exists(base_path):
+        base_path = "api/routes/baseline.py"
+    with open(base_path, "r", encoding="utf-8") as f:
         content = f.read()
     assert "Inspection Complete" in content
 

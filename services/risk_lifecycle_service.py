@@ -353,22 +353,24 @@ class RiskLifecycleService:
                 "review", "status", "report", "update", "system", "process", "service", 
                 "testing", "project", "pending", "complete", "completed", "sign-off", 
                 "deployment", "implementation", "deliverable", "meeting", "phase", 
-                "activity", "document", "documentation", "third-party", "vulnerability"
+                "activity", "document", "documentation", "third-party", "vulnerability",
+                "client", "customer", "vendor", "team", "operational", "blocker", "blocked", "waiting"
             }
-            significant_title_words = [
+            significant_title_words = list({
                 w.strip(".,;:()[]{}\"'")
                 for w in title_lower.split()
                 if len(w.strip(".,;:()[]{}\"'")) > 3 and w.strip(".,;:()[]{}\"'") not in GENERIC_STOP_WORDS
-            ]
+            })
 
             def _is_strong_match(text: str) -> bool:
                 if not text:
                     return False
                 t_low = text.lower()
                 # 1. Exact phrase match if title is substantial
-                if len(title_lower) >= 15 and title_lower in t_low:
+                clean_title = title_lower.replace("operational blocker:", "").strip()
+                if len(clean_title) >= 15 and clean_title in t_low:
                     return True
-                # 2. Or at least 2 significant specific content words must match
+                # 2. Or at least 2 significant distinct content words must match
                 if len(significant_title_words) >= 2:
                     matched = sum(1 for w in significant_title_words if w in t_low)
                     return matched >= 2

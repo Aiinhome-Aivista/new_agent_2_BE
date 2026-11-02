@@ -151,7 +151,18 @@ class Step4Inspector:
             record_type = "Acceptance Criteria"
         elif section in {"Functional Scope", "Scope of Work"}:
             record_type = "Scope Item"
-        elif section in {"Methodology", "Resources", "Technical Scope"}:
+        elif section == "Technical Scope":
+            # Actionable technical work items belong in the unified project work register
+            technical_work_signals = [
+                "implement", "develop", "configur", "setup", "integrat", "deploy", "build",
+                "api", "database", "pipeline", "schema", "test", "security", "infra", "service"
+            ]
+            if any(sig in comb_text for sig in technical_work_signals):
+                record_type = "Scope Item"
+                scope_type = "IN_SCOPE"
+            else:
+                record_type = "Contextual Contract Record"
+        elif section in {"Methodology", "Resources"}:
             record_type = "Contextual Contract Record"
         else:
             record_type = "General Obligation"
@@ -178,7 +189,17 @@ class Step4Inspector:
             verification_status = c.get("provenance_status", "VERIFIED")
 
         # 4. Work Item Eligibility (Schedulable in planning)
-        if scope_status == "IN_SCOPE" and record_type in {"Scope Item", "Deliverable", "Milestone", "Vendor Responsibility"}:
+        # Actionable vendor delivery work (Scope Items, Deliverables, or delivery Vendor Responsibilities)
+        # Pure Milestones, Governance, Client Responsibilities, Assumptions, Exclusions, Dependencies are NOT ordinary work items.
+        is_gov_or_committee = any(k in comb_text for k in [
+            "steering", "committee", "powers to decide", "fee negotiation", "fee adjustment",
+            "decide on project", "written notice", "billing", "rate card"
+        ])
+        is_vendor_delivery = (
+            record_type in {"Scope Item", "Deliverable"} or
+            (record_type == "Vendor Responsibility" and not is_gov_or_committee)
+        )
+        if scope_status == "IN_SCOPE" and is_vendor_delivery and record_type != "Milestone":
             work_item_eligible = True
         else:
             work_item_eligible = False
@@ -215,9 +236,58 @@ class Step4Inspector:
         else:
             recurrence = "One-time"
 
+        # 7. Standardized Record Category & Ownership Mapping (Remediation 1)
+        if work_item_eligible:
+            record_category = "PROJECT_WORK"
+            resp_owner = "VENDOR"
+            deliv_owner = "VENDOR"
+        elif record_type == "Milestone":
+            record_category = "MILESTONE"
+            resp_owner = "JOINT"
+            deliv_owner = "VENDOR"
+        elif record_type == "Client Responsibility":
+            record_category = "CLIENT_RESPONSIBILITY"
+            resp_owner = "CLIENT"
+            deliv_owner = "CLIENT"
+        elif record_type == "Dependency":
+            record_category = "CLIENT_DEPENDENCY"
+            resp_owner = "CLIENT"
+            deliv_owner = "VENDOR"
+        elif record_type == "Assumption":
+            record_category = "ASSUMPTION"
+            resp_owner = "JOINT"
+            deliv_owner = "JOINT"
+        elif recurrence != "One-time" or any(w in comb_text for w in ["status report", "stakeholder update", "committee meeting"]):
+            record_category = "COMMITMENT"
+            resp_owner = "VENDOR"
+            deliv_owner = "VENDOR"
+        elif record_type == "Governance Obligation" or is_gov_or_committee:
+            record_category = "GOVERNANCE_OBLIGATION"
+            resp_owner = "VENDOR" if c.get("actor_role") == "Vendor" else "JOINT"
+            deliv_owner = "VENDOR" if c.get("actor_role") == "Vendor" else "JOINT"
+        elif scope_status == "OUT_OF_SCOPE":
+            record_category = "OUT_OF_SCOPE"
+            resp_owner = "CLIENT"
+            deliv_owner = "OUT_OF_SCOPE"
+        elif scope_status == "UNCERTAIN":
+            record_category = "PENDING_REVIEW"
+            resp_owner = "UNKNOWN"
+            deliv_owner = "PENDING_REVIEW"
+        elif record_type in {"General Obligation", "Acceptance Criteria"}:
+            record_category = "CONTRACTUAL_CONDITION"
+            resp_owner = "JOINT"
+            deliv_owner = "JOINT"
+        else:
+            record_category = "CONTEXTUAL_INFORMATION"
+            resp_owner = "VENDOR"
+            deliv_owner = "VENDOR"
+
         c["record_type"] = record_type
+        c["record_category"] = record_category
         c["scope_type"] = scope_type
         c["scope_status"] = scope_status
+        c["responsibility_owner"] = resp_owner
+        c["delivery_owner"] = deliv_owner
         c["verification_status"] = verification_status
         c["work_item_eligible"] = work_item_eligible
         c["review_required"] = review_required

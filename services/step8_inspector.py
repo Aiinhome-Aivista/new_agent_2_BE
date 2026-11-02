@@ -222,9 +222,39 @@ class Step8Inspector:
             for r in structured_records + proposed_items
         )
         timeline_facts = DeadlineInferenceService.extract_timeline_facts(full_text_corpus)
-        contract_start_str = timeline_facts.get("contract_start_date") or "2027-01-22"
-        contract_end_str = timeline_facts.get("contract_end_date") or "2027-04-30"
-        support_end_str = timeline_facts.get("support_end_date") or "2027-07-31"
+        contract_start_str = timeline_facts.get("contract_start_date")
+        contract_end_str = timeline_facts.get("contract_end_date")
+        support_end_str = timeline_facts.get("support_end_date")
+
+        if not contract_start_str or not contract_end_str:
+            try:
+                from core.database import get_db_connection
+                _c = get_db_connection()
+                if _c:
+                    with _c.cursor(dictionary=True) as _cur:
+                        _cur.execute("SELECT start_date, end_date FROM projects WHERE id = %s", (project_id,))
+                        _prow = _cur.fetchone()
+                        if _prow:
+                            if not contract_start_str and _prow.get("start_date"):
+                                contract_start_str = str(_prow["start_date"])[:10]
+                            if not contract_end_str and _prow.get("end_date"):
+                                contract_end_str = str(_prow["end_date"])[:10]
+                    _c.close()
+            except Exception:
+                pass
+
+        if not contract_start_str:
+            contract_start_str = date.today().isoformat()
+        if not contract_end_str:
+            try:
+                contract_end_str = (datetime.strptime(contract_start_str, "%Y-%m-%d").date() + timedelta(days=90)).isoformat()
+            except Exception:
+                contract_end_str = contract_start_str
+        if not support_end_str:
+            try:
+                support_end_str = (datetime.strptime(contract_end_str, "%Y-%m-%d").date() + timedelta(days=90)).isoformat()
+            except Exception:
+                support_end_str = contract_end_str
 
         try:
             base_start = datetime.strptime(contract_start_str, "%Y-%m-%d").date()
@@ -379,7 +409,6 @@ class Step8Inspector:
                                 if d_match:
                                     raw_d = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', d_match.group(1))
                                     try:
-                                        from datetime import datetime
                                         dt = datetime.strptime(raw_d, "%d %B %Y")
                                         p_dt = dt.strftime("%Y-%m-%d")
                                     except Exception:

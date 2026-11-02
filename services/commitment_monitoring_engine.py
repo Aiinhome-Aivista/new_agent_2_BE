@@ -71,10 +71,10 @@ class CommitmentMonitoringEngine:
         if db_cursor and project_id:
             try:
                 db_cursor.execute("""
-                    SELECT id, name, deadline, completion_status, is_recurring, parent_scope_item_id
+                    SELECT id, name, COALESCE(deadline, estimated_deadline) as deadline, completion_status, is_recurring, parent_scope_item_id
                     FROM scope_items
                     WHERE project_id = %s
-                      AND (deadline IS NOT NULL OR is_recurring = 1)
+                      AND (deadline IS NOT NULL OR estimated_deadline IS NOT NULL OR is_recurring = 1)
                 """, (project_id,))
                 scope_rows = db_cursor.fetchall() or []
             except Exception as e:

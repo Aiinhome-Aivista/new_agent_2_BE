@@ -273,7 +273,7 @@ class BaselineRepository:
         cursor.close()
 
     @staticmethod
-    def get_latest_baseline_details(db: mysql.connector.connection.MySQLConnection, project_id: int) -> Optional[Dict[str, Any]]:
+    def get_latest_baseline_details(db: mysql.connector.connection.MySQLConnection, project_id: int, skip_artifact_enrichment: bool = False) -> Optional[Dict[str, Any]]:
         cursor = db.cursor(dictionary=True)
         cursor.execute("SELECT * FROM scope_baselines WHERE project_id = %s ORDER BY id DESC LIMIT 1", (project_id,))
         baseline = cursor.fetchone()
@@ -352,9 +352,21 @@ class BaselineRepository:
             "pending_review_records": "Ambiguous/uncertain items gated for review"
         }
         baseline["all_records"] = top_level_items
+        for it in top_level_items:
+            pa = it.get("parsed_plan_assumptions", {})
+            if "record_category" not in it or not it.get("record_category"):
+                it["record_category"] = pa.get("record_category") or ("PROJECT_WORK" if it.get("scope_type") == "IN_SCOPE" else ("OUT_OF_SCOPE" if it.get("scope_type") == "OUT_OF_SCOPE" else "PENDING_REVIEW"))
+            if "work_item_eligible" not in it or it.get("work_item_eligible") is None:
+                it["work_item_eligible"] = bool(pa.get("work_item_eligible"))
+            if "responsibility_owner" not in it or not it.get("responsibility_owner"):
+                it["responsibility_owner"] = pa.get("responsibility_owner") or ("CLIENT" if it.get("scope_type") == "OUT_OF_SCOPE" else "VENDOR")
+            if "delivery_owner" not in it or not it.get("delivery_owner"):
+                it["delivery_owner"] = pa.get("delivery_owner") or ("OUT_OF_SCOPE" if it.get("scope_type") == "OUT_OF_SCOPE" else "VENDOR")
+
         baseline["work_items"] = [
             it for it in top_level_items 
-            if it.get("parsed_plan_assumptions", {}).get("work_item_eligible") is True
+            if it.get("work_item_eligible") is True
+            or it.get("parsed_plan_assumptions", {}).get("work_item_eligible") is True
             or (it.get("scope_type") == "IN_SCOPE" and (it.get("estimated_deadline") is not None or it.get("deadline") is not None) and it.get("category") != "MILESTONE")
         ]
         baseline["out_of_scope_records"] = [
@@ -380,39 +392,79 @@ class BaselineRepository:
         ]
         baseline["payment_milestones"] = [
             m for m in milestones 
-            if any(k in (m.get("name") or "").lower() for k in ("60%", "30%", "10%", "implement", "sign-off", "hypercare", "payment"))
+            if any(k in (m.get("name") or "").lower() for k in ("60%", "30%", "10%", "%", "payment")) and "phase" not in (m.get("name") or "").lower()
         ]
         baseline["project_phases"] = [
             m for m in milestones if m not in baseline["payment_milestones"]
         ]
 
         # Enrich missing planning registers from authoritative final artifact / Step 9 logs
-        try:
-            from services.final_baseline_service import FinalBaselineService
-            doc_id = baseline.get("source_document_id")
-            art_res = FinalBaselineService.load_validated_final_baseline(project_id, doc_id)
-            art = art_res.get("artifact", {}) if art_res.get("status") in ("READY", "SUCCESS") else {}
-            if art.get("governance_obligations"):
-                baseline["governance_obligations"] = art.get("governance_obligations")
-            if art.get("contextual_records"):
-                baseline["contextual_records"] = art.get("contextual_records")
-            if art.get("payment_milestones"):
-                baseline["payment_milestones"] = art.get("payment_milestones")
-            if art.get("all_records"):
-                baseline["all_records"] = art.get("all_records")
-            baseline["customer_dependencies"] = art.get("customer_dependencies") or []
-            baseline["client_responsibilities"] = art.get("client_responsibilities") or []
-            baseline["commitments"] = art.get("commitments") or []
-            baseline["contractual_risks"] = art.get("contractual_risks") or []
-            baseline["document_quality_findings"] = art.get("document_quality_findings") or []
-            baseline["schedule_warnings"] = art.get("schedule_warnings") or []
-        except Exception:
-            baseline["customer_dependencies"] = []
-            baseline["client_responsibilities"] = []
-            baseline["commitments"] = []
-            baseline["contractual_risks"] = []
-            baseline["document_quality_findings"] = []
-            baseline["schedule_warnings"] = []
+        if not skip_artifact_enrichment:
+            try:
+                from services.final_baseline_service import FinalBaselineService
+                doc_id = baseline.get("source_document_id")
+                art_res = FinalBaselineService.load_validated_final_baseline(project_id, doc_id)
+                art = art_res.get("artifact", {}) if art_res.get("status") in ("READY", "SUCCESS") else {}
+                if art.get("governance_obligations"):
+                    baseline["governance_obligations"] = art.get("governance_obligations")
+                if art.get("contextual_records"):
+                    baseline["contextual_records"] = art.get("contextual_records")
+                if art.get("payment_milestones"):
+                    baseline["payment_milestones"] = art.get("payment_milestones")
+                if art.get("all_records"):
+                    baseline["all_records"] = art.get("all_records")
+                baseline["customer_dependencies"] = art.get("customer_dependencies") or []
+                baseline["client_responsibilities"] = art.get("client_responsibilities") or []
+                baseline["commitments"] = art.get("commitments") or []
+                baseline["contractual_risks"] = art.get("contractual_risks") or []
+                baseline["document_quality_findings"] = art.get("document_quality_findings") or []
+                baseline["schedule_warnings"] = art.get("schedule_warnings") or []
+            except Exception:
+                pass
+
+        # Fallback enrichment from canonical scope_items and DB tables
+        if not baseline.get("customer_dependencies"):
+            baseline["customer_dependencies"] = [
+                it for it in top_level_items
+                if it.get("record_category") in ("CLIENT_DEPENDENCY", "CUSTOMER_DEPENDENCY")
+                or (it.get("scope_type") == "IN_SCOPE" and ("dependency" in (it.get("name") or "").lower() or "client dependency" in (it.get("parsed_plan_assumptions", {}).get("record_type") or "").lower()))
+            ]
+        if not baseline.get("client_responsibilities"):
+            baseline["client_responsibilities"] = [
+                it for it in top_level_items
+                if it.get("record_category") == "CLIENT_RESPONSIBILITY"
+                or it.get("responsibility_owner") == "CLIENT"
+            ]
+        if not baseline.get("commitments"):
+            baseline["commitments"] = [
+                it for it in top_level_items
+                if it.get("record_category") in ("COMMITMENT", "CONTRACT_COMMITMENT")
+                or it.get("is_recurring") == 1
+            ]
+        if not baseline.get("contractual_risks"):
+            cursor = db.cursor(dictionary=True)
+            try:
+                cursor.execute("SELECT * FROM risk_findings WHERE project_id = %s", (project_id,))
+                baseline["contractual_risks"] = cursor.fetchall() or []
+            except Exception:
+                baseline["contractual_risks"] = []
+            finally:
+                cursor.close()
+        if not baseline.get("document_quality_findings"):
+            cursor = db.cursor(dictionary=True)
+            try:
+                cursor.execute("SELECT * FROM finding_evidence WHERE project_id = %s", (project_id,))
+                baseline["document_quality_findings"] = cursor.fetchall() or []
+            except Exception:
+                baseline["document_quality_findings"] = []
+            finally:
+                cursor.close()
+        if not baseline.get("schedule_warnings"):
+            baseline["schedule_warnings"] = [
+                it for it in top_level_items
+                if it.get("parsed_plan_assumptions", {}).get("forecast_status") == "SCHEDULE_OVERRUN"
+                or (it.get("estimated_deadline") and "2027-04-30" < str(it.get("estimated_deadline")))
+            ]
 
         return baseline
 
