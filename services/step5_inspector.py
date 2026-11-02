@@ -29,7 +29,7 @@ class Step5Logger:
         else:
             self.log_dir = log_dir
 
-        os.makedirs(self.log_dir, exist_ok=True)
+        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
         self.run_log_path = os.path.join(self.log_dir, f"step5_inspection_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step5_inspection_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -38,27 +38,14 @@ class Step5Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        try:
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-        with self._lock:
+        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
             try:
-                with open(self.run_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
-            except Exception:
-                pass
-            try:
-                with open(self.active_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
             except Exception:
                 pass
 
-    def log(self, message: str, level: str = "INFO"):
+            def log(self, message: str, level: str = "INFO"):
         prefix = f"[{self._format_timestamp()}] [{level.upper()}] "
         self.raw_log(f"{prefix}{message}")
 
@@ -644,15 +631,16 @@ class Step5Inspector:
             "quarantined_records": quarantined_records,
         }
 
-        with open(json_run_path, "w", encoding="utf-8") as f:
-            json.dump(step5_artifact, f, indent=2, default=str)
-        with open(json_active_path, "w", encoding="utf-8") as f:
-            json.dump(step5_artifact, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(json_run_path, "w", encoding="utf-8") as f:
+                json.dump(step5_artifact, f, indent=2, default=str)
+            with open(json_active_path, "w", encoding="utf-8") as f:
+                json.dump(step5_artifact, f, indent=2, default=str)
 
-        with open(preview_run_path, "w", encoding="utf-8") as f:
-            json.dump(step5_preview, f, indent=2, default=str)
-        with open(preview_active_path, "w", encoding="utf-8") as f:
-            json.dump(step5_preview, f, indent=2, default=str)
+            with open(preview_run_path, "w", encoding="utf-8") as f:
+                json.dump(step5_preview, f, indent=2, default=str)
+            with open(preview_active_path, "w", encoding="utf-8") as f:
+                json.dump(step5_preview, f, indent=2, default=str)
 
         logger.banner("STEP 5 COMPLETE — PIPELINE CONTINUING TO STEPS 6-9 (STEP 10 STRICTLY DISABLED)")
         logger.process(f"Step 5 JSON diagnostic saved to: {json_active_path}")

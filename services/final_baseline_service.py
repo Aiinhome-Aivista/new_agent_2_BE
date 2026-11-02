@@ -36,7 +36,7 @@ class FinalBaselineService:
             final_dir = os.path.join(base_dir, "final_baselines")
         else:
             backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            final_dir = os.path.join(backend_root, "logs", "final_baselines")
+            final_dir = os.path.join(backend_root, "data", "final_baselines")
         os.makedirs(final_dir, exist_ok=True)
         return final_dir
 
@@ -94,6 +94,61 @@ class FinalBaselineService:
                             return loaded
                 except Exception:
                     pass
+
+            # Stateless / No-disk-file fallback: reconstruct step payload from MySQL database
+            try:
+                from core.database import get_db_connection
+                _cnx = get_db_connection()
+                if _cnx:
+                    with _cnx.cursor(dictionary=True) as _cur:
+                        if step_num in (4, 5):
+                            _cur.execute("SELECT * FROM scope_items WHERE project_id = %s", (project_id,))
+                            _rows = _cur.fetchall()
+                            if _rows:
+                                _recs = []
+                                for _r in _rows:
+                                    _assump = {}
+                                    if _r.get("plan_assumptions"):
+                                        try:
+                                            _assump = json.loads(_r["plan_assumptions"])
+                                        except Exception:
+                                            pass
+                                    _st = (_r.get("scope_type") or "IN_SCOPE").upper()
+                                    _rc = _r.get("record_category") or _assump.get("record_category") or ("PROJECT_WORK" if _st == "IN_SCOPE" else ("OUT_OF_SCOPE" if _st == "OUT_OF_SCOPE" else "PENDING_REVIEW"))
+                                    _recs.append({
+                                        "candidate_id": _assump.get("candidate_id") or _r.get("status_change_tag") or f"c_{_r['id']}",
+                                        "name": _r.get("name"),
+                                        "description": _r.get("description"),
+                                        "scope_status": _st,
+                                        "scope_type": _st,
+                                        "record_category": _rc,
+                                        "work_item_eligible": bool(_r.get("work_item_eligible")),
+                                        "record_type": _assump.get("record_type") or ("Milestone" if "milestone" in (_r.get("name") or "").lower() else "Scope Item"),
+                                        "deadline": _r.get("deadline") or _r.get("estimated_deadline"),
+                                        "estimated_deadline": _r.get("estimated_deadline") or _r.get("deadline"),
+                                        "date_provenance": _r.get("date_provenance") or ("CONTRACT_CONFIRMED" if _r.get("deadline") else "AI_ESTIMATED"),
+                                        "source_quotation": _assump.get("source_quotation") or _r.get("evidence_text"),
+                                        "source_locator": _assump.get("source_locator") or _r.get("source_section"),
+                                        "review_reason": _assump.get("review_reason"),
+                                    })
+                                _cnx.close()
+                                return {"structured_records": _recs, "validation_gate_passed": True, "proposed_scope_items_preview": _recs}
+                        elif step_num == 8:
+                            _cur.execute("SELECT * FROM project_milestones WHERE project_id = %s ORDER BY sequence_order ASC", (project_id,))
+                            _ms = _cur.fetchall()
+                            _cur.execute("SELECT * FROM contract_dependencies WHERE project_id = %s", (project_id,))
+                            _deps = _cur.fetchall()
+                            _cnx.close()
+                            return {"milestones_preview": _ms, "dependencies_preview": _deps}
+                        elif step_num == 9:
+                            _cur.execute("SELECT * FROM contract_commitments WHERE project_id = %s", (project_id,))
+                            _comms = _cur.fetchall()
+                            _cnx.close()
+                            return {"commitments_preview": _comms, "commitments": _comms}
+                    _cnx.close()
+            except Exception:
+                pass
+
             return {}
 
         s13 = _get_step_json(3, "pipeline_steps_1_3")
@@ -238,16 +293,24 @@ class FinalBaselineService:
             complexity = item.get("complexity") or s4_item.get("complexity") or "MEDIUM"
             effort = item.get("estimated_effort") or item.get("effort_dev_weeks") or (0.5 if complexity == "SIMPLE" else (2.0 if complexity == "COMPLEX" else 1.0))
 
+            pred_start = item.get("predicted_start_date") or item.get("estimated_start_date") or contract_start
+            dur_days = item.get("estimated_duration_working_days") or item.get("estimated_duration_days") or 5
             scope_items.append({
                 "candidate_id": cid,
                 "name": name,
                 "description": desc,
                 "scope_type": "IN_SCOPE",
                 "record_type": s4_item.get("record_type") or rtype or "Scope Item",
+                "record_category": s4_item.get("record_category") or "PROJECT_WORK",
                 "work_item_eligible": True,
                 "complexity": complexity,
                 "effort_dev_weeks": effort,
+                "estimated_duration_working_days": dur_days,
                 "owner": item.get("owner") or s4_item.get("owner") or "Vendor Project Team",
+                "responsibility_owner": s4_item.get("responsibility_owner") or "VENDOR",
+                "delivery_owner": s4_item.get("delivery_owner") or "VENDOR",
+                "estimated_start_date": pred_start,
+                "predicted_start_date": pred_start,
                 "predicted_deadline": pred_deadline,
                 "estimated_deadline": pred_deadline,
                 "deadline": pred_deadline,
@@ -255,10 +318,12 @@ class FinalBaselineService:
                 "deadline_type": d_type,
                 "date_provenance": d_type,
                 "deadline_confidence": conf,
+                "estimation_confidence": conf,
                 "deadline_rationale": rationale,
                 "source_locator": source_loc,
                 "source_quotation": source_quote,
                 "dependencies": deps,
+                "dependency_ids": deps,
                 "milestone_ids": m_ids,
                 "review_status": "VALIDATED",
             })
@@ -292,7 +357,11 @@ class FinalBaselineService:
                         "source_quotation": quote,
                     })
             elif st == "OUT_OF_SCOPE":
-                if cid not in seen_out:
+                rec_cat = r.get("record_category") or ""
+                # Strict exclusion check: never classify client responsibilities, dependencies, or assumptions into out_of_scope
+                if rec_cat in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION", "GOVERNANCE_OBLIGATION", "PROJECT_WORK", "MILESTONE", "COMMITMENT"):
+                    pass
+                elif cid not in seen_out:
                     seen_out.add(cid)
                     out_of_scope_items.append({
                         "candidate_id": cid,
@@ -300,6 +369,7 @@ class FinalBaselineService:
                         "description": desc,
                         "scope_type": "OUT_OF_SCOPE",
                         "record_type": r.get("record_type") or "Exclusion",
+                        "record_category": "OUT_OF_SCOPE",
                         "reason_for_exclusion": r.get("reason_for_exclusion") or r.get("classification_reason") or "Contractual exclusion clause",
                         "source_locator": loc,
                         "source_quotation": quote,
@@ -310,6 +380,10 @@ class FinalBaselineService:
         s10_payload = s10.get("dashboard_payload", {})
         for item in s10_payload.get("out_of_scope_items", []) or []:
             cid = item.get("candidate_id")
+            s4_item = s4_map.get(cid, {})
+            rec_cat = s4_item.get("record_category") or ""
+            if rec_cat in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION", "GOVERNANCE_OBLIGATION", "PROJECT_WORK", "MILESTONE", "COMMITMENT"):
+                continue
             if cid and cid not in seen_out:
                 seen_out.add(cid)
                 s4_item = s4_map.get(cid, {})
@@ -345,7 +419,14 @@ class FinalBaselineService:
         all_records = []
         for r in s4_records:
             cid = r.get("candidate_id")
-            st = (r.get("scope_type") or r.get("scope_status") or "IN_SCOPE").upper()
+            rec_cat = r.get("record_category") or ""
+            raw_st = (r.get("scope_type") or r.get("scope_status") or "IN_SCOPE").upper()
+            if raw_st == "UNCERTAIN" or rec_cat == "PENDING_REVIEW":
+                st = "UNCERTAIN"
+            elif rec_cat == "OUT_OF_SCOPE" or (raw_st == "OUT_OF_SCOPE" and rec_cat not in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION", "GOVERNANCE_OBLIGATION", "PROJECT_WORK", "MILESTONE", "COMMITMENT")):
+                st = "OUT_OF_SCOPE"
+            else:
+                st = "IN_SCOPE"
             rtype = r.get("record_type") or "Scope Item"
             nm = r.get("name") or "Scope Record"
             desc = r.get("description") or r.get("evidence_text") or nm
@@ -523,7 +604,7 @@ class FinalBaselineService:
         excluded_meta_count = s3_audit.get("excluded_count") or 0
         raw_candidates_count = s3_audit.get("total_map_candidates") or (canonical_count + merged_count + excluded_meta_count)
         fully_traced_count = canonical_count
-        in_scope_count = sum(1 for r in s4_records if (r.get("scope_type") or r.get("scope_status")) == "IN_SCOPE") or len(scope_items)
+        in_scope_count = sum(1 for r in all_records if r.get("scope_type") == "IN_SCOPE")
         work_eligible_count = len(scope_items)
         out_of_scope_count = len(out_of_scope_items)
         pending_review_count = len(pending_review_items)
@@ -1287,7 +1368,7 @@ class FinalBaselineService:
                     approval_status = "PENDING_REVIEW"
                     review_reason = pr_map.get(cid, {}).get("review_reason") or r.get("manual_review_reason") or "Contractual review required"
                     reason_oos = None
-                elif cid in oos_map or r.get("scope_status") == "OUT_OF_SCOPE":
+                elif (cid in oos_map or r.get("scope_status") == "OUT_OF_SCOPE" or r.get("record_category") == "OUT_OF_SCOPE") and r.get("record_category") not in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION", "GOVERNANCE_OBLIGATION", "PROJECT_WORK", "MILESTONE", "COMMITMENT"):
                     scope_type = "OUT_OF_SCOPE"
                     category = "OUT_OF_SCOPE"
                     approval_status = "EXCLUDED"

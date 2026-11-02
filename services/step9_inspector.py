@@ -27,7 +27,7 @@ class Step9Logger:
         else:
             self.log_dir = log_dir
 
-        os.makedirs(self.log_dir, exist_ok=True)
+        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
         self.run_log_path = os.path.join(self.log_dir, f"step9_recurring_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step9_recurring_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -36,27 +36,14 @@ class Step9Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        try:
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-        with self._lock:
+        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
             try:
-                with open(self.run_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
-            except Exception:
-                pass
-            try:
-                with open(self.active_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
             except Exception:
                 pass
 
-    def banner(self, title: str):
+            def banner(self, title: str):
         bar = "=" * 80
         self.raw_log(f"\n{bar}")
         self.raw_log(f"[{self._format_timestamp()}] {title}")
@@ -180,10 +167,11 @@ class Step9Inspector:
             }
             json_run_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}_{timestamp_str}.json")
             json_active_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}.json")
-            with open(json_run_path, "w", encoding="utf-8") as f:
-                json.dump(blocked_artifact, f, indent=2, default=str)
-            with open(json_active_path, "w", encoding="utf-8") as f:
-                json.dump(blocked_artifact, f, indent=2, default=str)
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+                with open(json_run_path, "w", encoding="utf-8") as f:
+                    json.dump(blocked_artifact, f, indent=2, default=str)
+                with open(json_active_path, "w", encoding="utf-8") as f:
+                    json.dump(blocked_artifact, f, indent=2, default=str)
             logger.banner("STEP 9 BLOCKED DIAGNOSTIC COMPLETE — ADVANCING TO STEP 10")
             return {
                 "status": "BLOCKED",
@@ -262,8 +250,11 @@ class Step9Inspector:
                     resp = "Joint Steering Committee"
                     rule = "Source text specifies Steering Committee compulsorily meets at least once a month."
 
+                comm_id = f"comm_p{project_id}_d{document_id}_{len(commitments) + 1:03d}"
                 comm_record = {
+                    "commitment_id": comm_id,
                     "candidate_id": cid,
+                    "title": name or c_name,
                     "name": name or c_name,
                     "commitment_name": name or c_name,
                     "description": desc,
@@ -273,9 +264,11 @@ class Step9Inspector:
                     "responsible_party": resp,
                     "owner": "JOINT" if "Joint" in resp else "VENDOR",
                     "proposed_next_occurrence": (base_date + (timedelta(days=7) if cadence == "weekly" else (timedelta(days=14) if cadence == "fortnightly" else timedelta(days=30)))).isoformat(),
-                    "source_locator": item.get("source_locator"),
+                    "source_locator": item.get("source_locator") or "chunk_0",
                     "source_quotation": item.get("raw_text") or desc,
                     "risk_status": "LOW",
+                    "extraction_confidence": 0.9,
+                    "current_status": "ACTIVE",
                     "rule": rule,
                 }
                 commitments.append(comm_record)
@@ -284,22 +277,29 @@ class Step9Inspector:
                 continue
 
             if is_feedback_sla:
+                comm_id = f"comm_p{project_id}_d{document_id}_{len(commitments) + 1:03d}"
                 comm_record = {
+                    "commitment_id": comm_id,
                     "candidate_id": cid,
+                    "title": name or "Client Deliverable Feedback & Deemed Acceptance SLA",
                     "name": name or "Client Deliverable Feedback & Deemed Acceptance SLA",
                     "commitment_name": name or "Client Deliverable Feedback & Deemed Acceptance SLA",
                     "description": desc,
                     "commitment_type": "TRIGGER_BASED",
                     "frequency": "EVENT_DRIVEN",
-                    "trigger": "Deliverable Submission",
-                    "sla_window": "3 working days",
+                    "trigger_event": "Deliverable Submission",
+                    "sla_duration": 3,
+                    "sla_unit": "WORKING_DAYS",
+                    "working_day_rule": True,
                     "consequence": "Deemed accepted by client if no feedback received within stipulated time",
                     "responsible_party": "Client / Customer",
                     "owner": "CLIENT",
                     "proposed_next_occurrence": "ON_TRIGGER",
-                    "source_locator": item.get("source_locator"),
+                    "source_locator": item.get("source_locator") or "chunk_0",
                     "source_quotation": item.get("raw_text") or desc,
                     "risk_status": "MONITORING_REQUIRED",
+                    "extraction_confidence": 0.95,
+                    "current_status": "ACTIVE",
                 }
                 commitments.append(comm_record)
                 trigger_commitments.append(comm_record)
@@ -590,10 +590,11 @@ class Step9Inspector:
         json_run_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}_{timestamp_str}.json")
         json_active_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}.json")
 
-        with open(json_run_path, "w", encoding="utf-8") as f:
-            json.dump(step9_artifact, f, indent=2, default=str)
-        with open(json_active_path, "w", encoding="utf-8") as f:
-            json.dump(step9_artifact, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(json_run_path, "w", encoding="utf-8") as f:
+                json.dump(step9_artifact, f, indent=2, default=str)
+            with open(json_active_path, "w", encoding="utf-8") as f:
+                json.dump(step9_artifact, f, indent=2, default=str)
 
         logger.section("Step 9 Summary")
         logger.output("Execution Status", status)

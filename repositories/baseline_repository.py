@@ -141,7 +141,7 @@ class BaselineRepository:
 
         scope_type = str(scope_type).upper().strip()
         if scope_type not in valid_scope_types:
-            scope_type = "OUT_OF_SCOPE" if ("OUT" in scope_type or "RESPONSIBILITY" in scope_type or "ASSUMPTION" in scope_type) else "IN_SCOPE"
+            scope_type = "OUT_OF_SCOPE" if ("OUT" in scope_type or "EXCLUSION" in scope_type) else "IN_SCOPE"
 
         category = str(category).upper().strip() if category else "FUNCTIONAL"
         if category not in valid_categories:
@@ -207,7 +207,7 @@ class BaselineRepository:
 
         scope_type = str(scope_type).upper().strip()
         if scope_type not in valid_scope_types:
-            scope_type = "OUT_OF_SCOPE" if ("OUT" in scope_type or "RESPONSIBILITY" in scope_type or "ASSUMPTION" in scope_type) else "IN_SCOPE"
+            scope_type = "OUT_OF_SCOPE" if ("OUT" in scope_type or "EXCLUSION" in scope_type) else "IN_SCOPE"
 
         category = str(category).upper().strip() if category else "FUNCTIONAL"
         if category not in valid_categories:
@@ -366,14 +366,17 @@ class BaselineRepository:
         baseline["work_items"] = [
             it for it in top_level_items 
             if it.get("work_item_eligible") is True
+            or it.get("work_item_eligible") == 1
             or it.get("parsed_plan_assumptions", {}).get("work_item_eligible") is True
-            or (it.get("scope_type") == "IN_SCOPE" and (it.get("estimated_deadline") is not None or it.get("deadline") is not None) and it.get("category") != "MILESTONE")
         ]
         baseline["out_of_scope_records"] = [
-            it for it in top_level_items if it.get("scope_type") == "OUT_OF_SCOPE"
+            it for it in top_level_items 
+            if (it.get("record_category") == "OUT_OF_SCOPE" or it.get("scope_type") == "OUT_OF_SCOPE")
+            and it.get("record_category") not in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION")
         ]
         baseline["pending_review_records"] = [
-            it for it in top_level_items if it.get("scope_type") == "UNCERTAIN"
+            it for it in top_level_items 
+            if it.get("scope_type") == "UNCERTAIN" or it.get("record_category") == "PENDING_REVIEW"
         ]
         baseline["governance_obligations"] = [
             it for it in top_level_items

@@ -29,7 +29,7 @@ class Step4Logger:
         else:
             self.log_dir = log_dir
 
-        os.makedirs(self.log_dir, exist_ok=True)
+        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
         self.run_log_path = os.path.join(self.log_dir, f"step4_inspection_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step4_inspection_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -38,27 +38,14 @@ class Step4Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        try:
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-        with self._lock:
+        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
             try:
-                with open(self.run_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
-            except Exception:
-                pass
-            try:
-                with open(self.active_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
             except Exception:
                 pass
 
-    def log(self, message: str, level: str = "INFO"):
+            def log(self, message: str, level: str = "INFO"):
         prefix = f"[{self._format_timestamp()}] [{level.upper()}] "
         self.raw_log(f"{prefix}{message}")
 
@@ -137,14 +124,18 @@ class Step4Inspector:
             record_type = "Milestone"
         elif section in {"Client Responsibilities", "Customer Responsibilities"} or c.get("actor_role") == "Client" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Client":
             record_type = "Client Responsibility"
+            scope_type = "IN_SCOPE"
         elif section == "Responsibilities" or c.get("actor_role") == "Vendor" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Vendor":
             record_type = "Vendor Responsibility"
         elif section == "Assumptions":
             record_type = "Assumption"
+            scope_type = "IN_SCOPE"
         elif section == "Dependencies":
             record_type = "Dependency"
-        elif section == "Out of Scope" or scope_type == "OUT_OF_SCOPE":
+            scope_type = "IN_SCOPE"
+        elif section in {"Out of Scope", "Exclusions"} or (scope_type == "OUT_OF_SCOPE" and section not in {"Client Responsibilities", "Customer Responsibilities", "Assumptions", "Dependencies"}):
             record_type = "Exclusion"
+            scope_type = "OUT_OF_SCOPE"
         elif section == "Governance":
             record_type = "Governance Obligation"
         elif section == "Acceptance":
@@ -249,14 +240,20 @@ class Step4Inspector:
             record_category = "CLIENT_RESPONSIBILITY"
             resp_owner = "CLIENT"
             deliv_owner = "CLIENT"
+            scope_status = "IN_SCOPE"
+            scope_type = "IN_SCOPE"
         elif record_type == "Dependency":
             record_category = "CLIENT_DEPENDENCY"
             resp_owner = "CLIENT"
             deliv_owner = "VENDOR"
+            scope_status = "IN_SCOPE"
+            scope_type = "IN_SCOPE"
         elif record_type == "Assumption":
             record_category = "ASSUMPTION"
             resp_owner = "JOINT"
             deliv_owner = "JOINT"
+            scope_status = "IN_SCOPE"
+            scope_type = "IN_SCOPE"
         elif recurrence != "One-time" or any(w in comb_text for w in ["status report", "stakeholder update", "committee meeting"]):
             record_category = "COMMITMENT"
             resp_owner = "VENDOR"
@@ -319,7 +316,7 @@ class Step4Inspector:
         if logs_dir is None:
             backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             logs_dir = os.path.join(backend_root, "logs")
-        os.makedirs(logs_dir, exist_ok=True)
+        # os.makedirs(logs_dir, exist_ok=True) disabled for deployment
 
         logger = Step4Logger(project_id, document_id, timestamp_str, log_dir=logs_dir)
         t_start = time.time()
@@ -668,10 +665,11 @@ class Step4Inspector:
             "structured_records": structured_records,
         }
 
-        with open(json_run_path, "w", encoding="utf-8") as f:
-            json.dump(step4_artifact, f, indent=2, default=str)
-        with open(json_active_path, "w", encoding="utf-8") as f:
-            json.dump(step4_artifact, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(json_run_path, "w", encoding="utf-8") as f:
+                json.dump(step4_artifact, f, indent=2, default=str)
+            with open(json_active_path, "w", encoding="utf-8") as f:
+                json.dump(step4_artifact, f, indent=2, default=str)
 
         logger.banner("STEP 4 INSPECTION COMPLETE — ADVANCING TO STEP 5 SAFETY GATE")
         logger.process(f"Step 4 JSON artifact saved to: {json_active_path}")

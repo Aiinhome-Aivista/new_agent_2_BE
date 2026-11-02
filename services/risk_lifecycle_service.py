@@ -69,7 +69,13 @@ class RiskLifecycleService:
         for finding in s7_findings:
             f_cat = (finding.get("category") or finding.get("finding_type") or "CONTRACTUAL_AMBIGUITY").upper()
             f_id = finding.get("finding_id", f"F_{counter:03d}")
-            f_title = finding.get("title") or finding.get("issue_summary") or finding.get("finding_type") or f"Contractual Finding {f_id}"
+            f_title = finding.get("title") or finding.get("issue_summary")
+            if not f_title or f_title.upper() in ("CONTRACTUAL_AMBIGUITY", "GAP", "FINDING"):
+                expl = finding.get("explanation") or ""
+                if expl:
+                    f_title = expl[:90] + ("..." if len(expl) > 90 else "")
+                else:
+                    f_title = f"{f_cat.replace('_', ' ').title()} - {f_id}"
 
             # Resolve quote, chunk, and locator safely from Step 7 schema
             chunk_indices = finding.get("source_chunk_indices") or []

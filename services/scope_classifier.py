@@ -15,8 +15,9 @@ class ScopeClassifier:
         "Milestones", "Recurring Commitments",
         # New sections added for narrative ELs (demo_EL type)
         "Functional Scope", "Methodology", "Governance", "Support", "Acceptance",
+        "Assumptions", "Client Responsibilities", "Customer Responsibilities", "Dependencies",
     }
-    OUT_OF_SCOPE_SECTIONS = {"Out of Scope", "Assumptions", "Client Responsibilities", "Customer Responsibilities"}
+    OUT_OF_SCOPE_SECTIONS = {"Out of Scope", "Exclusions"}
     BAD_SECTIONS = OUT_OF_SCOPE_SECTIONS
 
     @classmethod
@@ -73,8 +74,6 @@ class ScopeClassifier:
             # If explicit exclusion signals exist, do not classify deterministically
             has_exclusion = any(sig in cand_text for sig in [
                 "not included", "excluded", "out of scope", "outside the scope",
-                "customer responsibility", "client responsibility",
-                "client will provide", "customer will provide"
             ])
             if not has_exclusion:
                 c = dict(candidate)

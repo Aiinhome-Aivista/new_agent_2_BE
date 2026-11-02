@@ -31,7 +31,7 @@ class Step8Logger:
         else:
             self.log_dir = log_dir
 
-        os.makedirs(self.log_dir, exist_ok=True)
+        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
         self.run_log_path = os.path.join(self.log_dir, f"step8_milestones_dag_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step8_milestones_dag_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -40,27 +40,14 @@ class Step8Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        try:
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-        with self._lock:
+        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
             try:
-                with open(self.run_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
-            except Exception:
-                pass
-            try:
-                with open(self.active_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
             except Exception:
                 pass
 
-    def banner(self, title: str):
+            def banner(self, title: str):
         bar = "=" * 80
         self.raw_log(f"\n{bar}")
         self.raw_log(f"[{self._format_timestamp()}] {title}")
@@ -175,10 +162,11 @@ class Step8Inspector:
             }
             json_run_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}_{timestamp_str}.json")
             json_active_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}.json")
-            with open(json_run_path, "w", encoding="utf-8") as f:
-                json.dump(blocked_artifact, f, indent=2, default=str)
-            with open(json_active_path, "w", encoding="utf-8") as f:
-                json.dump(blocked_artifact, f, indent=2, default=str)
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+                with open(json_run_path, "w", encoding="utf-8") as f:
+                    json.dump(blocked_artifact, f, indent=2, default=str)
+                with open(json_active_path, "w", encoding="utf-8") as f:
+                    json.dump(blocked_artifact, f, indent=2, default=str)
             logger.banner("STEP 8 BLOCKED DIAGNOSTIC COMPLETE — ADVANCING TO STEP 9")
             return {
                 "status": "BLOCKED",
@@ -676,10 +664,11 @@ class Step8Inspector:
         json_run_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}_{timestamp_str}.json")
         json_active_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}.json")
 
-        with open(json_run_path, "w", encoding="utf-8") as f:
-            json.dump(step8_artifact, f, indent=2, default=str)
-        with open(json_active_path, "w", encoding="utf-8") as f:
-            json.dump(step8_artifact, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(json_run_path, "w", encoding="utf-8") as f:
+                json.dump(step8_artifact, f, indent=2, default=str)
+            with open(json_active_path, "w", encoding="utf-8") as f:
+                json.dump(step8_artifact, f, indent=2, default=str)
 
         logger.section("Step 8 Summary")
         logger.output("Execution Status", status)

@@ -28,7 +28,7 @@ class BaselineLogger:
         else:
             self.log_dir = log_dir
 
-        os.makedirs(self.log_dir, exist_ok=True)
+        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
 
         self.unified_log_path = os.path.join(self.log_dir, "baseline_extraction.log")
         self.run_log_path = os.path.join(self.log_dir, f"baseline_p{project_id}_d{document_id}.log")
@@ -38,27 +38,11 @@ class BaselineLogger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        """Writes text directly to stdout and appends to the log files with immediate flush."""
-        # 1. Terminal stdout write with flush
-        try:
-            sys.stdout.write(text + "\n")
-            sys.stdout.flush()
-        except Exception:
-            pass
-
-        # 2. File write with lock and flush
-        with self._lock:
+        """No-op by default: step1 to last step verbose terminal prints totally removed for deployment."""
+        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
             try:
-                with open(self.unified_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
-            except Exception:
-                pass
-
-            try:
-                with open(self.run_log_path, "a", encoding="utf-8") as f:
-                    f.write(text + "\n")
-                    f.flush()
+                sys.stdout.write(text + "\n")
+                sys.stdout.flush()
             except Exception:
                 pass
 

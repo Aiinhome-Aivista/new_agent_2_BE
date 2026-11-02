@@ -87,7 +87,8 @@ class GroupedArtifactService:
             10: {"name": "...", "status": "...", "log_path": "...", "json_data": {...}, "duration": 0.8},
         }
         """
-        os.makedirs(logs_dir, exist_ok=True)
+        # os.makedirs(logs_dir, exist_ok=True) disabled for deployment
+        write_disk_logs = os.getenv("ENABLE_DISK_LOGS", "false").lower() in ("true", "1", "yes")
 
         # -------------------------------------------------------------
         # 1. Group 1: Steps 1-3
@@ -97,29 +98,30 @@ class GroupedArtifactService:
         g1_log_path = os.path.join(logs_dir, g1_log_name)
         g1_json_path = os.path.join(logs_dir, g1_json_name)
 
-        with open(g1_log_path, "w", encoding="utf-8") as f_out:
-            f_out.write(
-                f"================================================================================\n"
-                f"  PIPELINE INSPECTION AUDIT LOG: STEPS 1-3 (PARSING, SECTIONS, EXTRACTION)\n"
-                f"  Project ID: {project_id} | Document ID: {document_id} | Document: {doc_name}\n"
-                f"  Run ID: {run_id} | Timestamp UTC: {datetime.now(timezone.utc).isoformat()}\n"
-                f"================================================================================\n\n"
-            )
-            for s_num in [1, 2, 3]:
-                info = step_data.get(s_num, {})
-                s_name = info.get("name", f"Step {s_num}")
-                s_status = info.get("status", "COMPLETED")
-                s_dur = info.get("duration")
-                s_log = info.get("log_path")
-                s_src = os.path.basename(s_log) if s_log else "N/A"
+        if write_disk_logs:
+            with open(g1_log_path, "w", encoding="utf-8") as f_out:
+                f_out.write(
+                    f"================================================================================\n"
+                    f"  PIPELINE INSPECTION AUDIT LOG: STEPS 1-3 (PARSING, SECTIONS, EXTRACTION)\n"
+                    f"  Project ID: {project_id} | Document ID: {document_id} | Document: {doc_name}\n"
+                    f"  Run ID: {run_id} | Timestamp UTC: {datetime.now(timezone.utc).isoformat()}\n"
+                    f"================================================================================\n\n"
+                )
+                for s_num in [1, 2, 3]:
+                    info = step_data.get(s_num, {})
+                    s_name = info.get("name", f"Step {s_num}")
+                    s_status = info.get("status", "COMPLETED")
+                    s_dur = info.get("duration")
+                    s_log = info.get("log_path")
+                    s_src = os.path.basename(s_log) if s_log else "N/A"
 
-                f_out.write(cls._format_step_header(s_num, s_name, project_id, document_id, doc_name, run_id, s_src, s_status, s_dur))
-                if s_log and os.path.exists(s_log):
-                    with open(s_log, "r", encoding="utf-8", errors="replace") as f_in:
-                        f_out.write(f_in.read())
-                else:
-                    f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
-                f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
+                    f_out.write(cls._format_step_header(s_num, s_name, project_id, document_id, doc_name, run_id, s_src, s_status, s_dur))
+                    if s_log and os.path.exists(s_log):
+                        with open(s_log, "r", encoding="utf-8", errors="replace") as f_in:
+                            f_out.write(f_in.read())
+                    else:
+                        f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
+                    f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
 
         s1_3_json_data = {
             "manifest": {
@@ -148,8 +150,9 @@ class GroupedArtifactService:
             "step2_section_detection": step_data.get(2, {}).get("json_data", {}),
             "step3_candidate_extraction": step_data.get(3, {}).get("json_data", {}),
         }
-        with open(g1_json_path, "w", encoding="utf-8") as f:
-            json.dump(s1_3_json_data, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(g1_json_path, "w", encoding="utf-8") as f:
+                json.dump(s1_3_json_data, f, indent=2, default=str)
 
         # -------------------------------------------------------------
         # 2. Group 2: Steps 4-6
@@ -159,29 +162,30 @@ class GroupedArtifactService:
         g2_log_path = os.path.join(logs_dir, g2_log_name)
         g2_json_path = os.path.join(logs_dir, g2_json_name)
 
-        with open(g2_log_path, "w", encoding="utf-8") as f_out:
-            f_out.write(
-                f"================================================================================\n"
-                f"  PIPELINE INSPECTION AUDIT LOG: STEPS 4-6 (CLASSIFICATION, PERSISTENCE GATE, TRACEABILITY)\n"
-                f"  Project ID: {project_id} | Document ID: {document_id} | Document: {doc_name}\n"
-                f"  Run ID: {run_id} | Timestamp UTC: {datetime.now(timezone.utc).isoformat()}\n"
-                f"================================================================================\n\n"
-            )
-            for s_num in [4, 5, 6]:
-                info = step_data.get(s_num, {})
-                s_name = info.get("name", f"Step {s_num}")
-                s_status = info.get("status", "COMPLETED")
-                s_dur = info.get("duration")
-                s_log = info.get("log_path")
-                s_src = os.path.basename(s_log) if s_log else "N/A"
+        if write_disk_logs:
+            with open(g2_log_path, "w", encoding="utf-8") as f_out:
+                f_out.write(
+                    f"================================================================================\n"
+                    f"  PIPELINE INSPECTION AUDIT LOG: STEPS 4-6 (CLASSIFICATION, PERSISTENCE GATE, TRACEABILITY)\n"
+                    f"  Project ID: {project_id} | Document ID: {document_id} | Document: {doc_name}\n"
+                    f"  Run ID: {run_id} | Timestamp UTC: {datetime.now(timezone.utc).isoformat()}\n"
+                    f"================================================================================\n\n"
+                )
+                for s_num in [4, 5, 6]:
+                    info = step_data.get(s_num, {})
+                    s_name = info.get("name", f"Step {s_num}")
+                    s_status = info.get("status", "COMPLETED")
+                    s_dur = info.get("duration")
+                    s_log = info.get("log_path")
+                    s_src = os.path.basename(s_log) if s_log else "N/A"
 
-                f_out.write(cls._format_step_header(s_num, s_name, project_id, document_id, doc_name, run_id, s_src, s_status, s_dur))
-                if s_log and os.path.exists(s_log):
-                    with open(s_log, "r", encoding="utf-8", errors="replace") as f_in:
-                        f_out.write(f_in.read())
-                else:
-                    f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
-                f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
+                    f_out.write(cls._format_step_header(s_num, s_name, project_id, document_id, doc_name, run_id, s_src, s_status, s_dur))
+                    if s_log and os.path.exists(s_log):
+                        with open(s_log, "r", encoding="utf-8", errors="replace") as f_in:
+                            f_out.write(f_in.read())
+                    else:
+                        f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
+                    f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
 
         s4_6_json_data = {
             "manifest": {
@@ -210,8 +214,9 @@ class GroupedArtifactService:
             "step5_validation_gate_and_dry_run_preview": step_data.get(5, {}).get("json_data", {}),
             "step6_bidirectional_traceability_matrix": step_data.get(6, {}).get("json_data", {}),
         }
-        with open(g2_json_path, "w", encoding="utf-8") as f:
-            json.dump(s4_6_json_data, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(g2_json_path, "w", encoding="utf-8") as f:
+                json.dump(s4_6_json_data, f, indent=2, default=str)
 
         # -------------------------------------------------------------
         # 3. Group 3: Steps 7-10
@@ -221,33 +226,34 @@ class GroupedArtifactService:
         g3_log_path = os.path.join(logs_dir, g3_log_name)
         g3_json_path = os.path.join(logs_dir, g3_json_name)
 
-        with open(g3_log_path, "w", encoding="utf-8") as f_out:
-            f_out.write(
-                f"================================================================================\n"
-                f"  PIPELINE INSPECTION AUDIT LOG: STEPS 7-10 (FINDINGS, DAG, RECURRING, FINAL SYNTHESIS)\n"
-                f"  Project ID: {project_id} | Document ID: {document_id} | Document: {doc_name}\n"
-                f"  Run ID: {run_id} | Timestamp UTC: {datetime.now(timezone.utc).isoformat()}\n"
-                f"================================================================================\n\n"
-            )
-            for s_num in [7, 8, 9, 10]:
-                info = step_data.get(s_num, {})
-                s_name = info.get("name", f"Step {s_num}")
-                s_status = info.get("status", "COMPLETED")
-                s_dur = info.get("duration")
-                s_log = info.get("log_path")
-                s_src = os.path.basename(s_log) if s_log else "N/A"
+        if write_disk_logs:
+            with open(g3_log_path, "w", encoding="utf-8") as f_out:
+                f_out.write(
+                    f"================================================================================\n"
+                    f"  PIPELINE INSPECTION AUDIT LOG: STEPS 7-10 (FINDINGS, DAG, RECURRING, FINAL SYNTHESIS)\n"
+                    f"  Project ID: {project_id} | Document ID: {document_id} | Document: {doc_name}\n"
+                    f"  Run ID: {run_id} | Timestamp UTC: {datetime.now(timezone.utc).isoformat()}\n"
+                    f"================================================================================\n\n"
+                )
+                for s_num in [7, 8, 9, 10]:
+                    info = step_data.get(s_num, {})
+                    s_name = info.get("name", f"Step {s_num}")
+                    s_status = info.get("status", "COMPLETED")
+                    s_dur = info.get("duration")
+                    s_log = info.get("log_path")
+                    s_src = os.path.basename(s_log) if s_log else "N/A"
 
-                f_out.write(cls._format_step_header(s_num, s_name, project_id, document_id, doc_name, run_id, s_src, s_status, s_dur))
-                if s_log and os.path.exists(s_log):
-                    with open(s_log, "r", encoding="utf-8", errors="replace") as f_in:
-                        f_out.write(f_in.read())
-                else:
-                    f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
-                f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
+                    f_out.write(cls._format_step_header(s_num, s_name, project_id, document_id, doc_name, run_id, s_src, s_status, s_dur))
+                    if s_log and os.path.exists(s_log):
+                        with open(s_log, "r", encoding="utf-8", errors="replace") as f_in:
+                            f_out.write(f_in.read())
+                    else:
+                        f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
+                    f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
 
-        # Check Step 10 status and readiness
-        s10_info = step_data.get(10, {})
-        s10_readiness = s10_info.get("json_data", {}).get("readiness_status", "PROVISIONAL")
+            # Check Step 10 status and readiness
+            s10_info = step_data.get(10, {})
+            s10_readiness = s10_info.get("json_data", {}).get("readiness_status", "PROVISIONAL")
 
         s7_10_json_data = {
             "manifest": {
@@ -280,8 +286,9 @@ class GroupedArtifactService:
             "step9_recurring_commitments_expansion": step_data.get(9, {}).get("json_data", {}),
             "step10_final_el_analysis_and_dashboard": step_data.get(10, {}).get("json_data", {}),
         }
-        with open(g3_json_path, "w", encoding="utf-8") as f:
-            json.dump(s7_10_json_data, f, indent=2, default=str)
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            with open(g3_json_path, "w", encoding="utf-8") as f:
+                json.dump(s7_10_json_data, f, indent=2, default=str)
 
         # -------------------------------------------------------------
         # Integrity Verification: Compute SHA-256 Hashes
@@ -316,16 +323,18 @@ class GroupedArtifactService:
         # Check all 6 files exist and JSONs parse
         integrity_ok = True
         for g_k, g_v in grouped_artifacts.items():
-            if not os.path.exists(g_v["log_path"]) or os.path.getsize(g_v["log_path"]) == 0:
-                integrity_ok = False
-            if not os.path.exists(g_v["json_path"]) or os.path.getsize(g_v["json_path"]) == 0:
-                integrity_ok = False
-            else:
-                try:
-                    with open(g_v["json_path"], "r", encoding="utf-8") as jf:
-                        json.load(jf)
-                except Exception:
+            if write_disk_logs:
+                if not os.path.exists(g_v["log_path"]) or os.path.getsize(g_v["log_path"]) == 0:
                     integrity_ok = False
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+                if not os.path.exists(g_v["json_path"]) or os.path.getsize(g_v["json_path"]) == 0:
+                    integrity_ok = False
+                else:
+                    try:
+                        with open(g_v["json_path"], "r", encoding="utf-8") as jf:
+                            json.load(jf)
+                    except Exception:
+                        integrity_ok = False
 
         results = {
             "run_id": run_id,

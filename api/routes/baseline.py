@@ -337,7 +337,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
             import json
             from datetime import datetime, timezone
             logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs"))
-            os.makedirs(logs_dir, exist_ok=True)
+            # os.makedirs(logs_dir, exist_ok=True) disabled for deployment
             timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             inspection_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}.json")
             run_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}_{timestamp_str}.json")
@@ -405,14 +405,15 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
                     "canonical_candidates": raw_candidates,
                 },
             }
-            # Save latest document-scoped artifact and historical run artifact
-            with open(inspection_artifact_path, "w", encoding="utf-8") as f_art:
-                json.dump(diagnostic_artifact, f_art, indent=2, default=str)
-            try:
-                with open(run_artifact_path, "w", encoding="utf-8") as f_run:
-                    json.dump(diagnostic_artifact, f_run, indent=2, default=str)
-            except Exception:
-                pass
+            # Save latest document-scoped artifact and historical run artifact (disabled for deployment)
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+                with open(inspection_artifact_path, "w", encoding="utf-8") as f_art:
+                    json.dump(diagnostic_artifact, f_art, indent=2, default=str)
+                try:
+                    with open(run_artifact_path, "w", encoding="utf-8") as f_run:
+                        json.dump(diagnostic_artifact, f_run, indent=2, default=str)
+                except Exception:
+                    pass
 
             sec_bk = diagnostic_artifact["step3_candidate_extraction"]["section_breakdown"]
             logger.log("\n  >> [Step 3: Canonical Candidates Section Breakdown] <<")
