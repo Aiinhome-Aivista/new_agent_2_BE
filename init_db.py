@@ -38,19 +38,19 @@ def run_tracker_migrations():
         
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'risk_origin'")
         rows = cursor.fetchall()
-                if not rows:
+        if not rows:
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_origin VARCHAR(255) NULL DEFAULT NULL")
             conn.commit()
             
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'previous_highest_score'")
         rows = cursor.fetchall()
-                if not rows:
+        if not rows:
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN previous_highest_score INT NULL DEFAULT 0")
             conn.commit()
 
         cursor.execute("SHOW COLUMNS FROM tracker_items LIKE 'execution_status'")
         rows = cursor.fetchall()
-                if not rows:
+        if not rows:
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN execution_status VARCHAR(50) NULL DEFAULT 'NOT_STARTED'")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN risk_status VARCHAR(50) NULL DEFAULT 'OPEN'")
             cursor.execute("ALTER TABLE tracker_items ADD COLUMN graph_role VARCHAR(100) NULL DEFAULT 'DOWNSTREAM_ACTIVITY'")

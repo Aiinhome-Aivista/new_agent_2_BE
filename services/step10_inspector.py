@@ -41,7 +41,7 @@ class Step10Logger:
             except Exception:
                 pass
 
-            def banner(self, title: str):
+    def banner(self, title: str):
         bar = "=" * 80
         self.raw_log(f"\n{bar}")
         self.raw_log(f"[{self._format_timestamp()}] {title}")

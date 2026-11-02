@@ -17,7 +17,20 @@ class LocalStorageProvider(BaseStorageProvider):
         cwd_candidate = os.path.join(os.getcwd(), storage_key)
         if os.path.exists(cwd_candidate):
             return cwd_candidate
-        return storage_key
+        # Check relative to workspace root
+        root_dir = os.path.abspath(os.path.join(backend_dir, ".."))
+        root_candidate = os.path.join(root_dir, storage_key)
+        if os.path.exists(root_candidate):
+            return root_candidate
+        # Fallback by original document basename
+        raw_name = os.path.basename(storage_key)
+        base_name_clean = re.sub(r'_[a-f0-9]{8}(\.[a-zA-Z0-9]+)$', r'', raw_name)
+        for check_name in [raw_name, base_name_clean]:
+            for check_dir in [backend_dir, os.getcwd(), root_dir]:
+                c = os.path.join(check_dir, check_name)
+                if os.path.exists(c):
+                    return c
+        return candidate
 
     def _get_local_path(self, project_id: int, project_name: str, filename: str) -> str:
         safe_name = re.sub(r'[^a-zA-Z0-9_\-]', '_', project_name) if project_name else "Project"

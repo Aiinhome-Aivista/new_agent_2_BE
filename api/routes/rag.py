@@ -131,6 +131,8 @@ def get_session_messages(
     cursor.close()
     return {"success": True, "data": messages}
 
+_PROJECT_SUGGESTIONS_CACHE: dict = {}
+
 @router.get("/suggestions")
 def get_project_suggestions(
     project_id: int,
@@ -138,6 +140,11 @@ def get_project_suggestions(
     db: mysql.connector.connection.MySQLConnection = Depends(get_db)
 ):
     verify_project_access(project_id, current_user, db)
+    
+    # Return from cache if already generated
+    if project_id in _PROJECT_SUGGESTIONS_CACHE:
+        return {"success": True, "data": _PROJECT_SUGGESTIONS_CACHE[project_id]}
+
     cursor = db.cursor(dictionary=True)
     
     # 1. Fetch project
@@ -157,7 +164,18 @@ def get_project_suggestions(
     
     cursor.close()
     
-    # 4. Generate suggestions using LLM
+    # Fast path: If baseline scope has not been extracted yet, return instant contextual prompts (zero LLM latency)
+    if not scope_items:
+        fallback_suggestions = [
+            f"What documents are uploaded for {project_name}?",
+            f"How do I extract the baseline scope for {project_name}?",
+            f"What are the key contractual commitments in the uploaded contract?",
+            f"Who are the key stakeholders for {project_name}?"
+        ]
+        _PROJECT_SUGGESTIONS_CACHE[project_id] = fallback_suggestions
+        return {"success": True, "data": fallback_suggestions}
+    
+    # 4. Generate suggestions using LLM only when structured scope exists
     prompt = f"""You are the Project AI Assistant. Based on the following project context, generate exactly 4 highly specific, relevant, and realistic questions that a user (e.g. project manager, delivery lead, reviewer) would want to ask to understand the project's scope, deliverables, or exclusions.
 Make the questions directly reference the specific documents or scope items listed below.
 
@@ -182,7 +200,6 @@ Requirements:
         if not isinstance(suggestions, list) or len(suggestions) < 2:
             raise ValueError("Invalid format")
     except Exception as e:
-        print(f"Failed to generate dynamic suggestions using LLM: {e}")
         # Clean fallback
         suggestions = [
             f"What is the status of deliverables in {project_name}?",
@@ -191,7 +208,9 @@ Requirements:
             f"What are the main client dependencies for {project_name}?"
         ]
         
-    return {"success": True, "data": suggestions[:4]}
+    final_suggestions = suggestions[:4]
+    _PROJECT_SUGGESTIONS_CACHE[project_id] = final_suggestions
+    return {"success": True, "data": final_suggestions}
 
 @router.post("/sessions/{session_id}/messages")
 def send_chat_message(

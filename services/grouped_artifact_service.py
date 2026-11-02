@@ -251,9 +251,9 @@ class GroupedArtifactService:
                         f_out.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Log content recorded inline in pipeline session.\n")
                     f_out.write(cls._format_step_footer(s_num, s_name, run_id, s_status))
 
-            # Check Step 10 status and readiness
-            s10_info = step_data.get(10, {})
-            s10_readiness = s10_info.get("json_data", {}).get("readiness_status", "PROVISIONAL")
+        # Check Step 10 status and readiness
+        s10_info = step_data.get(10, {})
+        s10_readiness = s10_info.get("json_data", {}).get("readiness_status", "PROVISIONAL")
 
         s7_10_json_data = {
             "manifest": {

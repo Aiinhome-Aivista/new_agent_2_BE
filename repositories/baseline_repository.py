@@ -660,7 +660,7 @@ class BaselineRepository:
                 
         # 3. Apply Explicit Resolutions
         try:
-            from api.routes.baseline import _is_title_match
+            from core.helpers import is_title_match as _is_title_match
         except Exception:
             _is_title_match = None
 

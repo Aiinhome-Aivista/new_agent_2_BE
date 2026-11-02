@@ -45,7 +45,7 @@ class Step5Logger:
             except Exception:
                 pass
 
-            def log(self, message: str, level: str = "INFO"):
+    def log(self, message: str, level: str = "INFO"):
         prefix = f"[{self._format_timestamp()}] [{level.upper()}] "
         self.raw_log(f"{prefix}{message}")
 

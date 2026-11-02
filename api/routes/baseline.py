@@ -29,7 +29,6 @@ from services.chroma_service import ChromaService
 from services.embedding_service import EmbeddingService
 from services.scope_section_detector import ScopeSectionDetector
 from services.milestone_deadline_extractor import MilestoneDeadlineExtractor
-from services.scope_candidate_extractor import ScopeCandidateExtractor
 from services.scope_classifier import ScopeClassifier
 from services.scope_deduplicator import ScopeDeduplicator
 from services.normalization_service import NormalizationService
@@ -53,8 +52,7 @@ from services.project_planning_service import ProjectPlanningService
 
 router = APIRouter()
 
-# Supported extraction modes for the baseline pipeline.
-QUICK_EXTRACT = "QUICK"
+# Primary extraction pipeline for contract baseline
 DEEP_SCAN = "DEEP_SCAN"
 
 
@@ -90,7 +88,7 @@ def _supersede_previous_vector_versions(db_conn, project_id: int, current_docume
         print(f"[VectorVersioning] Non-fatal error during vector version cleanup: {e}")
 
 
-def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_EXTRACT, execution_mode: str = 'INSPECTION'):
+def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SCAN, execution_mode: str = 'INSPECTION'):
     # Establish a fresh connection for the thread
     thread_conn = get_db_connection()
     if not thread_conn:
@@ -277,20 +275,15 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         logger.input("Extraction Mode", mode)
         from services.deep_scan_extractor import DeepScanExtractor
         coverage_audit = {}
-        if mode == DEEP_SCAN:
-            logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap + Action/Entity Protection)...")
-            from services.deep_scan_extractor import DeepScanExtractor
-            raw_candidates, coverage_audit = DeepScanExtractor.extract_candidates_with_coverage(
-                project_id=project_id,
-                document_id=document_id,
-                document_type=doc.get("document_type", "EL"),
-                parsed_chunks=chunks,
-                sectioned_chunks=chunks_with_sections,
-                logger=logger,
-            )
-        else:
-            logger.process("Running QUICK deterministic extractor (bullets, numbered lists, table rows, clauses)...")
-            raw_candidates = ScopeCandidateExtractor.extract_candidates(chunks_with_sections, document_id)
+        logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap + Action/Entity Protection)...")
+        raw_candidates, coverage_audit = DeepScanExtractor.extract_candidates_with_coverage(
+            project_id=project_id,
+            document_id=document_id,
+            document_type=doc.get("document_type", "EL"),
+            parsed_chunks=chunks,
+            sectioned_chunks=chunks_with_sections,
+            logger=logger,
+        )
         step3_time = time.time() - t_step3
 
         logger.output("Canonical Candidates Extracted", len(raw_candidates))
@@ -1278,8 +1271,8 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = QUICK_E
         thread_conn.close()
 
 class ExtractRequest(BaseModel):
-    # "QUICK" (default, existing deterministic hybrid) or "DEEP_SCAN" (Map-Reduce).
-    mode: Optional[str] = QUICK_EXTRACT
+    # DEEP_SCAN Map-Reduce pipeline permanently active
+    mode: Optional[str] = DEEP_SCAN
     # "INSPECTION" / "DRY_RUN" (read-only) or "PERSIST_DRAFT" (persists to DB)
     execution_mode: Optional[str] = "INSPECTION" 
 
@@ -1294,10 +1287,8 @@ def extract_baseline(
 ):
     verify_project_access(project_id, current_user, db)
 
-    # Resolve and validate the extraction mode (backward compatible: no body -> QUICK).
-    mode = (payload.mode if payload and payload.mode else QUICK_EXTRACT).upper()
-    if mode not in (QUICK_EXTRACT, DEEP_SCAN):
-        mode = QUICK_EXTRACT
+    # Always use DEEP_SCAN pipeline
+    mode = DEEP_SCAN
     
     doc = BaselineRepository.get_document(db, document_id, project_id)
     if not doc:
@@ -1338,7 +1329,7 @@ def extract_baseline(
     )
     thread.start()
 
-    mode_label = "Deep Scan" if mode == DEEP_SCAN else "Quick Extract"
+    mode_label = "Deep Scan"
     return {"success": True, "message": f"Baseline extraction started ({mode_label})", "data": {"baseline_id": None, "mode": mode}}
 
 
@@ -1667,63 +1658,6 @@ def delete_scope_item(
     
     return {"success": True, "message": "Scope item deleted successfully"}
 
-def _extract_compound_abbrevs(word: str) -> set:
-    """Generically extract common compound abbreviations (e.g. 'database' -> 'db')."""
-    w = word.lower()
-    res = {w}
-    compound_splits = re.findall(r'[a-z]+', re.sub(r'([A-Z])', r' \1', word).lower())
-    if len(compound_splits) >= 2:
-        res.add("".join(s[0] for s in compound_splits))
-    if "data" in w and "base" in w:
-        res.add("db")
-    return res
-
-def _extract_acronyms(text: str) -> set:
-    """Generically extract acronyms from multi-word phrases and hyphenated terms."""
-    stop_words = {"for", "and", "the", "with", "to", "of", "in", "a", "an", "on", "is", "by", "at", "as", "from"}
-    clean_text = re.sub(r'[\(\)\[\]\{\}\-_,\.:;\t\r\n]+', ' ', text)
-    words = [w for w in re.findall(r'\b[a-zA-Z0-9]+\b', clean_text.lower()) if w not in stop_words]
-    acrs = set()
-    if len(words) >= 2:
-        acrs.add("".join(w[0] for w in words))
-    for l in range(2, min(len(words) + 1, 6)):
-        for i in range(len(words) - l + 1):
-            sub = words[i:i+l]
-            acrs.add("".join(w[0] for w in sub))
-    for w in words:
-        acrs.update(_extract_compound_abbrevs(w))
-    return acrs
-
-def _stem_token(token: str) -> str:
-    """Generic light stemming for English verb/noun inflections."""
-    t = token.lower()
-    for suffix in ("ation", "tion", "ment", "ing", "ies", "ed", "es", "s"):
-        if t.endswith(suffix) and len(t) - len(suffix) >= 3:
-            return t[:-len(suffix)]
-    return t
-
-def _tokenize_stemmed_words(text: str) -> set:
-    stop_words = {"for", "and", "the", "with", "to", "of", "in", "a", "an", "on", "is", "by", "at", "as", "from", "etc"}
-    clean_text = re.sub(r'[\(\)\[\]\{\}\-_,\.:;\t\r\n]+', ' ', text)
-    raw_tokens = re.findall(r'\b[a-zA-Z0-9]+\b', clean_text.lower())
-    return {_stem_token(w) for w in raw_tokens if w not in stop_words and len(w) > 1}
-
-def _is_token_match(t1: str, t2: str) -> bool:
-    if t1 == t2:
-        return True
-    if len(t1) >= 4 and len(t2) >= 4 and (t1.startswith(t2) or t2.startswith(t1)):
-        return True
-    if len(t1) >= 3 and len(t2) >= 3 and difflib.SequenceMatcher(None, t1, t2).ratio() >= 0.82:
-        return True
-    return False
-
-def _matches_any(target: str, pool: set) -> bool:
-    for item in pool:
-        if _is_token_match(target, item):
-            return True
-    return False
-
-# Canonical domain-agnostic title matching algorithm imported from core.helpers
 _is_title_match = is_title_match
 
 MONTH_MAP = {
@@ -1779,385 +1713,9 @@ def _is_scope_item_match_for_resolution(resolved_item: dict, si: dict) -> bool:
     return _is_title_match(res_name, si_name)
 
 def _rebuild_graph_and_recalculate(cursor, project_id: int, completed_title: Optional[str] = None) -> None:
-    """
-    GRAPH_RECALC PMO ENGINE:
-    Rebuild the runtime dependency graph from OPEN tracker_items' reasoning JSON
-    and re-evaluate graph_role and execution_priority_score using RiskScoringEngine.
-    Executes full Step 2A through Step 2G pipeline with complete terminal visibility.
-    """
-    try:
-        from services.risk_scoring_engine import RiskScoringEngine, _parse_due_date
-    except Exception:
-        return
+    """Delegates graph rebuild & execution priority recalculation to centralized RiskLifecycleService."""
+    return RiskLifecycleService.rebuild_graph_and_recalculate(cursor, project_id, completed_title)
 
-    # ──────────────────────────────────────────────────────────────────────────
-    # 🟢 STEP 2A: Fact Extraction & Completed Scope Verification
-    # ──────────────────────────────────────────────────────────────────────────
-    cursor.execute("""
-        SELECT name, scope_item_normalized FROM scope_items 
-        WHERE project_id = %s AND (completion_status = 'ACTIVE' OR completion_status IS NULL)
-    """, (project_id,))
-    active_scope_rows = cursor.fetchall() or []
-    active_scope_names = {r["name"] for r in active_scope_rows if r.get("name")} | {r["scope_item_normalized"] for r in active_scope_rows if r.get("scope_item_normalized")}
-
-    cursor.execute("""
-        SELECT name, scope_item_normalized FROM scope_items 
-        WHERE project_id = %s AND completion_status = 'COMPLETED'
-    """, (project_id,))
-    completed_scope_rows = cursor.fetchall() or []
-    completed_scope_names = {r["name"] for r in completed_scope_rows if r.get("name")} | {r["scope_item_normalized"] for r in completed_scope_rows if r.get("scope_item_normalized")}
-    if completed_title:
-        completed_scope_names.add(completed_title)
-
-    # 1. Ensure any open tracker item whose scope deliverable is COMPLETED is marked RESOLVED
-    cursor.execute("""
-        SELECT id, title FROM tracker_items 
-        WHERE project_id = %s AND status = 'OPEN'
-    """, (project_id,))
-    open_items_check = cursor.fetchall() or []
-    for it in open_items_check:
-        title = it["title"]
-        if any(_is_title_match(title, c_name) for c_name in completed_scope_names):
-            cursor.execute("""
-                UPDATE tracker_items 
-                SET status = 'RESOLVED', execution_status = 'RESOLVED', risk_status = 'RESOLVED',
-                    execution_priority_score = 0, risk_score = 0,
-                    resolution = 'Deliverable completed.', resolved_at = NOW()
-                WHERE id = %s
-            """, (it["id"],))
-
-    # 2. Ensure any tracker item previously auto-resolved by deliverable completion whose deliverable was REOPENED to ACTIVE is restored to OPEN
-    cursor.execute("""
-        SELECT id, title, resolution, resolved_by FROM tracker_items 
-        WHERE project_id = %s AND status = 'RESOLVED'
-    """, (project_id,))
-    resolved_items_check = cursor.fetchall() or []
-    for it in resolved_items_check:
-        title = it["title"]
-        is_auto_resolved = (it.get("resolution") == "Deliverable completed.")
-        if is_auto_resolved:
-            matches_active = any(_is_title_match(title, a_name) for a_name in active_scope_names)
-            matches_completed = any(_is_title_match(title, c_name) for c_name in completed_scope_names)
-            if matches_active and not matches_completed:
-                cursor.execute("""
-                    UPDATE tracker_items 
-                    SET status = 'OPEN', execution_status = 'IN_PROGRESS', risk_status = 'OPEN',
-                        resolution = NULL, resolved_by = NULL, resolved_at = NULL
-                    WHERE id = %s
-                """, (it["id"],))
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 🔵 STEP 2B: Context & Active Dependency Graph Reconstruction
-    # ──────────────────────────────────────────────────────────────────────────
-    cursor.execute("""
-        SELECT * FROM tracker_items 
-        WHERE project_id = %s AND status = 'OPEN'
-    """, (project_id,))
-    open_items = cursor.fetchall() or []
-    
-    cursor.execute("""
-        SELECT title FROM tracker_items 
-        WHERE project_id = %s AND status = 'RESOLVED'
-    """, (project_id,))
-    resolved_rows = cursor.fetchall() or []
-    resolved_titles = {r["title"] for r in resolved_rows if r.get("title")} | completed_scope_names
-        
-    if not open_items:
-        return
-
-    # Rebuild raw dependency graph from ALL project tracker items (open + resolved)
-    cursor.execute("""
-        SELECT title, reasoning FROM tracker_items 
-        WHERE project_id = %s
-    """, (project_id,))
-    all_tracker_items = cursor.fetchall() or []
-
-    raw_graph = {}
-    for item in all_tracker_items:
-        title = item["title"]
-        r = safe_json_loads(item.get("reasoning"))
-            
-        blocks_list = r.get("blocks", [])
-        if isinstance(blocks_list, list):
-            for b in blocks_list:
-                if isinstance(b, str) and b.strip():
-                    raw_graph.setdefault(title, []).append(b.strip())
-                    
-        chain = r.get("execution_chain", [])
-        if isinstance(chain, list) and len(chain) > 1:
-            for idx in range(len(chain) - 1):
-                src = chain[idx]
-                dst = chain[idx + 1]
-                if isinstance(src, str) and isinstance(dst, str):
-                    if dst not in raw_graph.get(src, []):
-                        raw_graph.setdefault(src, []).append(dst)
-
-    # Filter out completed items from the active DAG
-    graph = {}
-    for src, targets in raw_graph.items():
-        if any(_is_title_match(src, res) for res in resolved_titles):
-            continue
-        filtered_targets = []
-        for t in targets:
-            if not any(_is_title_match(t, res) for res in resolved_titles):
-                filtered_targets.append(t)
-        if filtered_targets:
-            graph[src] = filtered_targets
-
-    # STEP 2B SUPPLEMENT: Include static milestone dependency edges for tracker items
-    # that have an m_id set or match a project milestone, whose downstream milestone has no tracker item.
-    # This prevents cascade count loss when downstream milestones are not tracked separately.
-    # Generic: works for any tracker item matching project_milestones.
-    try:
-        cursor.execute("SELECT id, name, status FROM project_milestones WHERE project_id = %s", (project_id,))
-        all_pm = cursor.fetchall() or []
-        open_tracker_mids = {}
-        for item in open_items:
-            ref_id = item.get('reference_id')
-            title = item.get('title') or ''
-            found_mid = None
-            if ref_id and any((pm['id'] == ref_id if isinstance(pm, dict) else pm[0] == ref_id) for pm in all_pm):
-                found_mid = ref_id
-            else:
-                for pm in all_pm:
-                    pm_name = pm['name'] if isinstance(pm, dict) else pm[1]
-                    if _is_title_match(title, pm_name):
-                        found_mid = pm['id'] if isinstance(pm, dict) else pm[0]
-                        break
-            if found_mid and title:
-                open_tracker_mids[found_mid] = title
-
-        if open_tracker_mids:
-            mid_list = list(open_tracker_mids.keys())
-            format_str = ','.join(['%s'] * len(mid_list))
-            cursor.execute(f"""
-                SELECT md.parent_milestone_id, md.child_milestone_id, pm.name as downstream_name
-                FROM milestone_dependencies md
-                JOIN project_milestones pm ON md.child_milestone_id = pm.id
-                WHERE md.parent_milestone_id IN ({format_str})
-                AND pm.project_id = %s
-                AND pm.status NOT IN ('Completed', 'COMPLETED')
-            """, (*mid_list, project_id))
-
-            milestone_deps = cursor.fetchall() or []
-            for dep in milestone_deps:
-                upstream_mid = dep['parent_milestone_id'] if isinstance(dep, dict) else dep[0]
-                downstream_name = dep['downstream_name'] if isinstance(dep, dict) else dep[2]
-
-                if upstream_mid in open_tracker_mids:
-                    upstream_title = open_tracker_mids[upstream_mid]
-                    # Add edge if downstream is not already resolved/completed
-                    downstream_is_resolved = any(_is_title_match(downstream_name, res) for res in resolved_titles)
-                    downstream_is_tracker = any(
-                        _is_title_match(downstream_name, t.get('title', ''))
-                        for t in open_items
-                    )
-                    if not downstream_is_resolved and not downstream_is_tracker and downstream_name:
-                        # Add virtual downstream node to the runtime graph
-                        if upstream_title not in graph:
-                            graph[upstream_title] = []
-                        if not any(_is_title_match(downstream_name, existing_t) for existing_t in graph[upstream_title]):
-                            graph[upstream_title].append(downstream_name)
-    except Exception:
-        pass
-
-    def _bfs_cascade(start_node: str) -> int:
-        visited = set()
-        queue = [start_node]
-        while queue:
-            curr = queue.pop(0)
-            for child in graph.get(curr, []):
-                child_canonical = None
-                for k in graph.keys():
-                    if _is_title_match(k, child):
-                        child_canonical = k
-                        break
-                target_key = child_canonical or child
-                if target_key not in visited:
-                    visited.add(target_key)
-                    queue.append(target_key)
-        return len(visited)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 🟡 STEP 2C & 🟣 STEP 2D: Graph Roles & RiskScoringEngine Evaluation
-    # ──────────────────────────────────────────────────────────────────────────
-    recalculated = []
-    for item in open_items:
-        title = item["title"]
-        is_scope_creep = bool(item.get("is_out_of_scope", 0)) or item.get("graph_role") == "SCOPE_CREEP"
-        
-        if is_scope_creep:
-            new_graph_role = "SCOPE_CREEP"
-            cascade = 0
-        else:
-            has_incoming = False
-            for src, targets in graph.items():
-                if not _is_title_match(src, title):
-                    for t in targets:
-                        if _is_title_match(t, title):
-                            has_incoming = True
-                            break
-                    if has_incoming:
-                        break
-                        
-            has_outgoing = False
-            for src in graph.keys():
-                if _is_title_match(src, title):
-                    if len(graph[src]) > 0:
-                        has_outgoing = True
-                        break
-
-            # Check if this item had upstream predecessors in the full project architecture
-            had_upstream = False
-            for src, targets in raw_graph.items():
-                if not _is_title_match(src, title):
-                    for t in targets:
-                        if _is_title_match(t, title):
-                            had_upstream = True
-                            break
-                    if had_upstream:
-                        break
-
-            all_upstreams_done = had_upstream and not has_incoming
-
-            if not has_incoming and has_outgoing:
-                new_graph_role = "ROOT_CAUSE"
-                cascade = _bfs_cascade(title)
-            elif has_incoming and has_outgoing:
-                new_graph_role = "INTERMEDIATE_BLOCKER"
-                cascade = _bfs_cascade(title)
-            elif has_incoming and not has_outgoing:
-                new_graph_role = "TERMINAL_ACTIVITY"
-                cascade = 0
-            elif all_upstreams_done:
-                # All upstream predecessors completed -> Unblocked and ready for execution
-                new_graph_role = "ROOT_CAUSE"
-                cascade = 0
-            else:
-                new_graph_role = "ISOLATED"
-                cascade = 0
-
-        risk_severity = item.get("risk_severity_score") or item.get("risk_score") or 50
-        days_until_due = item.get("days_until_due") or 9999
-        owner = item.get("owner") or "Internal"
-        
-        if days_until_due == 9999:
-            r_obj = safe_json_loads(item.get("reasoning"))
-            due_date_str = r_obj.get("due_date")
-            if due_date_str:
-                d_parsed = _parse_due_date(due_date_str)
-                if d_parsed is not None:
-                    days_until_due = d_parsed
-
-        try:
-            score_res = RiskScoringEngine.calculate(
-                status=item.get("status", "OPEN"),
-                blocked_by=[],
-                graph_role=new_graph_role,
-                cascade_count=cascade,
-                is_scope_creep=is_scope_creep,
-                days_until_due=days_until_due,
-                dependency_owner=owner,
-                execution_unlock_count=cascade,
-                criticality_score=float(risk_severity),
-            )
-            new_exec_score = score_res["execution_priority"]
-        except Exception:
-            new_exec_score = item.get("execution_priority_score") or 20
-
-        # Step 6: Determine new execution_status & recommended action
-        old_exec_status = item.get("execution_status") or "OPEN"
-        if new_graph_role == "ROOT_CAUSE":
-            if old_exec_status in ["BLOCKED", "IN_PROGRESS", "OPEN"]:
-                new_exec_status = "IN_PROGRESS" if owner != "Customer" else "WAITING_ON_CUSTOMER"
-                new_rec_action = f"Prerequisites satisfied ({completed_title or 'Upstream deliverable'} completed). Ready for implementation."
-            else:
-                new_exec_status = "WAITING_ON_CUSTOMER" if owner == "Customer" else "NOT_STARTED"
-                new_rec_action = item.get("recommended_action") or "Prioritize execution."
-        elif new_graph_role == "INTERMEDIATE_BLOCKER":
-            new_exec_status = "BLOCKED"
-            new_rec_action = item.get("recommended_action") or "Awaiting completion of upstream prerequisite."
-        elif new_graph_role == "TERMINAL_ACTIVITY":
-            new_exec_status = "BLOCKED"
-            new_rec_action = item.get("recommended_action") or "Track execution progress."
-        else:
-            new_exec_status = item.get("execution_status") or "IN_PROGRESS"
-            new_rec_action = item.get("recommended_action") or "Track execution progress."
-
-        # ──────────────────────────────────────────────────────────────────────────
-        # 📝 STEP 2F: PM Impact & Executive Summary Synchronization
-        # ──────────────────────────────────────────────────────────────────────────
-        r_json = safe_json_loads(item.get("reasoning"))
-        if isinstance(r_json, dict) and r_json:
-            if new_graph_role == "ROOT_CAUSE" and old_exec_status in ["BLOCKED", "IN_PROGRESS"]:
-                if "business_impact" in r_json and isinstance(r_json["business_impact"], dict):
-                    r_json["business_impact"]["immediate"] = "Prerequisites satisfied. Unblocked and ready for execution."
-                r_json["executive_summary"] = f"Prerequisites completed; {title} is now unblocked and ready for implementation."
-            updated_reasoning_str = safe_json_dumps(r_json)
-        else:
-            updated_reasoning_str = item.get("reasoning")
-
-        # Step 7: Update tracker_items
-        # RC2 FIX: risk_score is NOT updated here — it is set at creation and is stable.
-        # execution_priority_score reflects graph position (changes as graph topology changes).
-        # risk_score reflects severity (set by RiskScoringEngine at creation, never changed here).
-        cursor.execute("""
-            UPDATE tracker_items
-            SET execution_priority_score = %s,
-                graph_role = %s,
-                execution_status = %s,
-                recommended_action = %s,
-                reasoning = %s
-            WHERE id = %s
-        """, (
-            new_exec_score,
-            new_graph_role,
-            new_exec_status,
-            new_rec_action,
-            updated_reasoning_str,
-            item["id"]
-        ))
-        
-        recalculated.append({
-            "id": item["id"],
-            "title": title,
-            "new_score": new_exec_score,
-            "graph_role": new_graph_role,
-            "execution_status": new_exec_status,
-            "cascade": cascade
-        })
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # ⚖️ STEP 2E: Parent > Child Constraint Enforcement
-    # ──────────────────────────────────────────────────────────────────────────
-    for src, targets in graph.items():
-        src_items = [r for r in recalculated if _is_title_match(r["title"], src)]
-        if not src_items:
-            continue
-        src_rec = src_items[0]
-        for tgt in targets:
-            tgt_items = [r for r in recalculated if _is_title_match(r["title"], tgt)]
-            if not tgt_items:
-                continue
-            tgt_rec = tgt_items[0]
-            if src_rec["new_score"] <= tgt_rec["new_score"]:
-                forced_score = min(100, tgt_rec["new_score"] + 1)
-                cursor.execute("UPDATE tracker_items SET execution_priority_score = %s WHERE id = %s", (forced_score, src_rec["id"]))
-                src_rec["new_score"] = forced_score
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # 🔢 STEP 2G: Re-stamp priority_order on all open items
-    # Ensures priority_order strictly reflects the finalized execution_priority_score
-    # ──────────────────────────────────────────────────────────────────────────
-    cursor.execute("""
-        SELECT id FROM tracker_items
-        WHERE project_id = %s AND status = 'OPEN'
-        ORDER BY COALESCE(execution_priority_score, 0) DESC, COALESCE(risk_score, 0) DESC, id ASC
-    """, (project_id,))
-    open_recalc_rows = cursor.fetchall() or []
-    for rank_idx, r_row in enumerate(open_recalc_rows, start=1):
-        r_id = r_row["id"] if isinstance(r_row, dict) else r_row[0]
-        cursor.execute("UPDATE tracker_items SET priority_order = %s WHERE id = %s", (rank_idx, r_id))
 
 class ScopeItemCompletionUpdate(BaseModel):
     completion_status: Optional[str] = None

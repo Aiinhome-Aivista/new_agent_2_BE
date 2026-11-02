@@ -16,7 +16,8 @@ router = APIRouter()
 def _safe_recalculate(cursor_or_db, project_id: int, completed_title: Optional[str] = None) -> None:
     """Safely runs tracker graph recalculation across remaining active items."""
     try:
-        from api.routes.baseline import _rebuild_graph_and_recalculate
+        from services.risk_lifecycle_service import RiskLifecycleService
+        _rebuild_graph_and_recalculate = RiskLifecycleService.rebuild_graph_and_recalculate
         if hasattr(cursor_or_db, 'cursor'):
             with db_cursor(cursor_or_db) as cursor:
                 _rebuild_graph_and_recalculate(cursor, project_id, completed_title)

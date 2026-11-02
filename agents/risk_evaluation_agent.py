@@ -3099,7 +3099,7 @@ class RiskEvaluationAgent:
 
         # Synchronize scope_items status to COMPLETED for completed deliverables from MoM
         try:
-            from api.routes.baseline import _is_title_match
+            from core.helpers import is_title_match as _is_title_match
             import re
             from datetime import datetime, date as date_type
 
@@ -3245,7 +3245,8 @@ class RiskEvaluationAgent:
 
         # Re-evaluate topological graph and recalculate execution queues
         try:
-            from api.routes.baseline import _rebuild_graph_and_recalculate
+            from services.risk_lifecycle_service import RiskLifecycleService
+            _rebuild_graph_and_recalculate = RiskLifecycleService.rebuild_graph_and_recalculate
             _rebuild_graph_and_recalculate(db_cursor, project_id, None)
         except Exception as e:
             print(f"Warning: Auto-recalc after document evaluation failed: {e}")
