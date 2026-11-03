@@ -11,15 +11,16 @@ class AzureDBProvider(BaseDBProvider):
         for attempt in range(max_retries):
             try:
                 connection = mysql.connector.connect(
-                    host=settings.AZURE_DB_HOST,
-                    port=settings.AZURE_DB_PORT,
-                    database=settings.AZURE_DB_DATABASE,
-                    user=settings.AZURE_DB_USER,
-                    password=settings.AZURE_DB_PASSWORD,
+                    host=settings.AZURE_DB_HOST or settings.DB_HOST,
+                    port=settings.AZURE_DB_PORT or settings.DB_PORT,
+                    database=settings.AZURE_DB_DATABASE or settings.DB_NAME,
+                    user=settings.AZURE_DB_USER or settings.DB_USER,
+                    password=settings.AZURE_DB_PASSWORD or settings.DB_PASSWORD,
                     charset='utf8mb4',
                     collation='utf8mb4_unicode_ci',
                     connect_timeout=10,
-                    connection_timeout=10
+                    connection_timeout=10,
+                    ssl_disabled=False
                 )
                 if connection.is_connected():
                     return connection

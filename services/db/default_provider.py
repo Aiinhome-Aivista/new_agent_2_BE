@@ -19,19 +19,22 @@ class DefaultDBProvider(BaseDBProvider):
                 if cls._pool is None or (cls._pool is False and (now - cls._last_pool_attempt > cls._POOL_RETRY_INTERVAL)):
                     cls._last_pool_attempt = now
                     try:
-                        cls._pool = pooling.MySQLConnectionPool(
-                            pool_name="acse_default_pool",
-                            pool_size=10,
-                            pool_reset_session=True,
-                            host=settings.DB_HOST,
-                            port=settings.DB_PORT,
-                            database=settings.DB_NAME,
-                            user=settings.DB_USER,
-                            password=settings.DB_PASSWORD,
-                            charset='utf8mb4',
-                            collation='utf8mb4_unicode_ci',
-                            connect_timeout=5,
-                        )
+                        pool_kwargs = {
+                            "pool_name": "acse_default_pool",
+                            "pool_size": 10,
+                            "pool_reset_session": True,
+                            "host": settings.DB_HOST,
+                            "port": settings.DB_PORT,
+                            "database": settings.DB_NAME,
+                            "user": settings.DB_USER,
+                            "password": settings.DB_PASSWORD,
+                            "charset": "utf8mb4",
+                            "collation": "utf8mb4_unicode_ci",
+                            "connect_timeout": 10,
+                        }
+                        if "azure.com" in settings.DB_HOST.lower():
+                            pool_kwargs["ssl_disabled"] = False
+                        cls._pool = pooling.MySQLConnectionPool(**pool_kwargs)
                     except Exception as e:
                         print(f"Warning: Failed to initialize MySQL connection pool: {e}")
                         cls._pool = False
@@ -57,17 +60,20 @@ class DefaultDBProvider(BaseDBProvider):
         retry_delay = 0.2  # seconds
         for attempt in range(max_retries):
             try:
-                connection = mysql.connector.connect(
-                    host=settings.DB_HOST,
-                    port=settings.DB_PORT,
-                    database=settings.DB_NAME,
-                    user=settings.DB_USER,
-                    password=settings.DB_PASSWORD,
-                    charset='utf8mb4',
-                    collation='utf8mb4_unicode_ci',
-                    connect_timeout=5,
-                    connection_timeout=5
-                )
+                conn_kwargs = {
+                    "host": settings.DB_HOST,
+                    "port": settings.DB_PORT,
+                    "database": settings.DB_NAME,
+                    "user": settings.DB_USER,
+                    "password": settings.DB_PASSWORD,
+                    "charset": "utf8mb4",
+                    "collation": "utf8mb4_unicode_ci",
+                    "connect_timeout": 10,
+                    "connection_timeout": 10,
+                }
+                if "azure.com" in settings.DB_HOST.lower():
+                    conn_kwargs["ssl_disabled"] = False
+                connection = mysql.connector.connect(**conn_kwargs)
                 if connection.is_connected():
                     return connection
             except Error as e:

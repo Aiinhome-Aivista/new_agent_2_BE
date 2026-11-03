@@ -1,5 +1,7 @@
 import os
+from urllib.parse import urlparse, unquote
 from pydantic_settings import BaseSettings
+from pydantic import model_validator
 
 class Settings(BaseSettings):
     APP_NAME: str = "Autonomous Contract Scope Evaluator"
@@ -31,6 +33,44 @@ class Settings(BaseSettings):
     AZURE_DB_DATABASE: str = "acse_db"
     AZURE_DB_USER: str = ""
     AZURE_DB_PASSWORD: str = ""
+    DATABASE_URL: str = ""
+    DB_URL: str = ""
+    AZURE_DATABASE_URL: str = ""
+
+    @model_validator(mode="after")
+    def parse_database_url(self):
+        url = self.DATABASE_URL or self.DB_URL or self.AZURE_DATABASE_URL
+        if url:
+            try:
+                if "+pymysql" in url:
+                    clean_url = url.replace("+pymysql", "")
+                else:
+                    clean_url = url
+                parsed = urlparse(clean_url)
+                if parsed.hostname:
+                    self.DB_HOST = parsed.hostname
+                    if not self.AZURE_DB_HOST:
+                        self.AZURE_DB_HOST = parsed.hostname
+                if parsed.port:
+                    self.DB_PORT = parsed.port
+                    if not self.AZURE_DB_PORT:
+                        self.AZURE_DB_PORT = parsed.port
+                if parsed.username:
+                    self.DB_USER = unquote(parsed.username)
+                    if not self.AZURE_DB_USER:
+                        self.AZURE_DB_USER = unquote(parsed.username)
+                if parsed.password:
+                    self.DB_PASSWORD = unquote(parsed.password)
+                    if not self.AZURE_DB_PASSWORD:
+                        self.AZURE_DB_PASSWORD = unquote(parsed.password)
+                if parsed.path and len(parsed.path) > 1:
+                    db_name = parsed.path.lstrip("/").split("?")[0]
+                    self.DB_NAME = db_name
+                    if not self.AZURE_DB_DATABASE:
+                        self.AZURE_DB_DATABASE = db_name
+            except Exception:
+                pass
+        return self
     
     JWT_SECRET_KEY: str = "replace_with_secure_secret"
     JWT_ALGORITHM: str = "HS256"
