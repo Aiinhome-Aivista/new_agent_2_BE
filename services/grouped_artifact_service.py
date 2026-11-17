@@ -87,8 +87,11 @@ class GroupedArtifactService:
             10: {"name": "...", "status": "...", "log_path": "...", "json_data": {...}, "duration": 0.8},
         }
         """
-        # os.makedirs(logs_dir, exist_ok=True) disabled for deployment
-        write_disk_logs = os.getenv("ENABLE_DISK_LOGS", "false").lower() in ("true", "1", "yes")
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+        except Exception:
+            pass
+        write_disk_logs = os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes")
 
         # -------------------------------------------------------------
         # 1. Group 1: Steps 1-3
@@ -150,7 +153,7 @@ class GroupedArtifactService:
             "step2_section_detection": step_data.get(2, {}).get("json_data", {}),
             "step3_candidate_extraction": step_data.get(3, {}).get("json_data", {}),
         }
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(g1_json_path, "w", encoding="utf-8") as f:
                 json.dump(s1_3_json_data, f, indent=2, default=str)
 
@@ -214,7 +217,7 @@ class GroupedArtifactService:
             "step5_validation_gate_and_dry_run_preview": step_data.get(5, {}).get("json_data", {}),
             "step6_bidirectional_traceability_matrix": step_data.get(6, {}).get("json_data", {}),
         }
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(g2_json_path, "w", encoding="utf-8") as f:
                 json.dump(s4_6_json_data, f, indent=2, default=str)
 
@@ -286,7 +289,7 @@ class GroupedArtifactService:
             "step9_recurring_commitments_expansion": step_data.get(9, {}).get("json_data", {}),
             "step10_final_el_analysis_and_dashboard": step_data.get(10, {}).get("json_data", {}),
         }
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(g3_json_path, "w", encoding="utf-8") as f:
                 json.dump(s7_10_json_data, f, indent=2, default=str)
 
@@ -326,7 +329,7 @@ class GroupedArtifactService:
             if write_disk_logs:
                 if not os.path.exists(g_v["log_path"]) or os.path.getsize(g_v["log_path"]) == 0:
                     integrity_ok = False
-            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
                 if not os.path.exists(g_v["json_path"]) or os.path.getsize(g_v["json_path"]) == 0:
                     integrity_ok = False
                 else:

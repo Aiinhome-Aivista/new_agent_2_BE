@@ -1,3 +1,15 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import os
 import sys
 import time
@@ -20,6 +32,7 @@ class BaselineLogger:
     def __init__(self, project_id: int, document_id: int, log_dir: Optional[str] = None):
         self.project_id = project_id
         self.document_id = document_id
+        self.timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if log_dir is None:
             # Backend root directory: new_agent_2_BE/logs
@@ -28,21 +41,62 @@ class BaselineLogger:
         else:
             self.log_dir = log_dir
 
-        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
 
         self.unified_log_path = os.path.join(self.log_dir, "baseline_extraction.log")
         self.run_log_path = os.path.join(self.log_dir, f"baseline_p{project_id}_d{document_id}.log")
+        self.run_timestamp_log_path = os.path.join(self.log_dir, f"baseline_p{project_id}_d{document_id}_{self.timestamp_str}.log")
+        self.step1_log_path = os.path.join(self.log_dir, f"step1_document_parsing_p{project_id}_d{document_id}.log")
+        self.step2_log_path = os.path.join(self.log_dir, f"step2_scope_sections_p{project_id}_d{document_id}.log")
+        self.step3_log_path = os.path.join(self.log_dir, f"step3_candidate_extraction_p{project_id}_d{document_id}.log")
+        self.current_step = None
         self._lock = threading.Lock()
 
     def _format_timestamp(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        """No-op by default: step1 to last step verbose terminal prints totally removed for deployment."""
-        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
+            except Exception:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    safe_text = text.encode(enc, errors="replace").decode(enc)
+                    sys.stdout.write(safe_text + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
+            try:
+                with self._lock:
+                    if not os.path.exists(self.log_dir):
+                        os.makedirs(self.log_dir, exist_ok=True)
+                    # 1. Main run log and unified cumulative log
+                    with open(self.run_log_path, "a", encoding="utf-8") as f_run:
+                        f_run.write(text + "\n")
+                    if hasattr(self, "run_timestamp_log_path") and self.run_timestamp_log_path:
+                        with open(self.run_timestamp_log_path, "a", encoding="utf-8") as f_ts:
+                            f_ts.write(text + "\n")
+                    with open(self.unified_log_path, "a", encoding="utf-8") as f_u:
+                        f_u.write(text + "\n")
+
+                    # 2. Per-step logs for Steps 1, 2, 3
+                    step_val = str(getattr(self, "current_step", ""))
+                    if step_val in ("1", "Step 1", "step1"):
+                        with open(self.step1_log_path, "a", encoding="utf-8") as f_s1:
+                            f_s1.write(text + "\n")
+                    elif step_val in ("2", "Step 2", "step2"):
+                        with open(self.step2_log_path, "a", encoding="utf-8") as f_s2:
+                            f_s2.write(text + "\n")
+                    elif step_val in ("3", "Step 3", "step3"):
+                        with open(self.step3_log_path, "a", encoding="utf-8") as f_s3:
+                            f_s3.write(text + "\n")
             except Exception:
                 pass
 
@@ -57,14 +111,15 @@ class BaselineLogger:
         self.raw_log(f"  {title}")
         self.raw_log(f"{sep}")
 
-    def step_start(self, step_num: int, step_title: str):
+    def step_start(self, step_num: Any, step_title: str):
+        self.current_step = step_num
         sep = "-" * 80
         ts = self._format_timestamp()
         self.raw_log(f"\n{sep}")
         self.raw_log(f"[*] STEP {step_num}: {step_title.upper()} | Started: {ts}")
         self.raw_log(f"{sep}")
 
-    def step_end(self, step_num: int, step_title: str, duration_sec: float):
+    def step_end(self, step_num: Any, step_title: str, duration_sec: float):
         ts = self._format_timestamp()
         self.raw_log(f"[✓] STEP {step_num} COMPLETED in {duration_sec:.2f}s | {ts}\n")
 
@@ -97,12 +152,16 @@ class BaselineLogger:
     def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
         ts = self._format_timestamp()
         sep = "!" * 80
-        self.raw_log(f"\n{sep}")
-        self.raw_log(f"[{ts}] [ERROR] Baseline Extraction failed at: {context}")
-        self.raw_log(f"Error Message: {error_msg}")
+        err_block = (
+            f"\n{sep}\n"
+            f"[{ts}] [ERROR] Baseline Extraction failed at: {context}\n"
+            f"Error Message: {error_msg}\n"
+        )
         if traceback_str:
-            self.raw_log(f"Traceback:\n{traceback_str}")
-        self.raw_log(f"{sep}\n")
+            err_block += f"Traceback:\n{traceback_str}\n"
+        err_block += f"{sep}\n"
+        self.raw_log(err_block)
+        pass
 
     def get_log_paths(self) -> Dict[str, str]:
         return {

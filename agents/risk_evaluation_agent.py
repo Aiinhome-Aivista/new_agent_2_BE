@@ -3251,6 +3251,24 @@ class RiskEvaluationAgent:
         except Exception as e:
             print(f"Warning: Auto-recalc after document evaluation failed: {e}")
 
+        # Leading-Indicator Alert Engine (Part C)
+        leading_results = {}
+        try:
+            from services.leading_indicator_engine import LeadingIndicatorEngine
+            leading_results = LeadingIndicatorEngine.evaluate(
+                project_id=project_id,
+                document_id=document_id,
+                document_text=document_text,
+                document_date=document_date,
+                db_cursor=db_cursor,
+                extracted_activities=activities_with_contexts,
+                stakeholders=stakeholders,
+            )
+            if leading_results and leading_results.get("alerts"):
+                print(f"  [LeadingIndicators] Synthesized {leading_results.get('alerts_count', 0)} proactive alerts.")
+        except Exception as li_err:
+            print(f"  [LeadingIndicators] Warning: Leading indicator evaluation failed (non-blocking): {li_err}")
+
         _emit("Completed", 100)
         return {
             "overallRisk": overall_risk,
@@ -3258,7 +3276,8 @@ class RiskEvaluationAgent:
             "summary": summary,
             "highestActionPriority": highest_action_priority,
             "recommendations": recommendations,
-            "subAgentResults": sub_agent_results
+            "subAgentResults": sub_agent_results,
+            "leadingIndicators": leading_results,
         }
 
     # ── PUBLIC ENTRY POINT ─────────────────────────────────────────────────────

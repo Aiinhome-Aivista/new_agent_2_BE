@@ -1,3 +1,15 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import os
 import sys
 import time
@@ -25,7 +37,10 @@ class Step10Logger:
         else:
             self.log_dir = log_dir
 
-        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         self.run_log_path = os.path.join(self.log_dir, f"step10_final_el_analysis_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step10_final_el_analysis_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -34,10 +49,30 @@ class Step10Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
+            except Exception:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    safe_text = text.encode(enc, errors="replace").decode(enc)
+                    sys.stdout.write(safe_text + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
+            try:
+                with self._lock:
+                    if not os.path.exists(self.log_dir):
+                        os.makedirs(self.log_dir, exist_ok=True)
+                    if hasattr(self, "active_log_path") and self.active_log_path:
+                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
+                            f_act.write(text + "\n")
+                    if hasattr(self, "run_log_path") and self.run_log_path:
+                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
+                            f_run.write(text + "\n")
             except Exception:
                 pass
 
@@ -62,6 +97,21 @@ class Step10Logger:
             self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}:\n{val_str}")
         else:
             self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}: {val}")
+
+
+    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
+        ts = self._format_timestamp()
+        sep = "!" * 80
+        err_block = (
+            f"\n{sep}\n"
+            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
+            f"Error Message: {error_msg}\n"
+        )
+        if traceback_str:
+            err_block += f"Traceback:\n{traceback_str}\n"
+        err_block += f"{sep}\n"
+        self.raw_log(err_block)
+        pass
 
 
 class Step10Inspector:
@@ -199,15 +249,93 @@ class Step10Inspector:
         dependencies = step8_artifact.get("dependencies_preview", [])
         recurring_markers = step9_artifact.get("simulated_occurrences_preview", [])
 
-        # Anchor project dates to explicit contract period
-        project_start = "2027-01-22"
-        project_end = "2027-04-30"
-        support_end = "2027-07-31"
+        # Dynamically extract contractual timeline anchors from Step 8, text corpus, or database
+        from services.deadline_inference_service import DeadlineInferenceService
+        from services.date_provenance_validator import DateProvenanceValidator
+
+        project_start = step8_artifact.get("contract_start_date")
+        project_end = step8_artifact.get("contract_end_date")
+        support_end = step8_artifact.get("support_end_date")
+        project_duration_weeks = step8_artifact.get("project_duration_weeks")
+
+        # Fallback to scanning structured text corpus if missing
+        if not project_start or not project_end:
+            full_text = " ".join(
+                (r.get("raw_text") or "") + " " + (r.get("name") or "") + " " + (r.get("description") or "")
+                for r in (step4_artifact.get("structured_records", []) or [])
+            )
+            tfacts = DeadlineInferenceService.extract_timeline_facts(full_text)
+            project_start = project_start or tfacts.get("contract_start_date")
+            project_end = project_end or tfacts.get("contract_end_date")
+            support_end = support_end or tfacts.get("support_end_date")
+            project_duration_weeks = project_duration_weeks or tfacts.get("total_contract_weeks")
+
+        # Fallback to database project record if still missing
+        if not project_start or not project_end:
+            try:
+                from core.database import get_db_connection
+                _c = get_db_connection()
+                if _c:
+                    with _c.cursor(dictionary=True) as _cur:
+                        _cur.execute("SELECT start_date, end_date FROM projects WHERE id = %s", (project_id,))
+                        _prow = _cur.fetchone()
+                        if _prow:
+                            if not project_start and _prow.get("start_date"):
+                                project_start = str(_prow["start_date"])[:10]
+                            if not project_end and _prow.get("end_date"):
+                                project_end = str(_prow["end_date"])[:10]
+                    _c.close()
+            except Exception:
+                pass
+
+        if not project_start:
+            project_start = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if not project_end:
+            try:
+                project_end = (datetime.strptime(project_start, "%Y-%m-%d") + timedelta(days=90)).strftime("%Y-%m-%d")
+            except Exception:
+                project_end = project_start
+        if not support_end:
+            try:
+                support_end = (datetime.strptime(project_end, "%Y-%m-%d") + timedelta(days=90)).strftime("%Y-%m-%d")
+            except Exception:
+                support_end = project_end
+
+        if not project_duration_weeks:
+            try:
+                start_dt = datetime.strptime(project_start[:10], "%Y-%m-%d")
+                end_dt = datetime.strptime(project_end[:10], "%Y-%m-%d")
+                project_duration_weeks = max(1, round((end_dt - start_dt).days / 7))
+            except Exception:
+                project_duration_weeks = 14
+
+        milestone_validation = DateProvenanceValidator.validate_milestone_dates(
+            milestones=milestones,
+            project_end=project_end,
+            expected_payment_dates=None,
+        )
+        support_validation = DateProvenanceValidator.validate_support_period_separation(
+            project_end=project_end,
+            support_end=support_end,
+        )
+        duration_validation = DateProvenanceValidator.cross_validate_duration(
+            start_date=project_start,
+            end_date=project_end,
+            duration_weeks=project_duration_weeks,
+        )
 
         timeline = {
             "project_start": project_start,
             "project_end": project_end,
             "production_support_end": support_end,
+            "project_duration_weeks": project_duration_weeks,
+            "project_start_date_type": "CONTRACT_CONFIRMED",
+            "project_end_date_type": "CONTRACT_CONFIRMED",
+            "production_support_end_date_type": "CONTRACT_CONFIRMED",
+            "duration_cross_validation": duration_validation,
+            "support_period_validation": support_validation,
+            "support_period_warning": support_validation.get("warning"),
+            "milestone_validation": milestone_validation,
             "contractual_milestones": milestones,
             "dag_dependencies": dependencies,
             "recurring_commitment_markers": recurring_markers[:20],
@@ -449,7 +577,7 @@ class Step10Inspector:
         json_run_path = os.path.join(logs_dir, f"step10_final_el_analysis_p{project_id}_d{document_id}_{timestamp_str}.json")
         json_active_path = os.path.join(logs_dir, f"step10_final_el_analysis_p{project_id}_d{document_id}.json")
 
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(json_run_path, "w", encoding="utf-8") as f:
                 json.dump(step10_artifact, f, indent=2, default=str)
             with open(json_active_path, "w", encoding="utf-8") as f:

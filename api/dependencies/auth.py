@@ -25,7 +25,22 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     if user_id is None or role is None:
         raise credentials_exception
         
-    return {"id": int(user_id), "role": role}
+    try:
+        resolved_id = int(user_id)
+    except (ValueError, TypeError):
+        from repositories.user_repository import UserRepository
+        from core.database import get_db_connection
+        conn = get_db_connection()
+        resolved_id = 0
+        if conn:
+            try:
+                user_obj = UserRepository.get_user_by_email(conn, str(user_id))
+                if user_obj:
+                    resolved_id = user_obj["id"]
+            finally:
+                conn.close()
+        
+    return {"id": resolved_id, "role": role}
 
 def require_roles(allowed_roles: List[str]):
     def role_checker(current_user: dict = Depends(get_current_user)):

@@ -16,6 +16,7 @@ venv.bak/
 
 # Application Data (Uploads, ChromaDB, etc.)
 data/
+storage/
 
 # IDEs / OS files
 .vscode/

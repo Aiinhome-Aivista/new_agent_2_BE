@@ -221,6 +221,16 @@ class ActionEntityProtector:
         return w
 
     @classmethod
+    def get_prefix(cls, n: str) -> Optional[str]:
+        if not n:
+            return None
+        if " - " in n:
+            return n.split(" - ")[0].strip().lower()
+        if ": " in n:
+            return n.split(": ")[0].strip().lower()
+        return None
+
+    @classmethod
     def can_merge(cls, item_a: Dict[str, Any], item_b: Dict[str, Any]) -> Tuple[bool, str]:
         """
         Determines whether two candidate items are eligible for deduplication.
@@ -253,12 +263,11 @@ class ActionEntityProtector:
         norm_desc_a = re.sub(r"\s+", " ", desc_a.lower().strip())
         norm_desc_b = re.sub(r"\s+", " ", desc_b.lower().strip())
         if c_idx_a is not None and c_idx_a == c_idx_b and norm_desc_a and norm_desc_a == norm_desc_b and len(norm_desc_a) >= 15:
-            # FIX-Defect2: When descriptions are BYTE-IDENTICAL from the same chunk,
-            # the candidates are provably the same obligation regardless of how the LLM
-            # named them. The entity title contrast check is intended to protect distinct
-            # obligations that happen to share a chunk but have different descriptions.
-            # An identical description is conclusive proof of a duplicate emission.
-            # Therefore: skip the entity title contrast check and allow dedup unconditionally.
+            # FIX-Agent12: Ensure distinct workstream/module prefixes are NOT merged even if descriptions in same chunk are identical
+            pref_a = cls.get_prefix(name_a)
+            pref_b = cls.get_prefix(name_b)
+            if pref_a and pref_b and pref_a != pref_b:
+                return False, f"Distinct workstream prefixes under shared chunk: '{pref_a}' vs '{pref_b}'"
             return True, "Duplicate emission from identical source span in same chunk"
 
         # 2. Explicit milestone date conflict check
@@ -1967,6 +1976,10 @@ class DeepScanExtractor:
                 norm_d_it = re.sub(r"\s+", " ", desc_it_raw.lower().strip())
                 norm_d_ex = re.sub(r"\s+", " ", desc_ex_raw.lower().strip())
                 if c_idx_it is not None and c_idx_it == c_idx_ex and norm_d_it and norm_d_it == norm_d_ex and len(norm_d_it) >= 15:
+                    pref_it = ActionEntityProtector.get_prefix(name_it)
+                    pref_ex = ActionEntityProtector.get_prefix(name_ex)
+                    if pref_it and pref_ex and pref_it != pref_ex:
+                        continue  # Distinct modules/workstreams -> NEVER merge!
                     match = existing
                     merge_reason = "Duplicate emission of identical source statement within same chunk"
                     if "construct" in name_it_l and "implementation" in name_ex_l:

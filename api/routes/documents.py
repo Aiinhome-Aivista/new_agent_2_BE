@@ -393,10 +393,12 @@ def get_document_final_baseline(
         document_id=document_id
     )
     if res.get("status") == "NOT_GENERATED":
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=res.get("message", "Final baseline artifact not found or not ready yet.")
-        )
+        return {
+            "success": False,
+            "status": "NOT_GENERATED",
+            "message": res.get("message", "Final baseline artifact not found or not ready yet."),
+            "data": None
+        }
     if res.get("status") == "BLOCKED":
         return {
             "success": False,

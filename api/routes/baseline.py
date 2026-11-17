@@ -37,6 +37,7 @@ from services.milestone_dependency_service import MilestoneDependencyService
 from services.recurring_deliverable_service import RecurringDeliverableService
 from services.rag_service import RAGService
 from services.baseline_logger import BaselineLogger
+from services.risk_lifecycle_service import RiskLifecycleService
 
 # pyrefly: ignore [missing-import]
 import mysql.connector
@@ -188,6 +189,10 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
             logger.input("Downloaded File Size", f"{file_size_kb:.1f} KB")
             logger.process("Running MarkItDown / Docling parser and header-aware chunk splitter...")
             chunks = DocumentService.parse_document(temp_path, ext)
+        except Exception as s1_err:
+            import traceback as _tb
+            logger.error("Step 1: Document Parsing & Text Extraction", str(s1_err), _tb.format_exc())
+            raise
         finally:
             if os.path.exists(temp_path):
                 os.remove(temp_path)
@@ -239,7 +244,12 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
         logger.step_start(2, "Scope Section Detection")
         logger.input("Input Chunks Count", len(chunks))
         logger.process("Executing deterministic structural heading detection on chunk boundaries...")
-        chunks_with_sections, section_stats = ScopeSectionDetector.detect_sections_with_stats(chunks)
+        try:
+            chunks_with_sections, section_stats = ScopeSectionDetector.detect_sections_with_stats(chunks)
+        except Exception as s2_err:
+            import traceback as _tb
+            logger.error("Step 2: Scope Section Detection", str(s2_err), _tb.format_exc())
+            raise
         step2_time = time.time() - t_step2
 
         logger.output("Categories Defined in Taxonomy", section_stats["categories_defined"])
@@ -276,14 +286,19 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
         from services.deep_scan_extractor import DeepScanExtractor
         coverage_audit = {}
         logger.process("Running DEEP_SCAN (Map-Reduce + Heatmap + Action/Entity Protection)...")
-        raw_candidates, coverage_audit = DeepScanExtractor.extract_candidates_with_coverage(
-            project_id=project_id,
-            document_id=document_id,
-            document_type=doc.get("document_type", "EL"),
-            parsed_chunks=chunks,
-            sectioned_chunks=chunks_with_sections,
-            logger=logger,
-        )
+        try:
+            raw_candidates, coverage_audit = DeepScanExtractor.extract_candidates_with_coverage(
+                project_id=project_id,
+                document_id=document_id,
+                document_type=doc.get("document_type", "EL"),
+                parsed_chunks=chunks,
+                sectioned_chunks=chunks_with_sections,
+                logger=logger,
+            )
+        except Exception as s3_err:
+            import traceback as _tb
+            logger.error("Step 3: Candidate Scope Extraction", str(s3_err), _tb.format_exc())
+            raise
         step3_time = time.time() - t_step3
 
         logger.output("Canonical Candidates Extracted", len(raw_candidates))
@@ -330,7 +345,10 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
             import json
             from datetime import datetime, timezone
             logs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "logs"))
-            # os.makedirs(logs_dir, exist_ok=True) disabled for deployment
+            try:
+                os.makedirs(logs_dir, exist_ok=True)
+            except Exception:
+                pass
             timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             inspection_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}.json")
             run_artifact_path = os.path.join(logs_dir, f"baseline_inspection_p{project_id}_d{document_id}_{timestamp_str}.json")
@@ -399,7 +417,7 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
                 },
             }
             # Save latest document-scoped artifact and historical run artifact (disabled for deployment)
-            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
                 with open(inspection_artifact_path, "w", encoding="utf-8") as f_art:
                     json.dump(diagnostic_artifact, f_art, indent=2, default=str)
                 try:
@@ -429,137 +447,227 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
             logger.output("Provenance Verification Rate", f"{prov_stats.get('verified_percentage', 100.0)}%")
 
             # ── [INSPECTION MODE: STEP 4 CLASSIFICATION & STRUCTURING] ──
-            # Step 3 is complete and its artifacts are preserved independently.
-            # Now execute Step 4 under inspection mode with a dedicated Step 4 log and JSON artifact.
+            t_step4 = time.time()
+            emit("Classifying Scope Items (Step 4)", 50)
+            logger.step_start(4, "Scope Item Classification & Structuring")
+            logger.input("Raw Candidates Count", len(raw_candidates))
+            logger.process("Running deterministic section pre-filter and LLM batch classification...")
             from services.step4_inspector import Step4Inspector
             run_id = f"inspection_run_{timestamp_str}"
-            step4_results = Step4Inspector.execute_inspection(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                raw_candidates=raw_candidates,
-                step3_json_path=run_artifact_path,
-                step3_log_path=logger.get_log_paths()["run_log"],
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-                index_to_chunk={i: c.get("text", "") for i, c in enumerate(chunks)},
-            )
+            try:
+                step4_results = Step4Inspector.execute_inspection(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    raw_candidates=raw_candidates,
+                    step3_json_path=run_artifact_path,
+                    step3_log_path=logger.get_log_paths()["run_log"],
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                    index_to_chunk={i: c.get("text", "") for i, c in enumerate(chunks)},
+                )
+            except Exception as s4_err:
+                import traceback as _tb
+                logger.error("Step 4: Scope Classification & Structuring", str(s4_err), _tb.format_exc())
+                raise
+            step4_time = time.time() - t_step4
+            logger.output("Step 4 Classified Items Breakdown", step4_results.get("scope_breakdown", {}))
+            logger.step_end(4, "Scope Item Classification & Structuring", step4_time)
 
             # ── [INSPECTION MODE: STEP 5 BASELINE PREPARATION & PERSISTENCE SAFETY GATE] ──
-            # Step 4 is complete and its artifacts are preserved independently.
-            # Now execute Step 5 under inspection mode with dedicated Step 5 log and preview JSON artifacts.
+            t_step5 = time.time()
+            emit("Preparing Baseline & Persistence Safety Gate (Step 5)", 70)
+            logger.step_start(5, "Scope Baseline Preparation & Persistence Safety Gate")
             from services.step5_inspector import Step5Inspector
             step5_mode = os.getenv("STEP5_EXECUTION_MODE", "DRY_RUN")
-            step5_results = Step5Inspector.execute_inspection(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step4_artifact=step4_results.get("step4_artifact") or json.load(open(step4_results["step4_run_json_path"], "r", encoding="utf-8")),
-                step4_json_path=step4_results["step4_run_json_path"],
-                step4_log_path=step4_results["step4_log_path"],
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-                mode=step5_mode,
-                db_conn=None if step5_mode == "DRY_RUN" else thread_conn,
-            )
+            logger.input("Execution Mode", step5_mode)
+            logger.process("Validating scope boundaries, exclusions, dependencies, and baseline safety gate...")
+            try:
+                step5_results = Step5Inspector.execute_inspection(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step4_artifact=step4_results.get("step4_artifact") or json.load(open(step4_results["step4_run_json_path"], "r", encoding="utf-8")),
+                    step4_json_path=step4_results["step4_run_json_path"],
+                    step4_log_path=step4_results["step4_log_path"],
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                    mode=step5_mode,
+                    db_conn=None if step5_mode == "DRY_RUN" else thread_conn,
+                )
+            except Exception as s5_err:
+                import traceback as _tb
+                logger.error("Step 5: Baseline Preparation & Safety Gate", str(s5_err), _tb.format_exc())
+                raise
+            step5_time = time.time() - t_step5
+            logger.output("Step 5 Safety Gate Verdict", step5_results.get("verdict", "N/A"))
+            logger.step_end(5, "Scope Baseline Preparation & Persistence Safety Gate", step5_time)
 
             # ── [INSPECTION MODE: STEP 6 TRACEABILITY & COVERAGE AUDIT] ──
+            t_step6 = time.time()
+            emit("Auditing Traceability & Coverage (Step 6)", 80)
+            logger.step_start(6, "Traceability & Coverage Audit")
+            logger.process("Verifying bidirectional source locators, verbatim quotes, and chunk coverage...")
             from services.step6_tracer import Step6Tracer
-            step6_results = Step6Tracer.execute_inspection(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step3_artifact=diagnostic_artifact,
-                step4_artifact=step4_results.get("step4_artifact") or {},
-                step5_artifact=step5_results.get("step5_artifact") or {},
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-            )
+            try:
+                step6_results = Step6Tracer.execute_inspection(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step3_artifact=diagnostic_artifact,
+                    step4_artifact=step4_results.get("step4_artifact") or {},
+                    step5_artifact=step5_results.get("step5_artifact") or {},
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                )
+            except Exception as s6_err:
+                import traceback as _tb
+                logger.error("Step 6: Traceability & Coverage Audit", str(s6_err), _tb.format_exc())
+                raise
+            step6_time = time.time() - t_step6
+            logger.output("Step 6 Traceability Score", step6_results.get("verdict", "N/A"))
+            logger.step_end(6, "Traceability & Coverage Audit", step6_time)
 
             # ── [INSPECTION MODE: STEP 7 AMBIGUITY & GAP ANALYSIS] ──
+            t_step7 = time.time()
+            emit("Analyzing Ambiguities & Contract Gaps (Step 7)", 82)
+            logger.step_start(7, "Ambiguity & Gap Analysis")
+            logger.process("Detecting ambiguous terminology, SLAs, unassigned ownership, and contract gaps...")
             from services.step7_analyzer import Step7Analyzer
-            step7_results = Step7Analyzer.execute_inspection(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step3_artifact=diagnostic_artifact,
-                step4_artifact=step4_results.get("step4_artifact") or {},
-                step5_artifact=step5_results.get("step5_artifact") or {},
-                step6_artifact=step6_results.get("step6_artifact") or {},
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-            )
+            try:
+                step7_results = Step7Analyzer.execute_inspection(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step3_artifact=diagnostic_artifact,
+                    step4_artifact=step4_results.get("step4_artifact") or {},
+                    step5_artifact=step5_results.get("step5_artifact") or {},
+                    step6_artifact=step6_results.get("step6_artifact") or {},
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                )
+            except Exception as s7_err:
+                import traceback as _tb
+                logger.error("Step 7: Ambiguity & Gap Analysis", str(s7_err), _tb.format_exc())
+                raise
+            step7_time = time.time() - t_step7
+            logger.output("Step 7 Ambiguities Analyzed", step7_results.get("verdict", "N/A"))
+            logger.step_end(7, "Ambiguity & Gap Analysis", step7_time)
 
             # ── [INSPECTION MODE: STEP 8 PROJECT MILESTONES & DAG DEPENDENCIES] ──
-            emit("Building Milestone Dependencies (Inspection)", 85)
+            t_step8 = time.time()
+            emit("Building Milestone Dependencies (Step 8)", 85)
+            logger.step_start(8, "Project Milestones & DAG Dependencies")
+            logger.process("Extracting milestone anchors, mapping dependencies, and running DAG cycle detection...")
             from services.step8_inspector import Step8Inspector
-            step8_results = Step8Inspector.execute_inspection(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step4_artifact=step4_results.get("step4_artifact") or {},
-                step5_artifact=step5_results.get("step5_artifact") or {},
-                step6_artifact=step6_results.get("step6_artifact") or {},
-                step7_artifact=step7_results.get("step7_artifact") or {},
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-                mode=step5_mode,
-            )
+            try:
+                step8_results = Step8Inspector.execute_inspection(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step4_artifact=step4_results.get("step4_artifact") or {},
+                    step5_artifact=step5_results.get("step5_artifact") or {},
+                    step6_artifact=step6_results.get("step6_artifact") or {},
+                    step7_artifact=step7_results.get("step7_artifact") or {},
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                    mode=step5_mode,
+                )
+            except Exception as s8_err:
+                import traceback as _tb
+                logger.error("Step 8: Milestones & DAG Dependencies", str(s8_err), _tb.format_exc())
+                raise
+            step8_time = time.time() - t_step8
+            logger.output("Step 8 Milestones & DAG Status", step8_results.get("verdict", "N/A"))
+            logger.step_end(8, "Project Milestones & DAG Dependencies", step8_time)
 
             # ── [INSPECTION MODE: STEP 9 RECURRING COMMITMENTS DETECTION & EXPANSION] ──
-            emit("Detecting Recurring Commitments (Inspection)", 93)
+            t_step9 = time.time()
+            emit("Detecting Recurring Commitments (Step 9)", 93)
+            logger.step_start(9, "Recurring Commitments Detection & Expansion")
+            logger.process("Detecting reporting cadences, governance meetings, SLAs, and recurring obligations...")
             from services.step9_inspector import Step9Inspector
-            step9_results = Step9Inspector.execute_inspection(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step4_artifact=step4_results.get("step4_artifact") or {},
-                step5_artifact=step5_results.get("step5_artifact") or {},
-                step8_artifact=step8_results.get("step8_artifact") or {},
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-                mode=step5_mode,
-            )
+            try:
+                step9_results = Step9Inspector.execute_inspection(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step4_artifact=step4_results.get("step4_artifact") or {},
+                    step5_artifact=step5_results.get("step5_artifact") or {},
+                    step8_artifact=step8_results.get("step8_artifact") or {},
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                    mode=step5_mode,
+                )
+            except Exception as s9_err:
+                import traceback as _tb
+                logger.error("Step 9: Recurring Commitments Detection", str(s9_err), _tb.format_exc())
+                raise
+            step9_time = time.time() - t_step9
+            logger.output("Step 9 Recurring Commitments Status", step9_results.get("verdict", "N/A"))
+            logger.step_end(9, "Recurring Commitments Detection & Expansion", step9_time)
 
             # ── [RISK ASSESSMENT LIFECYCLE: PHASE 1 INITIAL CONTRACTUAL ASSESSMENT] ──
+            t_risk = time.time()
             emit("Generating Initial Contractual Risk Assessment", 95)
+            logger.step_start("Risk Lifecycle", "Phase 1: Initial Contractual Risk Assessment")
+            logger.process("Evaluating baseline ambiguities, milestone tight tolerances, and contractual exposure...")
             from services.risk_lifecycle_service import RiskLifecycleService
-            initial_risk_assessment = RiskLifecycleService.generate_initial_contractual_assessment(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step4_artifact=step4_results.get("step4_artifact") or {},
-                step7_artifact=step7_results.get("step7_artifact") or {},
-                step9_artifact=step9_results.get("step9_artifact") or {},
-                run_id=run_id,
-                logs_dir=logs_dir,
-            )
+            try:
+                initial_risk_assessment = RiskLifecycleService.generate_initial_contractual_assessment(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step4_artifact=step4_results.get("step4_artifact") or {},
+                    step7_artifact=step7_results.get("step7_artifact") or {},
+                    step9_artifact=step9_results.get("step9_artifact") or {},
+                    run_id=run_id,
+                    logs_dir=logs_dir,
+                )
+            except Exception as risk_err:
+                import traceback as _tb
+                logger.error("Risk Assessment Lifecycle", str(risk_err), _tb.format_exc())
+                raise
+            risk_time = time.time() - t_risk
+            logger.output("Contractual Risks Detected", len(initial_risk_assessment.get("risk_items", [])))
+            logger.step_end("Risk Lifecycle", "Phase 1: Initial Contractual Risk Assessment", risk_time)
 
             # ── [INSPECTION MODE: STEP 10 FINAL EL SYNTHESIS & DASHBOARD PAYLOAD] ──
-            emit("Synthesizing Final EL Analysis & Dashboard (Inspection)", 97)
+            t_step10 = time.time()
+            emit("Synthesizing Final EL Analysis & Dashboard (Step 10)", 97)
+            logger.step_start(10, "Final EL Analysis & Dashboard Synthesis")
+            logger.process("Consolidating steps 1-9 into executive synthesis, KPI metrics, and UI dashboard payload...")
             from services.step10_inspector import Step10Inspector
-            step10_results = Step10Inspector.execute_synthesis(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                step4_artifact=step4_results.get("step4_artifact") or {},
-                step5_artifact=step5_results.get("step5_artifact") or {},
-                step6_artifact=step6_results.get("step6_artifact") or {},
-                step7_artifact=step7_results.get("step7_artifact") or {},
-                step8_artifact=step8_results.get("step8_artifact") or {},
-                step9_artifact=step9_results.get("step9_artifact") or {},
-                initial_risk_assessment=initial_risk_assessment,
-                run_id=run_id,
-                timestamp_str=timestamp_str,
-                logs_dir=logs_dir,
-                mode=step5_mode,
-            )
+            try:
+                step10_results = Step10Inspector.execute_synthesis(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    step4_artifact=step4_results.get("step4_artifact") or {},
+                    step5_artifact=step5_results.get("step5_artifact") or {},
+                    step6_artifact=step6_results.get("step6_artifact") or {},
+                    step7_artifact=step7_results.get("step7_artifact") or {},
+                    step8_artifact=step8_results.get("step8_artifact") or {},
+                    step9_artifact=step9_results.get("step9_artifact") or {},
+                    initial_risk_assessment=initial_risk_assessment,
+                    run_id=run_id,
+                    timestamp_str=timestamp_str,
+                    logs_dir=logs_dir,
+                    mode=step5_mode,
+                )
+            except Exception as s10_err:
+                import traceback as _tb
+                logger.error("Step 10: Final EL Analysis Synthesis", str(s10_err), _tb.format_exc())
+                raise
+            step10_time = time.time() - t_step10
+            logger.output("Step 10 Dashboard Readiness", step10_results.get("readiness_status", "N/A"))
+            logger.step_end(10, "Final EL Analysis & Dashboard Synthesis", step10_time)
 
             # ── [CONSOLIDATE GROUPED AUDIT ARTIFACTS: 3 LOGS & 3 JSONs] ──
             emit("Consolidating Grouped Audit Artifacts", 98)
@@ -661,16 +769,24 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
 
             # Build, validate, and atomically save consolidated authoritative final baseline artifact
             from services.final_baseline_service import FinalBaselineService
-            final_artifact = FinalBaselineService.build_final_baseline(
-                project_id=project_id,
-                document_id=document_id,
-                doc_name=doc.get("document_name", "demo_EL.docx"),
-                run_id=run_id,
-                execution_mode="PERSIST_DRAFT" if str(execution_mode).upper() == "PERSIST_DRAFT" else ("INSPECTION" if INSPECTION_MODE else "DRY_RUN"),
-                step_data=step_data_map,
-                logs_dir=logs_dir,
-            )
-            final_save_report = FinalBaselineService.save_atomic_and_verify(final_artifact)
+            logger.banner("AUTHORITATIVE FINAL EL BASELINE ARTIFACT CONSOLIDATION & VALIDATION")
+            logger.process("Building canonical final baseline JSON data structure from Step 1-10 outputs...")
+            try:
+                final_artifact = FinalBaselineService.build_final_baseline(
+                    project_id=project_id,
+                    document_id=document_id,
+                    doc_name=doc.get("document_name", "demo_EL.docx"),
+                    run_id=run_id,
+                    execution_mode="PERSIST_DRAFT" if str(execution_mode).upper() == "PERSIST_DRAFT" else ("INSPECTION" if INSPECTION_MODE else "DRY_RUN"),
+                    step_data=step_data_map,
+                    logs_dir=logs_dir,
+                )
+                logger.process("Validating schema, count reconciliation, date provenance, and saving atomically...")
+                final_save_report = FinalBaselineService.save_atomic_and_verify(final_artifact)
+            except Exception as final_err:
+                import traceback as _tb
+                logger.error("Final Baseline Service: Build & Save", str(final_err), _tb.format_exc())
+                raise
             logger.banner("AUTHORITATIVE FINAL EL BASELINE ARTIFACT SAVED AND VALIDATED")
             logger.output("Final Artifact Path", final_save_report.get("final_artifact_path"))
             logger.output("Final Artifact Status", final_save_report.get("artifact_status"))
@@ -1250,6 +1366,15 @@ def run_baseline_pipeline(project_id: int, document_id: int, mode: str = DEEP_SC
         import traceback
         tb_str = traceback.format_exc()
         logger.error("run_baseline_pipeline", str(e), tb_str)
+        sys.stderr.write(
+            f"\n{'!' * 80}\n"
+            f"[CRITICAL ERROR] [BASELINE EXTRACTION FAILED]\n"
+            f"Project ID: {project_id} | Document ID: {document_id}\n"
+            f"Exception: {type(e).__name__}: {str(e)}\n"
+            f"Traceback:\n{tb_str}"
+            f"{'!' * 80}\n"
+        )
+        sys.stderr.flush()
         try:
             thread_conn.rollback()
         except Exception:
@@ -1398,9 +1523,25 @@ def approve_baseline(
         raise HTTPException(status_code=422, detail=str(val_err))
         
     BaselineRepository.update_project_monitoring_status(db, project_id, 'ACTIVE')
+    
+    # Part B: Freeze immutable Project Plan snapshot upon PM approval
+    frozen_plan_version = 1
+    try:
+        from services.project_plan_service import ProjectPlanService
+        frozen_plan = ProjectPlanService.freeze_plan(
+            db, project_id, baseline["id"], user_id=current_user.get("id")
+        )
+        frozen_plan_version = frozen_plan.get("version", 1)
+    except Exception as plan_err:
+        print(f"[BaselineApprove] Plan freeze warning (non-blocking): {plan_err}")
+
     db.commit()
     
-    return {"success": True, "message": "Baseline approved. Project is now ACTIVE."}
+    return {
+        "success": True,
+        "message": "Baseline approved. Project plan frozen and project is now ACTIVE.",
+        "plan_version": frozen_plan_version,
+    }
 
 class ScopeItemCreate(BaseModel):
     name: str
@@ -2023,10 +2164,12 @@ def get_final_baseline(
         run_id=run_id
     )
     if res.get("status") == "NOT_GENERATED":
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=res.get("message", "Final baseline artifact not found or not ready yet.")
-        )
+        return {
+            "success": False,
+            "status": "NOT_GENERATED",
+            "message": res.get("message", "Final baseline artifact not found or not ready yet."),
+            "data": None
+        }
     if res.get("status") == "BLOCKED":
         return {
             "success": False,

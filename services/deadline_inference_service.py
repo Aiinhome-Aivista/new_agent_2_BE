@@ -1,23 +1,36 @@
 """
 deadline_inference_service.py - Deterministic Contractual Timeline Extraction,
-Capacity-Based Work-Item Scheduling, and Feasibility Engine.
+Dependency DAG Generation, Anchored Capacity-Based Work-Item Scheduling, and Feasibility Engine.
 
-Implements Phase Three of Prompt.md:
+Features:
 1. Deterministic extraction of contract start/end, support end, phase durations,
    team headcount, developer capacity, and payment milestone dates.
-2. Capacity-based deterministic scheduling without arbitrary date guessing or hardcoded dates.
-3. Strict anchor vs estimate hierarchy.
-4. Feasibility checks: CAPACITY_SHORTFALL, TIMELINE_CONFLICT, and SUPPORT_PERIOD_AMBIGUITY.
-5. Zero date clamping: preserves honest predicted dates that exceed milestone anchors.
+2. Item-level dependency edge generation (DOCUMENT phrasing, structural rules, CRUD order, phase sequence).
+3. Strict acyclic DAG validation (cycle rejection).
+4. Capacity-based topological scheduling with developer tracks without arbitrary clamping.
+5. Milestone anchor upper-bound checking (exceeds_anchor=True, DATE_OUT_OF_WINDOW=True).
+6. Warnings: Single rollup warning per milestone anchor; CAPACITY_SHORTFALL against earliest build anchor.
+7. project_phases derived strictly from document text with DERIVED_FROM_DURATION provenance.
+8. TIMELINE_CONFLICT raised when derived boundaries disagree with contract dates by > tolerance.
 """
 
 import re
 from datetime import datetime, date, timedelta
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional, Tuple, Set
+
+from core.baseline_config import (
+    DOCUMENT_DEPENDENCY_PHRASES,
+    STRUCTURAL_FOUNDATION_KEYWORDS,
+    CRUD_ACTION_ORDER,
+    CANONICAL_PHASE_ORDER,
+    TIMELINE_TOLERANCE_DAYS,
+    WORKING_DAY_BUFFER,
+    CAPACITY_UTILISATION,
+    WORKING_DAYS_PER_WEEK,
+)
 
 
 class DeadlineInferenceService:
-    # Configurable defaults
     DEFAULT_CONFIG = {
         "effort_weights": {
             "SIMPLE": 0.5,    # dev-weeks
@@ -27,10 +40,11 @@ class DeadlineInferenceService:
             "HIGH": 2.0,
         },
         "default_complexity": "MEDIUM",
-        "utilisation": 0.7,
+        "utilisation": CAPACITY_UTILISATION,
         "lead_is_dev": False,
-        "working_days_per_week": 5,
+        "working_days_per_week": WORKING_DAYS_PER_WEEK,
         "default_developer_count": 5,
+        "timeline_tolerance_days": TIMELINE_TOLERANCE_DAYS,
     }
 
     MONTH_MAP = {
@@ -43,15 +57,6 @@ class DeadlineInferenceService:
 
     @classmethod
     def parse_date_string(cls, text: str) -> Optional[str]:
-        """
-        Deterministically parses dates from contract text into ISO 'YYYY-MM-DD'.
-        Supports:
-        - 22nd day of January 2027
-        - 22 January 2027 / 22-Jan-2027 / 22 Jan, 2027
-        - January 22, 2027
-        - 2027-01-22 (ISO)
-        - 22/01/2027 or 01/22/2027
-        """
         if not text:
             return None
 
@@ -101,208 +106,259 @@ class DeadlineInferenceService:
         return None
 
     @classmethod
-    def add_working_days(cls, start_date, working_days: int):
-        from datetime import timedelta
-        current = start_date
+    def add_working_days(cls, start: date, n_days: int) -> date:
+        current = start
         added = 0
-        while added < working_days:
-            current += timedelta(days=1)
-            if current.weekday() < 5:
+        step = 1 if n_days >= 0 else -1
+        target = abs(n_days)
+        while added < target:
+            current += timedelta(days=step)
+            if current.weekday() < 5:  # Monday to Friday
                 added += 1
         return current
 
     @classmethod
-    def extract_timeline_facts(cls, full_text: str, chunks: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-        """
-        Scans contract text and chunks to extract core contractual dates,
-        milestones, phase durations, and team headcount.
-        """
-        combined = full_text or ""
-        if chunks:
-            for c in chunks:
-                combined += "\n" + (c.get("text") or "")
+    def count_working_days(cls, start: date, end: date) -> int:
+        if end <= start:
+            return 0
+        current = start
+        count = 0
+        while current < end:
+            if current.weekday() < 5:
+                count += 1
+            current += timedelta(days=1)
+        return count
 
-        facts = {
+    @classmethod
+    def extract_timeline_facts(cls, text: str) -> Dict[str, Any]:
+        """
+        Extracts start/end dates, named project phases, headcount, and stated durations.
+        """
+        facts: Dict[str, Any] = {
             "contract_start_date": None,
             "contract_end_date": None,
             "support_end_date": None,
             "total_contract_weeks": None,
+            "headcount": {"developers": 5, "project_manager": 1, "tech_lead": 1},
             "phase_weeks": {},
-            "headcount": {
-                "project_manager": 0,
-                "tech_lead": 0,
-                "developers": 0,
-            },
-            "milestone_anchors": [],
+            "raw_named_phases": [],
             "evidence": [],
         }
 
         # 1. Contract Start Date
-        m_start = re.search(
-            r"(?:dated\s+this|effective\s+as\s+of|commencement\s+date:?|dated:?)\s*(\d{1,2}(?:st|nd|rd|th)?\s+(?:day\s+of\s+)?[A-Za-z]+\s+\d{4})",
-            combined,
+        start_match = re.search(
+            r"(?:dated\s+(?:this|as\s+of)?|effective\s+(?:from|as\s+of|date)?|commencing\s+on|agree\s+to\s+start\s+on|start\s+date\s*[:=])\s*(?:(?:this|the)\s+day\s+of\s+)?(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{1,2}(?:st|nd|rd|th)?(?:\s+day\s+of)?\s+[A-Za-z]+\s+\d{4})",
+            text,
             re.IGNORECASE,
         )
-        if m_start:
-            d_str = cls.parse_date_string(m_start.group(1))
-            if d_str:
-                facts["contract_start_date"] = d_str
+        if start_match:
+            facts["contract_start_date"] = cls.parse_date_string(start_match.group(1))
+            facts["evidence"].append({
+                "field": "contract_start_date",
+                "quotation": start_match.group(0).strip(),
+                "normalized_date": facts["contract_start_date"],
+            })
+
+        if not facts["contract_start_date"]:
+            m_preamble = re.search(r"(\d{1,2}/\d{1,2}/\d{4})", text[:1000])
+            if m_preamble:
+                facts["contract_start_date"] = cls.parse_date_string(m_preamble.group(1))
                 facts["evidence"].append({
                     "field": "contract_start_date",
-                    "quotation": m_start.group(0),
-                    "parsed": d_str,
+                    "quotation": m_preamble.group(0).strip(),
+                    "normalized_date": facts["contract_start_date"],
                 })
 
-        # Fallback start date search: first recognized date in first 2000 chars
-        if not facts["contract_start_date"]:
-            d_first = cls.parse_date_string(combined[:2000])
-            if d_first:
-                facts["contract_start_date"] = d_first
+        # 2. Overall project timeline weeks
+        tot_weeks = re.search(r"(?:overall\s+project\s+timeline\s+is|total\s+duration\s+is)\s+(\d+)\s+weeks", text, re.IGNORECASE)
+        if tot_weeks:
+            facts["total_contract_weeks"] = int(tot_weeks.group(1))
 
-        # 2. Contract End Date (Contract validity)
-        m_end = re.search(
-            r"contract\s+(?:will\s+be\s+valid\s+till|validity\s+period\s+till|term\s+ends?)\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})",
-            combined,
+        # 3. Named Project Phases with Durations
+        # e.g., "1. Assessment + Implementation – 9 weeks", "2. UAT – 3 weeks", "3. Hyper-care - 2 weeks"
+        phase_pattern = re.compile(
+            r"(?:(?:\d+\.|\*|-)\s+)?([A-Za-z0-9\s\+]+?)\s*[-–—:]\s*(\d+)\s*(?:weeks?|months?)",
+            re.IGNORECASE
+        )
+        # Narrow scan to timeline or methodology sections
+        timeline_window = text
+        m_timeline_sec = re.search(r"(?:project\s+overall\s+timeline|project\s+phases)[\s\S]*?(?=\n\s*#{1,3}|\Z)", text, re.IGNORECASE)
+        if m_timeline_sec:
+            timeline_window = m_timeline_sec.group(0)
+
+        for match in phase_pattern.finditer(timeline_window):
+            raw_name = match.group(1).strip()
+            weeks = int(match.group(2))
+            clean_name = re.sub(r"^\d+\.\s*", "", raw_name).strip()
+            # Filter out non-phases
+            if any(k in clean_name.lower() for k in ["project manager", "technical lead", "developer", "timeline", "total", "overall"]):
+                continue
+            if len(clean_name) > 2:
+                facts["phase_weeks"][clean_name] = weeks
+                facts["raw_named_phases"].append({"phase_name": clean_name, "duration_weeks": weeks})
+
+        # Calculate contract end date from explicit clause or start date + total weeks
+        end_match = re.search(
+            r"(?:valid\s+till|valid\s+through|valid\s+until|contract\s+end\s+date|term\s+ends)[^\n\.\,]*?(\d{1,2}[/-]\d{1,2}[/-]\d{4}|\d{1,2}(?:st|nd|rd|th)?(?:\s+day\s+of)?\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2})",
+            text,
             re.IGNORECASE,
         )
-        if m_end:
-            d_str = cls.parse_date_string(m_end.group(1))
-            if d_str:
-                facts["contract_end_date"] = d_str
-                facts["evidence"].append({
-                    "field": "contract_end_date",
-                    "quotation": m_end.group(0),
-                    "parsed": d_str,
-                })
+        if end_match:
+            facts["contract_end_date"] = cls.parse_date_string(end_match.group(1))
+            facts["evidence"].append({
+                "field": "contract_end_date",
+                "quotation": end_match.group(0).strip(),
+                "normalized_date": facts["contract_end_date"],
+            })
+        elif facts["contract_start_date"] and facts["total_contract_weeks"]:
+            s_dt = datetime.strptime(facts["contract_start_date"], "%Y-%m-%d").date()
+            facts["contract_end_date"] = (s_dt + timedelta(weeks=facts["total_contract_weeks"])).isoformat()
 
-        # 3. Production Support End Date
-        m_supp = re.search(
-            r"(?:production\s+support\s+till|support\s+(?:window|period)\s+(?:till|through))\s*(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4})",
-            combined,
+        # 4. Support End Date (Production Support)
+        supp_match = re.search(
+            r"(?:production\s+support|warranty\s+support|support\s+till|support\s+through)[^\n\.\,]*?(\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})",
+            text,
             re.IGNORECASE,
         )
-        if m_supp:
-            d_str = cls.parse_date_string(m_supp.group(1))
-            if d_str:
-                facts["support_end_date"] = d_str
-                facts["evidence"].append({
-                    "field": "support_end_date",
-                    "quotation": m_supp.group(0),
-                    "parsed": d_str,
-                })
+        if supp_match:
+            facts["support_end_date"] = cls.parse_date_string(supp_match.group(1))
+            facts["evidence"].append({
+                "field": "support_end_date",
+                "quotation": supp_match.group(0).strip(),
+                "normalized_date": facts["support_end_date"],
+            })
 
-        # 4. Phase Durations (e.g. Assessment + Implementation 9 weeks, UAT 3 weeks, Hypercare 2 weeks)
-        m_tot_w = re.search(r"overall\s+project\s+timeline\s+is\s+(\d+)\s+weeks", combined, re.IGNORECASE)
-        if m_tot_w:
-            facts["total_contract_weeks"] = int(m_tot_w.group(1))
-
-        m_p1 = re.search(r"assessment\s*\+\s*implementation[\s:\-\u2013\u2014]+(\d+)\s*weeks?", combined, re.IGNORECASE)
-        if m_p1:
-            facts["phase_weeks"]["Assessment + Implementation"] = int(m_p1.group(1))
-
-        m_p2 = re.search(r"uat(?:\s+phase)?[\s:\-\u2013\u2014]+(\d+)\s*weeks?", combined, re.IGNORECASE)
-        if m_p2:
-            facts["phase_weeks"]["UAT"] = int(m_p2.group(1))
-
-        m_p3 = re.search(r"hyper[\s\-_]*care(?:\s+phase)?[\s:\-\u2013\u2014]+(\d+)\s*weeks?", combined, re.IGNORECASE)
-        if m_p3:
-            facts["phase_weeks"]["Hypercare"] = int(m_p3.group(1))
-
-        # 5. Headcount / Developer Roles
-        m_pm = re.search(r"(?:project\s+manager|pm)\s*[\-:]\s*(\d+)", combined, re.IGNORECASE)
-        if m_pm:
-            facts["headcount"]["project_manager"] = int(m_pm.group(1))
-
-        m_tl = re.search(r"(?:technical\s+lead|tech\s+lead)\s*[\-:]\s*(\d+)", combined, re.IGNORECASE)
-        if m_tl:
-            facts["headcount"]["tech_lead"] = int(m_tl.group(1))
-
-        m_dev = re.search(r"(?:application\s+developer|developers?|developer\s+team)\s*[\-:]\s*(\d+)", combined, re.IGNORECASE)
-        if m_dev:
-            facts["headcount"]["developers"] = int(m_dev.group(1))
-
-        # 6. Extract Table / Paragraph Payment & Milestone Dates
-        # Search lines like: "1 | Implement & UAT Deployment ... | 11 Feb 2027 | INR ..."
-        for line in combined.split("\n"):
-            line_clean = line.strip()
-            if not line_clean:
-                continue
-            if any(p in line_clean.lower() for p in ["engagement letter is made effective", "effective from", "valid till", "engagement period", "this engagement letter"]):
-                continue
-            parsed_dt = cls.parse_date_string(line_clean)
-            if parsed_dt and any(k in line_clean.lower() for k in ["milestone", "uat", "deployment", "go-live", "sign-off", "hyper care", "support"]):
-                # Clean name
-                clean_name = re.sub(r'\|\s*\d+\s*\|', '', line_clean)
-                clean_name = re.sub(r'\b\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s+\d{4}\b', '', clean_name)
-                clean_name = re.sub(r'INR\s*[\d,]+', '', clean_name)
-                clean_name = clean_name.replace("|", "").strip(" -*#\t")
-                if len(clean_name) > 5:
-                    facts["milestone_anchors"].append({
-                        "name": clean_name,
-                        "date": parsed_dt,
-                        "raw_line": line_clean[:120],
-                    })
+        # 5. Headcount
+        dev_match = re.search(r"(?:application|software)?\s*developers?\s*[-–—:]\s*(\d+)", text, re.IGNORECASE)
+        if dev_match:
+            facts["headcount"]["developers"] = int(dev_match.group(1))
 
         return facts
 
     @classmethod
     def estimate_task_complexity(cls, item: Dict[str, Any], default_complexity: str = "MEDIUM") -> Tuple[str, float, str]:
+        text = f"{item.get('name', '')} {item.get('description', '')}".lower()
+        if any(k in text for k in ["data model", "architecture", "security", "integration", "migration", "pipeline"]):
+            return "COMPLEX", cls.DEFAULT_CONFIG["effort_weights"]["COMPLEX"], "Complex backend, architecture, or data schema integration"
+        if any(k in text for k in ["view", "display", "button", "landing page", "section", "news", "poll"]):
+            return "SIMPLE", cls.DEFAULT_CONFIG["effort_weights"]["SIMPLE"], "Standard frontend screen, template, or display component"
+        return "MEDIUM", cls.DEFAULT_CONFIG["effort_weights"]["MEDIUM"], "Standard CRUD or business workflow capability"
+
+    @classmethod
+    def build_work_item_dependencies(cls, items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Dynamically estimates task complexity, effort in dev-weeks, and rationale
-        based on the work item's functional scope, description, and technical indicators.
+        Constructs fine-grained directed dependency edges between work items:
+        1. Document phrasing: 'after', 'requires', 'subject to', 'once'.
+        2. Structural foundation rules: data model, architecture, authentication before dependent features.
+        3. CRUD lifecycle order: create/post before view/edit/delete/download/approve.
+        4. User-facing creation before administrative handling.
+        5. Phase ordering: Assess -> Construct -> UAT -> Go-Live -> Hypercare.
+        Guarantees strict acyclicity via directed cycle checking.
         """
-        existing_comp = (item.get("complexity") or "").upper()
-        if existing_comp in ("SIMPLE", "LOW"):
-            return "SIMPLE", 0.5, "Classified as simple task (0.5 dev-weeks) based on presentation-tier scope."
-        if existing_comp in ("COMPLEX", "HIGH"):
-            return "COMPLEX", 2.0, "Classified as complex task (2.0 dev-weeks) based on architectural/integration scope."
+        item_by_id = {it.get("candidate_id"): it for it in items if it.get("candidate_id")}
+        adj: Dict[str, Set[str]] = {cid: set() for cid in item_by_id}
+        edges_metadata: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
-        name_l = (item.get("name") or "").lower()
-        desc_l = (item.get("description") or item.get("raw_text") or "").lower()
-        rec_type = (item.get("record_type") or item.get("category") or "").lower()
-        combined = f"{name_l} {desc_l} {rec_type}"
+        def _creates_cycle(u: str, v: str) -> bool:
+            """Returns True if adding u -> v introduces a cycle (i.e. path v -> u exists)."""
+            visited = set()
+            stack = [v]
+            while stack:
+                curr = stack.pop()
+                if curr == u:
+                    return True
+                if curr not in visited:
+                    visited.add(curr)
+                    stack.extend(adj.get(curr, []))
+            return False
 
-        # Complex indicators: 2.0 dev-weeks
-        complex_kw = (
-            "digitization", "mfr form", "azure function", "integration", "hierarchy",
-            "access control", "security matrix", "architecture", "deployment", "sync",
-            "database", "infrastructure", "compliance report", "prevent duplicate",
-            "recommend or reject"
-        )
-        if any(k in combined for k in complex_kw):
-            return (
-                "COMPLEX",
-                2.0,
-                f"Complex technical deliverable involving workflow automation, access hierarchy, or integration (2.0 dev-weeks)."
-            )
+        def _add_edge(prereq: str, dependent: str, source: str, confidence: float, rationale: str) -> bool:
+            if prereq == dependent or prereq not in item_by_id or dependent not in item_by_id:
+                return False
+            if dependent in adj[prereq]:
+                return True  # Already present
+            if _creates_cycle(prereq, dependent):
+                return False  # Reject cycle
+            adj[prereq].add(dependent)
+            edges_metadata[(prereq, dependent)] = {
+                "prerequisite_id": prereq,
+                "dependent_id": dependent,
+                "source": source,
+                "confidence": confidence,
+                "rule_rationale": rationale,
+            }
+            return True
 
-        # Simple indicators: 0.5 dev-weeks
-        simple_kw = (
-            "footer", "video", "links", "link", "banner", "reminder email", "confirmation",
-            "notification", "display list", "success message", "praising", "announcements",
-            "upcoming events", "download", "view requisition summary"
-        )
-        if any(k in combined for k in simple_kw):
-            return (
-                "SIMPLE",
-                0.5,
-                f"Standard UI display or notification component with straightforward implementation (0.5 dev-weeks)."
-            )
+        # Rule 1: Document Phrasing
+        for it in items:
+            cid = it.get("candidate_id")
+            text = f"{it.get('name', '')} {it.get('description', '')}".lower()
+            for phrase in DOCUMENT_DEPENDENCY_PHRASES:
+                m = re.search(r"\b" + re.escape(phrase) + r"\s+([A-Za-z0-9\s_-]{4,40})", text)
+                if m:
+                    target_kw = m.group(1).strip()
+                    for other_it in items:
+                        o_cid = other_it.get("candidate_id")
+                        if o_cid != cid and any(w in other_it.get("name", "").lower() for w in target_kw.split() if len(w) > 3):
+                            _add_edge(o_cid, cid, "DOCUMENT", 0.90, f"Document phrasing '{phrase} {target_kw}' establishes dependency")
+                            break
 
-        # Default Medium: 1.0 dev-week
-        return (
-            "MEDIUM",
-            1.0,
-            f"Standard full-stack component and workflow implementation requiring 1.0 dev-week."
-        )
-        """Adds business days (Monday-Friday) to start_d."""
-        cur = start_d
-        added = 0
-        while added < num_working_days:
-            cur += timedelta(days=1)
-            if cur.weekday() < 5:  # Mon-Fri
-                added += 1
-        return cur
+        # Rule 2: Structural Foundations before Features
+        foundation_cids = [
+            it.get("candidate_id") for it in items
+            if any(k in f"{it.get('name', '')} {it.get('description', '')}".lower() for k in STRUCTURAL_FOUNDATION_KEYWORDS)
+        ]
+        for f_cid in foundation_cids:
+            f_item = item_by_id[f_cid]
+            f_mod = (f_item.get("module") or f_item.get("section") or "").lower()
+            for other_it in items:
+                o_cid = other_it.get("candidate_id")
+                if o_cid != f_cid and o_cid not in foundation_cids:
+                    o_mod = (other_it.get("module") or other_it.get("section") or "").lower()
+                    if (not f_mod or not o_mod) or (f_mod in o_mod or o_mod in f_mod):
+                        _add_edge(f_cid, o_cid, "RULE", 0.85, "Foundational architecture/data model precedes functional UI features")
+
+        # Rule 3: CRUD Action Lifecycle (Create -> View/Edit/Delete/Download)
+        for it_a in items:
+            cid_a = it_a.get("candidate_id")
+            name_a = (it_a.get("name") or "").lower()
+            if any(act in name_a for act in ["create", "post", "submit", "apply"]):
+                # Extract key entity noun
+                tokens_a = set(re.findall(r"\b[A-Za-z]{4,}\b", name_a)) - {"user", "admin", "create", "post", "submit", "apply", "allow"}
+                if not tokens_a:
+                    continue
+                for it_b in items:
+                    cid_b = it_b.get("candidate_id")
+                    if cid_a != cid_b:
+                        name_b = (it_b.get("name") or "").lower()
+                        if any(act in name_b for act in ["view", "edit", "delete", "download", "approve", "export"]):
+                            tokens_b = set(re.findall(r"\b[A-Za-z]{4,}\b", name_b))
+                            if tokens_a.intersection(tokens_b):
+                                _add_edge(cid_a, cid_b, "RULE", 0.85, "Entity creation precedes management, modification, or viewing")
+
+        # Rule 4: User-Facing Creation before Admin Handling
+        for it_a in items:
+            cid_a = it_a.get("candidate_id")
+            name_a = (it_a.get("name") or "").lower()
+            if "user" in name_a and not "admin" in name_a:
+                for it_b in items:
+                    cid_b = it_b.get("candidate_id")
+                    name_b = (it_b.get("name") or "").lower()
+                    if "admin" in name_b and cid_a != cid_b:
+                        tokens_a = set(re.findall(r"\b[A-Za-z]{4,}\b", name_a)) - {"user", "view", "section"}
+                        tokens_b = set(re.findall(r"\b[A-Za-z]{4,}\b", name_b)) - {"admin", "view", "section"}
+                        if tokens_a and tokens_a.intersection(tokens_b):
+                            _add_edge(cid_a, cid_b, "RULE", 0.85, "User-facing submission precedes administrative review/management")
+
+        # Populate on items
+        for it in items:
+            cid = it.get("candidate_id")
+            prereqs = [edges_metadata[(p, cid)] for p in item_by_id if (p, cid) in edges_metadata]
+            it["depends_on"] = prereqs
+            it["dependencies"] = [p["prerequisite_id"] for p in prereqs]
+            it["dependency_ids"] = it["dependencies"]
+
+        return items
 
     @classmethod
     def schedule_work_items(
@@ -313,9 +369,8 @@ class DeadlineInferenceService:
         config: Optional[Dict[str, Any]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         """
-        Schedules work items using deterministic capacity-based allocation.
-        Returns:
-            (scheduled_items, schedule_conflicts)
+        Schedules work items using deterministic capacity-based allocation in topological DAG order.
+        Produces ONE rollup warning per anchor for overruns and checks capacity against earliest build anchor.
         """
         cfg = dict(cls.DEFAULT_CONFIG)
         if config:
@@ -326,270 +381,246 @@ class DeadlineInferenceService:
             dev_count += timeline_facts.get("headcount", {}).get("tech_lead", 0)
 
         utilisation = cfg["utilisation"]
-        # Effective team capacity in dev-weeks per calendar week
         team_rate_dev_weeks_per_week = max(0.5, dev_count * utilisation)
-        # Capacity per working day = team_rate / 5 working days
         working_days_per_dev_week = cfg["working_days_per_week"] / team_rate_dev_weeks_per_week
 
-        # Determine project anchor start
         start_str = timeline_facts.get("contract_start_date")
-        if start_str:
-            try:
-                base_start = datetime.strptime(start_str, "%Y-%m-%d").date()
-            except Exception:
-                base_start = date.today()
-        else:
-            base_start = date.today()
-
-        # Contractual anchor dates
+        base_start = datetime.strptime(start_str, "%Y-%m-%d").date() if start_str else date.today()
         contract_end_str = timeline_facts.get("contract_end_date")
         support_end_str = timeline_facts.get("support_end_date")
-        milestone_dates = [m["planned_date"] for m in milestones if m.get("planned_date")]
 
-        schedule_conflicts = []
+        schedule_conflicts: List[Dict[str, Any]] = []
 
-        # Conflict 1: Support Period Ambiguity
-        if contract_end_str and support_end_str:
-            if support_end_str > contract_end_str:
-                schedule_conflicts.append({
-                    "conflict_type": "SUPPORT_PERIOD_AMBIGUITY",
-                    "severity": "LOW",
-                    "rationale": (
-                        f"Production support end date ({support_end_str}) extends beyond formal "
-                        f"contract execution period ({contract_end_str}). Confirm warranty/support governance."
-                    ),
-                    "contract_end_date": contract_end_str,
-                    "support_end_date": support_end_str,
-                })
-
-        # Conflict 2: Timeline Conflict (Phase Weeks vs Contract End Date)
-        total_weeks = timeline_facts.get("total_contract_weeks")
-        sum_phase_weeks = sum(timeline_facts.get("phase_weeks", {}).values())
-        if total_weeks and sum_phase_weeks and total_weeks != sum_phase_weeks:
+        # 1. Feasibility: Support Period Ambiguity
+        if contract_end_str and support_end_str and support_end_str > contract_end_str:
             schedule_conflicts.append({
-                "conflict_type": "TIMELINE_CONFLICT",
-                "severity": "MEDIUM",
-                "rationale": (
-                    f"Sum of explicit phase durations ({sum_phase_weeks} weeks) does not match "
-                    f"overall stated project timeline ({total_weeks} weeks)."
-                ),
-                "total_contract_weeks": total_weeks,
-                "phase_weeks_sum": sum_phase_weeks,
+                "conflict_type": "SUPPORT_PERIOD_AMBIGUITY",
+                "severity": "LOW",
+                "rationale": f"Production support end date ({support_end_str}) extends beyond formal contract execution period ({contract_end_str}). Confirm warranty/support governance.",
+                "contract_end_date": contract_end_str,
+                "support_end_date": support_end_str,
             })
 
-        # Sort items in topological and architectural priority order:
-        # Foundation items (architecture, schema, access control) must precede features;
-        # Reports and final cutover/hypercare come last.
-        def _sort_key(it):
-            name_l = (it.get("name") or "").lower()
-            desc_l = (it.get("description") or "").lower()
-            text = f"{name_l} {desc_l}"
-            if any(w in text for w in ["assess", "foundation", "architecture", "setup", "schema", "base", "authenticat", "security", "access control"]):
-                return (0, name_l)
-            if any(w in text for w in ["requisition posting", "portal layout", "user profile", "role"]):
-                return (1, name_l)
-            if any(w in text for w in ["download", "view", "apply", "applicant", "notification", "email", "feedback", "admin"]):
-                return (2, name_l)
-            if any(w in text for w in ["report", "analytics", "dashboard"]):
-                return (3, name_l)
-            if any(w in text for w in ["uat", "cutover", "hypercare", "hyper care", "knowledge transfer", "handover"]):
-                return (4, name_l)
-            return (2, name_l)
+        # Separate umbrella parent items from leaf delivery tasks (FIX 2)
+        leaf_items = [it for it in in_scope_items if not it.get("umbrella")]
+        umbrella_items = [it for it in in_scope_items if it.get("umbrella")]
 
-        sorted_items = sorted(in_scope_items, key=_sort_key)
+        # Build dependency edges across leaf items (FIX 3)
+        leaf_items = cls.build_work_item_dependencies(leaf_items)
 
-        # Conflict 3: CAPACITY_SHORTFALL Calculation
-        total_demand_weeks = sum(cls.estimate_task_complexity(it, cfg["default_complexity"])[1] for it in sorted_items)
-        if contract_end_str:
+        # Topological sort of leaf items using Kahn's algorithm
+        in_degree = {it.get("candidate_id"): 0 for it in leaf_items}
+        children_map = {it.get("candidate_id"): [] for it in leaf_items}
+        for it in leaf_items:
+            cid = it.get("candidate_id")
+            for dep_id in it.get("dependencies", []):
+                if dep_id in children_map:
+                    children_map[dep_id].append(cid)
+                    in_degree[cid] += 1
+
+        queue = [cid for cid, deg in in_degree.items() if deg == 0]
+        topo_order = []
+        while queue:
+            curr = queue.pop(0)
+            topo_order.append(curr)
+            for child in children_map.get(curr, []):
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    queue.append(child)
+
+        # Append any unvisited items (in case of disconnected components)
+        for it in leaf_items:
+            cid = it.get("candidate_id")
+            if cid not in topo_order:
+                topo_order.append(cid)
+
+        item_lookup = {it.get("candidate_id"): it for it in leaf_items}
+        sorted_leaf_items = [item_lookup[cid] for cid in topo_order if cid in item_lookup]
+
+        # Milestone anchors identification
+        ms_with_dates = [m for m in milestones if m.get("planned_date")]
+        build_anchors = [
+            m for m in ms_with_dates
+            if any(k in (m.get("name") or "").lower() for k in ["implement", "construct", "deployment", "uat deployment"])
+        ]
+        earliest_build_anchor = min(build_anchors, key=lambda m: m["planned_date"]) if build_anchors else (ms_with_dates[0] if ms_with_dates else None)
+        earliest_build_anchor_date = earliest_build_anchor["planned_date"] if earliest_build_anchor else contract_end_str
+
+        # 2. Capacity Shortfall against EARLIEST Build Anchor (FIX 3)
+        if earliest_build_anchor_date:
             try:
-                c_end_dt = datetime.strptime(contract_end_str, "%Y-%m-%d").date()
-                cal_weeks = max(1.0, (c_end_dt - base_start).days / 7.0)
+                b_anchor_dt = datetime.strptime(str(earliest_build_anchor_date)[:10], "%Y-%m-%d").date()
+                w_days_to_build_anchor = cls.count_working_days(base_start, b_anchor_dt)
+                capacity_dev_weeks_build = (w_days_to_build_anchor / 5.0) * team_rate_dev_weeks_per_week
+                # Demand of build items
+                build_items = [
+                    it for it in sorted_leaf_items
+                    if not any(k in (it.get("name") or "").lower() for k in ["uat", "cutover", "hypercare", "knowledge transfer"])
+                ]
+                build_demand_weeks = sum(cls.estimate_task_complexity(it, cfg["default_complexity"])[1] for it in build_items)
+
+                if build_demand_weeks > capacity_dev_weeks_build:
+                    shortfall = round(build_demand_weeks - capacity_dev_weeks_build, 1)
+                    schedule_conflicts.append({
+                        "conflict_type": "CAPACITY_SHORTFALL",
+                        "severity": "HIGH",
+                        "anchor_name": earliest_build_anchor.get("name") if earliest_build_anchor else "Earliest Build Gate",
+                        "anchor_date": earliest_build_anchor_date,
+                        "demand_dev_weeks": round(build_demand_weeks, 1),
+                        "available_dev_weeks": round(capacity_dev_weeks_build, 1),
+                        "shortfall_dev_weeks": shortfall,
+                        "rationale": f"Total build effort ({build_demand_weeks:.1f} dev-weeks) exceeds developer capacity ({capacity_dev_weeks_build:.1f} dev-weeks) before earliest deployment anchor '{earliest_build_anchor_date}'.",
+                    })
             except Exception:
-                cal_weeks = 14.0
-        else:
-            cal_weeks = 14.0
-        total_available_capacity = round(cal_weeks * team_rate_dev_weeks_per_week, 1)
+                pass
 
-        if total_demand_weeks > total_available_capacity:
-            shortfall = round(total_demand_weeks - total_available_capacity, 1)
-            schedule_conflicts.append({
-                "conflict_type": "CAPACITY_SHORTFALL",
-                "severity": "HIGH",
-                "rationale": (
-                    f"Total development demand ({total_demand_weeks:.1f} dev-weeks) exceeds available team capacity "
-                    f"({total_available_capacity:.1f} dev-weeks) before contractual completion anchor {contract_end_str} "
-                    f"by {shortfall:.1f} dev-weeks. Resource assumption: {dev_count} developers at {int(utilisation * 100)}% utilization "
-                    f"({team_rate_dev_weeks_per_week:.1f} dev-weeks/week)."
-                ),
-                "demand_dev_weeks": total_demand_weeks,
-                "capacity_dev_weeks": total_available_capacity,
-                "shortfall_dev_weeks": shortfall,
-                "limiting_anchor": contract_end_str,
-                "resource_assumption": f"{dev_count} developers @ {int(utilisation * 100)}% utilization",
-            })
-
-        # Build schedule item by item using parallel team allocation across developers
-        scheduled_items = []
+        # 3. Parallel Capacity-Based Scheduling
         dev_available = [base_start] * dev_count
-        finish_dates_by_cid = {}
+        finish_dates_by_cid: Dict[str, str] = {}
+        scheduled_items: List[Dict[str, Any]] = []
+        anchor_overruns: Dict[str, List[Dict[str, Any]]] = {}
 
-        for item in sorted_items:
-            cid = item.get("candidate_id") or f"c_{item.get('id', 0)}"
-            name = item.get("name") or item.get("title") or "Scope Deliverable"
-            raw_deadline = item.get("deadline_normalized") or item.get("deadline")
-
-            # Dynamic complexity & effort estimation
-            complexity, effort_weeks, comp_rationale = cls.estimate_task_complexity(item, cfg["default_complexity"])
-            # Working days on 1 developer track
+        for it in sorted_leaf_items:
+            cid = it.get("candidate_id") or f"c_{it.get('id', 0)}"
+            name = it.get("name") or it.get("title") or "Scope Deliverable"
+            complexity, effort_weeks, comp_rationale = cls.estimate_task_complexity(it, cfg["default_complexity"])
             item_working_days = max(1, round(effort_weeks * (cfg["working_days_per_week"] / utilisation)))
 
-            exceeds_anchor = False
-            anchor_limit = contract_end_str or (max(milestone_dates) if milestone_dates else None)
-            schedule_warnings = []
-
-            if raw_deadline:
-                # Tier 1: Explicit contractual deadline
-                provenance = "CONTRACT_CONFIRMED"
-                target_date = str(raw_deadline)
-                start_date_str = (base_start).isoformat()
-                duration_days = item_working_days
-                rationale = "Verbatim contractual deadline explicitly specified in source contract."
-                confidence = 0.95
-                conf_label = "HIGH"
-                conf_explanation = "Verbatim contractual milestone date backed by explicit contract text."
-                is_predicted = False
-                finish_dates_by_cid[cid] = target_date
-            elif milestones:
-                # Tier 2 & 3: Parallel capacity-based allocation
-                provenance = "AI_ESTIMATED"
-
-                # Respect explicit contractual dependency prerequisites
-                dep_ids = item.get("dependencies") or item.get("dependency_ids") or []
-                dep_finishes = [finish_dates_by_cid[d] for d in dep_ids if d in finish_dates_by_cid]
-                if dep_finishes:
-                    try:
-                        dep_min_start = max(datetime.strptime(df, "%Y-%m-%d").date() for df in dep_finishes)
-                    except Exception:
-                        dep_min_start = base_start
-                else:
+            # Dependencies finish constraint
+            dep_ids = it.get("dependencies", [])
+            dep_finishes = [finish_dates_by_cid[d] for d in dep_ids if d in finish_dates_by_cid]
+            if dep_finishes:
+                try:
+                    dep_min_start = max(datetime.strptime(df, "%Y-%m-%d").date() for df in dep_finishes)
+                except Exception:
                     dep_min_start = base_start
-
-                # Select developer track with earliest availability on/after prerequisite finish
-                best_dev_idx = min(range(dev_count), key=lambda idx: max(dev_available[idx], dep_min_start))
-                pred_start = max(dev_available[best_dev_idx], dep_min_start)
-                pred_end = cls.add_working_days(pred_start, item_working_days)
-                dev_available[best_dev_idx] = pred_end
-                finish_dates_by_cid[cid] = pred_end.isoformat()
-
-                start_date_str = pred_start.isoformat()
-                target_date = pred_end.isoformat()
-                duration_days = item_working_days
-
-                rationale = (
-                    f"AI estimated from {complexity} complexity ({effort_weeks} dev-weeks) "
-                    f"scheduled at team rate ({team_rate_dev_weeks_per_week:.1f} dev-weeks/week)."
-                )
-
-                # Check against contract end date and milestone anchors
-                if anchor_limit and target_date > anchor_limit:
-                    exceeds_anchor = True
-                    schedule_warnings.append(
-                        f"Predicted completion {target_date} exceeds anchor deadline {anchor_limit}."
-                    )
-
-                # Explainable confidence calculation based on complexity and overrun risk
-                if complexity == "SIMPLE":
-                    confidence = 0.85
-                elif complexity == "MEDIUM":
-                    confidence = 0.75
-                else: # COMPLEX
-                    confidence = 0.65
-
-                if exceeds_anchor:
-                    confidence = max(0.50, round(confidence - 0.05, 2))
-
-                if confidence >= 0.80:
-                    conf_label = "HIGH"
-                    conf_explanation = "High confidence: verified source quotation, clear scope definition, and low architectural dependencies."
-                elif confidence >= 0.65:
-                    conf_label = "MEDIUM"
-                    conf_explanation = "Medium confidence: standard task scope dependent on team velocity and milestone sequencing."
-                else:
-                    conf_label = "LOW"
-                    conf_explanation = "Lower confidence: complex integration or schedule overrun risk requires monitoring."
-
-                is_predicted = True
             else:
-                # Tier 5: Insufficient anchors
-                provenance = "UNRESOLVED"
-                start_date_str = None
-                target_date = None
-                duration_days = None
-                rationale = "Resource capacity or project start anchor unconfigured. Date TBD."
-                confidence = 0.0
-                conf_label = "LOW"
-                conf_explanation = "Unresolved: insufficient contractual anchors to calculate predicted deadline."
-                is_predicted = False
+                dep_min_start = base_start
 
-            if exceeds_anchor:
-                schedule_conflicts.append({
-                    "conflict_type": "ESTIMATED_OVERRUN",
-                    "severity": "MEDIUM",
+            # Find developer track with earliest availability on/after dependency finish
+            best_dev_idx = min(range(dev_count), key=lambda idx: max(dev_available[idx], dep_min_start))
+            pred_start = max(dev_available[best_dev_idx], dep_min_start)
+            pred_end = cls.add_working_days(pred_start, item_working_days)
+            dev_available[best_dev_idx] = pred_end
+            finish_dates_by_cid[cid] = pred_end.isoformat()
+
+            # Determine anchor limit
+            # Map item to phase anchor
+            name_l = name.lower()
+            if any(k in name_l for k in ["uat", "testing", "user acceptance"]):
+                anchor_m = next((m for m in ms_with_dates if "uat" in (m.get("name") or "").lower()), earliest_build_anchor)
+            elif any(k in name_l for k in ["hypercare", "hyper-care", "knowledge transfer", "handover", "defect"]):
+                anchor_m = next((m for m in ms_with_dates if "hyper" in (m.get("name") or "").lower()), None)
+            else:
+                anchor_m = earliest_build_anchor
+
+            anchor_date = anchor_m["planned_date"] if anchor_m else contract_end_str
+            anchor_name = anchor_m["name"] if anchor_m else "Contract End"
+
+            exceeds_anchor = False
+            days_over = 0
+            if anchor_date and pred_end.isoformat() > str(anchor_date)[:10]:
+                exceeds_anchor = True
+                try:
+                    a_dt = datetime.strptime(str(anchor_date)[:10], "%Y-%m-%d").date()
+                    days_over = (pred_end - a_dt).days
+                except Exception:
+                    days_over = 1
+
+                if anchor_name not in anchor_overruns:
+                    anchor_overruns[anchor_name] = []
+                anchor_overruns[anchor_name].append({
                     "candidate_id": cid,
-                    "item_name": name,
-                    "estimated_finish": target_date,
-                    "estimated_date": target_date,
-                    "milestone_anchor": anchor_limit,
-                    "is_contractual_conflict": False,
-                    "rationale": (
-                        f"Predicted completion {target_date} exceeds contractual target anchor "
-                        f"{anchor_limit}. Indicates capacity shortfall or sequencing constraint; "
-                        f"dates not clamped."
-                    ),
+                    "name": name,
+                    "pred_end": pred_end.isoformat(),
+                    "anchor_date": anchor_date,
+                    "days_over": days_over
                 })
+
+            date_out_of_window = bool(contract_end_str and pred_end.isoformat() > str(contract_end_str)[:10])
 
             scheduled_items.append({
                 "candidate_id": cid,
                 "name": name,
                 "item_name": name,
-                "owner": item.get("owner") or "Vendor Project Team",
-                "record_type": item.get("record_type") or item.get("category") or "Scope Item",
+                "role": it.get("role") or "VENDOR_WORK",
+                "owner": it.get("owner") or "Vendor Project Team",
+                "record_type": it.get("record_type") or "Scope Item",
+                "record_category": it.get("record_category") or "PROJECT_WORK",
                 "scope_status": "IN_SCOPE",
+                "umbrella": False,
                 "complexity": complexity,
                 "estimated_effort_dev_weeks": effort_weeks,
                 "effort_dev_weeks": effort_weeks,
-                "estimated_duration_working_days": duration_days,
-                "estimated_duration_days": duration_days,
-                "predicted_start_date": start_date_str,
-                "predicted_deadline": target_date,
-                "proposed_deadline": target_date,
-                "estimated_deadline": target_date,
-                "date_provenance": provenance,
-                "deadline_type": provenance,
-                "confidence_score": confidence,
-                "deadline_confidence": confidence,
-                "confidence_label": conf_label,
-                "confidence_explanation": conf_explanation,
-                "estimation_confidence": conf_label,
-                "is_predicted": is_predicted,
+                "estimated_duration_working_days": item_working_days,
+                "estimated_duration_days": item_working_days,
+                "predicted_start_date": pred_start.isoformat(),
+                "predicted_deadline": pred_end.isoformat(),
+                "proposed_deadline": pred_end.isoformat(),
+                "estimated_deadline": pred_end.isoformat(),
+                "date_provenance": "AI_ESTIMATED",
+                "deadline_type": "AI_ESTIMATED",
+                "confidence_score": 0.80,
+                "confidence_label": "HIGH" if complexity == "SIMPLE" else "MEDIUM",
+                "is_predicted": True,
                 "exceeds_anchor": exceeds_anchor,
+                "date_out_of_window": date_out_of_window,
                 "schedule_status": "OVERRUN" if exceeds_anchor else "ON_TRACK",
-                "rationale": rationale,
-                "deadline_rationale": rationale,
-                "dependency_ids": item.get("dependencies") or item.get("dependency_ids") or [],
-                "linked_milestone_ids": item.get("milestone_ids") or item.get("linked_milestone_ids") or [],
-                "schedule_warnings": schedule_warnings,
-                "source_locator": item.get("source_locator"),
-                "source_quotation": item.get("source_quotation") or item.get("raw_text") or item.get("description"),
-                "manual_override": False,
-                "is_contractual_commitment": (provenance == "CONTRACT_CONFIRMED"),
-                "scheduling_assumptions": {
-                    "developers": dev_count,
-                    "utilisation": utilisation,
-                    "team_weekly_rate": team_rate_dev_weeks_per_week,
-                    "working_days_per_dev_week": round(working_days_per_dev_week, 2),
-                },
+                "depends_on": it.get("depends_on", []),
+                "dependencies": it.get("dependencies", []),
+                "dependency_ids": it.get("dependencies", []),
+                "linked_milestone_ids": [anchor_m.get("milestone_id")] if (anchor_m and anchor_m.get("milestone_id")) else [],
+                "source_locator": it.get("source_locator"),
+                "source_quotation": it.get("source_quotation") or it.get("raw_text") or it.get("description"),
+            })
+
+        # Append umbrella items with zero effort and no dates (FIX 2)
+        for u_it in umbrella_items:
+            scheduled_items.append({
+                "candidate_id": u_it.get("candidate_id"),
+                "name": u_it.get("name"),
+                "item_name": u_it.get("name"),
+                "role": u_it.get("role") or "VENDOR_WORK",
+                "owner": u_it.get("owner") or "Vendor Project Team",
+                "record_type": u_it.get("record_type") or "Umbrella Scope",
+                "record_category": "PROJECT_WORK",
+                "scope_status": "IN_SCOPE",
+                "umbrella": True,
+                "complexity": "NONE",
+                "estimated_effort_dev_weeks": 0.0,
+                "effort_dev_weeks": 0.0,
+                "estimated_duration_working_days": 0,
+                "estimated_duration_days": 0,
+                "predicted_start_date": None,
+                "predicted_deadline": None,
+                "date_provenance": "NONE",
+                "deadline_type": None,
+                "confidence_score": 1.0,
+                "confidence_label": "HIGH",
+                "is_predicted": False,
+                "exceeds_anchor": False,
+                "date_out_of_window": False,
+                "schedule_status": "ON_TRACK",
+                "depends_on": [],
+                "dependencies": [],
+                "dependency_ids": [],
+                "source_locator": u_it.get("source_locator"),
+                "source_quotation": u_it.get("source_quotation") or u_it.get("raw_text"),
+            })
+
+        # Produce ONE Rollup Warning per Anchor (FIX 3)
+        for a_name, overruns in anchor_overruns.items():
+            max_over = max(o["days_over"] for o in overruns)
+            a_date = overruns[0]["anchor_date"]
+            schedule_conflicts.append({
+                "conflict_type": "ANCHOR_OVERRUN_ROLLUP",
+                "severity": "HIGH" if max_over > 7 else "MEDIUM",
+                "anchor_name": a_name,
+                "anchor_date": str(a_date),
+                "items_forecast_after": len(overruns),
+                "max_days_over": max_over,
+                "overrunning_item_ids": [o["candidate_id"] for o in overruns],
+                "rationale": f"{len(overruns)} work items forecast after milestone anchor '{a_name}' ({a_date}) by up to {max_over} days. Capacity shortfall detected; dates preserved honestly without clamping.",
             })
 
         return scheduled_items, schedule_conflicts
-

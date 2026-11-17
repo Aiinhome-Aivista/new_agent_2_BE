@@ -1,3 +1,15 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import os
 import sys
 import time
@@ -29,7 +41,10 @@ class Step4Logger:
         else:
             self.log_dir = log_dir
 
-        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         self.run_log_path = os.path.join(self.log_dir, f"step4_inspection_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step4_inspection_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -38,10 +53,30 @@ class Step4Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
+            except Exception:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    safe_text = text.encode(enc, errors="replace").decode(enc)
+                    sys.stdout.write(safe_text + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
+            try:
+                with self._lock:
+                    if not os.path.exists(self.log_dir):
+                        os.makedirs(self.log_dir, exist_ok=True)
+                    if hasattr(self, "active_log_path") and self.active_log_path:
+                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
+                            f_act.write(text + "\n")
+                    if hasattr(self, "run_log_path") and self.run_log_path:
+                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
+                            f_run.write(text + "\n")
             except Exception:
                 pass
 
@@ -83,6 +118,21 @@ class Step4Logger:
         self.raw_log(f"    [{status}] {check_name}: {details}")
 
 
+    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
+        ts = self._format_timestamp()
+        sep = "!" * 80
+        err_block = (
+            f"\n{sep}\n"
+            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
+            f"Error Message: {error_msg}\n"
+        )
+        if traceback_str:
+            err_block += f"Traceback:\n{traceback_str}\n"
+        err_block += f"{sep}\n"
+        self.raw_log(err_block)
+        pass
+
+
 class Step4Inspector:
     """
     Executes Step 4 Candidate Scope Classification & Structuring under BASELINE_INSPECTION_MODE.
@@ -108,58 +158,245 @@ class Step4Inspector:
         scope_type = c.get("scope_type", "UNCERTAIN")
         comb_text = f"{name} {desc}".lower()
 
-        # 1. Record Type Classification (Taxonomy)
-        if "travel restriction" in comb_text or "physical presence" in comb_text:
-            record_type = "Dependency"
-            scope_type = "UNCERTAIN"
-        elif "delay" in comb_text and ("penalt" in comb_text or "breach of contract" in comb_text or "damages" in comb_text or "exemption" in comb_text):
-            record_type = "Dependency"
-            scope_type = "UNCERTAIN"
-        elif "engagement period" in name.lower() or "contract validity" in name.lower():
-            record_type = "General Obligation"
-            scope_type = "IN_SCOPE"
-        elif section == "Deliverables" or any(w in comb_text for w in ["deliverable", "deliverables", "formal sign-off document"]):
-            record_type = "Deliverable"
-        elif c.get("candidate_type") == "Milestone" or section == "Milestones":
-            record_type = "Milestone"
-        elif section in {"Client Responsibilities", "Customer Responsibilities"} or c.get("actor_role") == "Client" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Client":
-            record_type = "Client Responsibility"
-            scope_type = "IN_SCOPE"
-        elif section == "Responsibilities" or c.get("actor_role") == "Vendor" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Vendor":
-            record_type = "Vendor Responsibility"
-        elif section == "Assumptions":
-            record_type = "Assumption"
-            scope_type = "IN_SCOPE"
-        elif section == "Dependencies":
-            record_type = "Dependency"
-            scope_type = "IN_SCOPE"
-        elif section in {"Out of Scope", "Exclusions"} or (scope_type == "OUT_OF_SCOPE" and section not in {"Client Responsibilities", "Customer Responsibilities", "Assumptions", "Dependencies"}):
-            record_type = "Exclusion"
+        # 1. Classification Rules (in strict order of specificity)
+        exclusion_patterns = [
+            "out of scope", "not included", "will be treated as a change request",
+            "will be treated as change request", "not responsible for", "not be responsible",
+            "will not be responsible", "excluded", "is excluded", "are excluded",
+            "exclusion of", "not in scope", "exclusion"
+        ]
+        is_explicit_exclusion = any(p in comb_text for p in exclusion_patterns) or section in {"Out of Scope", "Exclusions"}
+        is_legal_or_loc_context = any(k in name.lower() for k in ["covered legal entity", "onsite location", "offshore location", "engagement period", "contract validity", "governing law"])
+        is_vendor_feature = any(k in name.lower() for k in ["user view", "application success text"])
+
+        # Detect role items from responsibility matrices or staffing definitions (FIX 1)
+        is_role_cand = False
+        role_title = None
+        duty_text = None
+        if " - " in name:
+            part0 = name.split(" - ")[0].strip()
+            if c.get("candidate_type") == "Role" or any(r_word in part0.lower() for r_word in ["sponsor", "partner", "director", "manager", "lead", "developer", "user", "architect", "engineer", "specialist"]):
+                is_role_cand = True
+                role_title = part0
+                duty_text = name.split(" - ", 1)[1].strip()
+
+        # Umbrella detection: items that summarize a module or child tasks (FIX 2)
+        is_umbrella = (
+            any(k in name.lower() for k in ["overview", "module overview", "scope overview", "solution components", "summary of services", "deliverables summary"])
+            or c.get("is_umbrella", False)
+            or (c.get("is_parent", False) and not c.get("is_leaf", True))
+        )
+
+        # Rule 1: Explicit exclusion language -> OUT_OF_SCOPE
+        if is_explicit_exclusion:
+            role = "EXCLUSION"
             scope_type = "OUT_OF_SCOPE"
-        elif section == "Governance":
+            record_type = "Exclusion"
+            record_category = "OUT_OF_SCOPE"
+            rule_fired = "RULE_1_EXCLUSION: Explicit contractual exclusion language"
+        # Rule 5: Genuine contractual legal ambiguity / contingency clauses -> UNCERTAIN
+        elif "travel restriction" in comb_text or ("delay" in comb_text and any(k in comb_text for k in ["penalt", "breach of contract", "damages", "exemption"])):
+            role = "UNCERTAIN"
+            scope_type = "UNCERTAIN"
+            record_type = "Dependency"
+            record_category = "PENDING_REVIEW"
+            rule_fired = "RULE_5_AMBIGUOUS: Legal contingency clause"
+        # Rule 2 / Milestones: Milestone section or pure milestone type
+        elif c.get("candidate_type") == "Milestone" or c.get("is_pure_milestone") or section == "Milestones":
+            role = "VENDOR_WORK"
+            scope_type = "IN_SCOPE"
+            record_type = "Milestone"
+            record_category = "MILESTONE"
+            rule_fired = "RULE_2_OWNERSHIP: Project milestone"
+        # Rule 2 / Role descriptions from Responsibility Matrix (FIX 1)
+        elif is_role_cand:
+            role_party = PartyResolver.resolve_party_role(role_title)
+            if role_party == "Joint / Unspecified":
+                role_party = PartyResolver.resolve_party_role(comb_text)
+
+            if role_party == "Vendor":
+                if PartyResolver.is_vendor_activity_duty(duty_text) or PartyResolver.is_vendor_activity_duty(comb_text):
+                    role = "VENDOR_WORK"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Activity"
+                    record_category = "PROJECT_WORK"
+                    rule_fired = "RULE_2_ROLE: Vendor role delivery duty promoted to work item"
+                elif any(k in comb_text for k in ["status update", "steering committee", "reporting", "weekly status"]):
+                    role = "VENDOR_WORK"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Governance Obligation"
+                    record_category = "COMMITMENT"
+                    rule_fired = "RULE_2_ROLE: Vendor role reporting/meeting obligation"
+                else:
+                    role = "VENDOR_WORK"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Role Description"
+                    record_category = "ROLES_REGISTER"
+                    rule_fired = "RULE_2_ROLE: Vendor role description in roles register"
+            elif role_party == "Client":
+                if any(m in comb_text for m in ["prerequisite", "dependency", "access", "sign-off", "signoff", "guideline", "credentials", "infrastructure", "uat", "approval"]):
+                    role = "CLIENT_DUTY"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Dependency"
+                    record_category = "CUSTOMER_DEPENDENCY"
+                    rule_fired = "RULE_2_ROLE: Client gating duty promoted to customer dependency"
+                elif any(k in comb_text for k in ["status update", "steering committee", "reporting", "feedback"]):
+                    role = "CLIENT_DUTY"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Client Responsibility"
+                    record_category = "COMMITMENT"
+                    rule_fired = "RULE_2_ROLE: Client role cadence obligation"
+                else:
+                    role = "CLIENT_DUTY"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Role Description"
+                    record_category = "ROLES_REGISTER"
+                    rule_fired = "RULE_2_ROLE: Client role description in roles register"
+            else:
+                if PartyResolver.is_vendor_activity_duty(duty_text) or PartyResolver.is_vendor_activity_duty(comb_text):
+                    role = "VENDOR_WORK"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Activity"
+                    record_category = "PROJECT_WORK"
+                    rule_fired = "RULE_2_ROLE: Joint delivery duty promoted to work item"
+                else:
+                    role = "GOVERNANCE"
+                    scope_type = "IN_SCOPE"
+                    record_type = "Role Description"
+                    record_category = "ROLES_REGISTER"
+                    rule_fired = "RULE_2_ROLE: Joint role description in roles register"
+        # Rule 2 / Client ownership / duty / dependencies (checked before Deliverables keyword matching)
+        elif section == "Dependencies" or any(k in comb_text for k in ["prerequisite", "technical dependency", "environment access", "server access", "cloud credentials"]):
+            role = "CLIENT_DUTY"
+            scope_type = "IN_SCOPE"
+            record_type = "Dependency"
+            record_category = "CUSTOMER_DEPENDENCY"
+            rule_fired = "RULE_2_OWNERSHIP: Client technical dependency"
+        elif section in {"Client Responsibilities", "Customer Responsibilities"} or (
+            (c.get("actor_role") == "Client" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Client") and not is_vendor_feature
+        ):
+            resolved_subj = PartyResolver.resolve_party_role(comb_text)
+            if resolved_subj == "Vendor":
+                role = "VENDOR_WORK"
+                scope_type = "IN_SCOPE"
+                record_type = "Scope Item"
+                record_category = "PROJECT_WORK"
+                rule_fired = "RULE_2_OWNERSHIP: Vendor subject within client section"
+            else:
+                role = "CLIENT_DUTY"
+                scope_type = "IN_SCOPE"
+                if any(m in comb_text for m in ["access", "credentials", "provision", "prerequisite", "sign-off", "guideline", "authoriz"]):
+                    record_type = "Dependency"
+                    record_category = "CUSTOMER_DEPENDENCY"
+                else:
+                    record_type = "Client Responsibility"
+                    record_category = "CLIENT_RESPONSIBILITY"
+                rule_fired = "RULE_2_OWNERSHIP: Client obligation / duty"
+        # Rule 3: Governance patterns & oversight
+        elif section == "Governance" or any(k in comb_text for k in [
+            "steering", "committee", "powers to decide", "fee negotiation", "fee adjustment",
+            "written notice", "billing", "rate card", "status reporting", "weekly status", "monthly review", "escalation"
+        ]):
+            role = "GOVERNANCE"
+            scope_type = "IN_SCOPE"
             record_type = "Governance Obligation"
+            rule_fired = "RULE_3_GOVERNANCE: Governance and review obligation"
+        # Rule 4: Assumptions
+        elif section == "Assumptions":
+            role = "ASSUMPTION"
+            scope_type = "IN_SCOPE"
+            record_type = "Assumption"
+            rule_fired = "RULE_4_CONTEXT: Contractual delivery assumption"
+        # Rule 4: Acceptance Criteria
         elif section == "Acceptance":
+            role = "CONTEXT"
+            scope_type = "IN_SCOPE"
             record_type = "Acceptance Criteria"
-        elif section in {"Functional Scope", "Scope of Work"}:
+            rule_fired = "RULE_4_CONTEXT: Acceptance criteria definition"
+        # Rule 4 / Misfiled: Descriptive legal entity/location metadata
+        elif is_legal_or_loc_context:
+            role = "CONTEXT"
+            scope_type = "IN_SCOPE"
+            record_type = "Contextual Contract Record"
+            rule_fired = "RULE_4_CONTEXT: Descriptive legal entity/location metadata"
+        # Rule 2 / Misfiled: Vendor UI application feature in functional scope
+        elif is_vendor_feature:
+            role = "VENDOR_WORK"
+            scope_type = "IN_SCOPE"
             record_type = "Scope Item"
+            rule_fired = "RULE_2_OWNERSHIP: Vendor application UI feature in scope"
+        # Rule 2: Deliverables section
+        elif section == "Deliverables":
+            # Staffing / governance roles under Deliverables heading
+            if any(k in comb_text for k in ["project director", "project manager", "steering committee", "escalation point", "resource allocation"]):
+                role = "GOVERNANCE"
+                scope_type = "IN_SCOPE"
+                record_type = "Governance Obligation"
+                rule_fired = "RULE_3_GOVERNANCE: Staffing and governance role deliverable"
+            elif any(k in comb_text for k in ["approach and deliverables", "feedback timeline"]):
+                role = "CONTEXT"
+                scope_type = "IN_SCOPE"
+                record_type = "Contextual Contract Record"
+                rule_fired = "RULE_4_CONTEXT: Methodology overview or timeline condition"
+            else:
+                role = "VENDOR_WORK"
+                scope_type = "IN_SCOPE"
+                record_type = "Deliverable"
+                rule_fired = "RULE_2_OWNERSHIP: Vendor deliverable"
+        # Rule 2: Functional Scope / Scope of Work / Responsibilities
+        elif section in {"Functional Scope", "Scope of Work", "Responsibilities"} or (
+            c.get("actor_role") == "Vendor" or PartyResolver.resolve_party_role(c.get("actor", "")) == "Vendor"
+        ):
+            if any(k in comb_text for k in ["offshore location", "onsite location", "google india responsibility"]):
+                role = "CONTEXT"
+                scope_type = "IN_SCOPE"
+                record_type = "Contextual Contract Record"
+                rule_fired = "RULE_4_CONTEXT: Location or entity metadata within scope section"
+            else:
+                role = "VENDOR_WORK"
+                scope_type = "IN_SCOPE"
+                record_type = "Scope Item" if section != "Responsibilities" else "Vendor Responsibility"
+                rule_fired = "RULE_2_OWNERSHIP: Vendor delivery scope"
         elif section == "Technical Scope":
-            # Actionable technical work items belong in the unified project work register
             technical_work_signals = [
                 "implement", "develop", "configur", "setup", "integrat", "deploy", "build",
                 "api", "database", "pipeline", "schema", "test", "security", "infra", "service"
             ]
-            if any(sig in comb_text for sig in technical_work_signals):
-                record_type = "Scope Item"
+            if any(k in name.lower() for k in ["solution components", "web technology solution", "database solution"]):
+                role = "CONTEXT"
                 scope_type = "IN_SCOPE"
-            else:
                 record_type = "Contextual Contract Record"
+                rule_fired = "RULE_4_CONTEXT: Technical architecture overview"
+            elif any(sig in comb_text for sig in technical_work_signals):
+                role = "VENDOR_WORK"
+                scope_type = "IN_SCOPE"
+                record_type = "Scope Item"
+                rule_fired = "RULE_2_OWNERSHIP: Technical implementation item"
+            else:
+                role = "CONTEXT"
+                scope_type = "IN_SCOPE"
+                record_type = "Contextual Contract Record"
+                rule_fired = "RULE_4_CONTEXT: Technical context clause"
         elif section in {"Methodology", "Resources"}:
-            record_type = "Contextual Contract Record"
+            if any(k in name.lower() for k in ["timeline", "phase"]):
+                role = "VENDOR_WORK"
+                scope_type = "IN_SCOPE"
+                record_type = "Milestone"
+                rule_fired = "RULE_2_OWNERSHIP: Project timeline phase milestone"
+            else:
+                role = "CONTEXT"
+                scope_type = "IN_SCOPE"
+                record_type = "Contextual Contract Record"
+                rule_fired = "RULE_4_CONTEXT: Methodology/resource clause"
         else:
+            role = "CONTEXT"
+            scope_type = "IN_SCOPE"
             record_type = "General Obligation"
+            rule_fired = "RULE_4_CONTEXT: General contractual clause"
 
         # 2. Scope Status
-        scope_status = scope_type  # "IN_SCOPE", "OUT_OF_SCOPE", "UNCERTAIN"
+        old_scope_type = c.get("scope_type", "IN_SCOPE")
+        scope_status = scope_type  # Strictly "IN_SCOPE", "OUT_OF_SCOPE", or "UNCERTAIN"
 
         # 3. Verification Status (derived honestly from atomic claim-level evidence)
         claims_ev = c.get("claims_evidence", [])
@@ -168,7 +405,6 @@ class Step4Inspector:
             has_unresolved = any(clm.get("status") in {"UNRESOLVED", "PARTIALLY_VERIFIED"} for clm in claims_ev)
             all_verified = all(clm.get("status") == "VERIFIED" for clm in claims_ev)
             if has_unsupported:
-                # Cannot be VERIFIED when atomic claims remain unsupported
                 verification_status = "PARTIALLY_VERIFIED" if any(clm.get("status") == "VERIFIED" for clm in claims_ev) else "UNRESOLVED"
             elif has_unresolved:
                 verification_status = "PARTIALLY_VERIFIED"
@@ -180,20 +416,23 @@ class Step4Inspector:
             verification_status = c.get("provenance_status", "VERIFIED")
 
         # 4. Work Item Eligibility (Schedulable in planning)
-        # Actionable vendor delivery work (Scope Items, Deliverables, or delivery Vendor Responsibilities)
-        # Pure Milestones, Governance, Client Responsibilities, Assumptions, Exclusions, Dependencies are NOT ordinary work items.
-        is_gov_or_committee = any(k in comb_text for k in [
-            "steering", "committee", "powers to decide", "fee negotiation", "fee adjustment",
-            "decide on project", "written notice", "billing", "rate card"
-        ])
-        is_vendor_delivery = (
-            record_type in {"Scope Item", "Deliverable"} or
-            (record_type == "Vendor Responsibility" and not is_gov_or_committee)
+        # ONLY actionable, effort-consuming vendor or joint delivery activities qualify.
+        # Pure Milestones, Governance, Client Responsibilities, Assumptions, Exclusions,
+        # Dependencies, Location/Entity Metadata, Architecture Overviews are NOT work items.
+        is_actionable_delivery = (
+            role == "VENDOR_WORK"
+            and record_type in {"Scope Item", "Deliverable", "Vendor Responsibility", "Activity"}
+            and record_type != "Milestone"
+            and not c.get("is_pure_milestone", False)
+            and not is_legal_or_loc_context
+            and not any(k in name.lower() for k in [
+                "offshore location", "onsite location", "google india responsibility",
+                "solution components", "project director", "project manager",
+                "timely feedback", "scope revisions", "sign-off", "overall progress"
+            ])
         )
-        if scope_status == "IN_SCOPE" and is_vendor_delivery and record_type != "Milestone":
-            work_item_eligible = True
-        else:
-            work_item_eligible = False
+        is_umbrella = bool(cand.get("is_umbrella") or cand.get("umbrella") or False)
+        work_item_eligible = bool(scope_status == "IN_SCOPE" and is_actionable_delivery and not is_umbrella)
 
         # 5. Review Required Flag
         review_required = False
@@ -227,8 +466,8 @@ class Step4Inspector:
         else:
             recurrence = "One-time"
 
-        # 7. Standardized Record Category & Ownership Mapping (Remediation 1)
-        if work_item_eligible:
+        # 7. Standardized Record Category & Ownership Mapping
+        if role == "VENDOR_WORK" and work_item_eligible:
             record_category = "PROJECT_WORK"
             resp_owner = "VENDOR"
             deliv_owner = "VENDOR"
@@ -236,37 +475,31 @@ class Step4Inspector:
             record_category = "MILESTONE"
             resp_owner = "JOINT"
             deliv_owner = "VENDOR"
-        elif record_type == "Client Responsibility":
-            record_category = "CLIENT_RESPONSIBILITY"
+        elif role == "CLIENT_DUTY":
+            record_category = "CLIENT_RESPONSIBILITY" if record_type == "Client Responsibility" else "CUSTOMER_DEPENDENCY"
             resp_owner = "CLIENT"
-            deliv_owner = "CLIENT"
-            scope_status = "IN_SCOPE"
-            scope_type = "IN_SCOPE"
-        elif record_type == "Dependency":
-            record_category = "CLIENT_DEPENDENCY"
+            deliv_owner = "CLIENT" if record_type == "Client Responsibility" else "VENDOR"
+        elif role == "EXCLUSION" or scope_type == "OUT_OF_SCOPE":
+            record_category = "OUT_OF_SCOPE"
             resp_owner = "CLIENT"
-            deliv_owner = "VENDOR"
-            scope_status = "IN_SCOPE"
-            scope_type = "IN_SCOPE"
-        elif record_type == "Assumption":
+            deliv_owner = "OUT_OF_SCOPE"
+        elif role == "ASSUMPTION":
             record_category = "ASSUMPTION"
             resp_owner = "JOINT"
             deliv_owner = "JOINT"
-            scope_status = "IN_SCOPE"
-            scope_type = "IN_SCOPE"
+        elif record_type == "Role Description":
+            record_category = "ROLES_REGISTER"
+            resp_owner = "JOINT"
+            deliv_owner = "JOINT"
+        elif role == "GOVERNANCE":
+            record_category = "GOVERNANCE_OBLIGATION"
+            resp_owner = "VENDOR" if c.get("actor_role") == "Vendor" else "JOINT"
+            deliv_owner = "VENDOR" if c.get("actor_role") == "Vendor" else "JOINT"
         elif recurrence != "One-time" or any(w in comb_text for w in ["status report", "stakeholder update", "committee meeting"]):
             record_category = "COMMITMENT"
             resp_owner = "VENDOR"
             deliv_owner = "VENDOR"
-        elif record_type == "Governance Obligation" or is_gov_or_committee:
-            record_category = "GOVERNANCE_OBLIGATION"
-            resp_owner = "VENDOR" if c.get("actor_role") == "Vendor" else "JOINT"
-            deliv_owner = "VENDOR" if c.get("actor_role") == "Vendor" else "JOINT"
-        elif scope_status == "OUT_OF_SCOPE":
-            record_category = "OUT_OF_SCOPE"
-            resp_owner = "CLIENT"
-            deliv_owner = "OUT_OF_SCOPE"
-        elif scope_status == "UNCERTAIN":
+        elif role == "UNCERTAIN" or scope_type == "UNCERTAIN":
             record_category = "PENDING_REVIEW"
             resp_owner = "UNKNOWN"
             deliv_owner = "PENDING_REVIEW"
@@ -279,14 +512,18 @@ class Step4Inspector:
             resp_owner = "VENDOR"
             deliv_owner = "VENDOR"
 
+        c["role"] = role
+        c["scope_type"] = scope_type
+        c["deprecated_scope_type"] = old_scope_type
+        c["scope_status"] = scope_type
+        c["classification_rule"] = rule_fired
         c["record_type"] = record_type
         c["record_category"] = record_category
-        c["scope_type"] = scope_type
-        c["scope_status"] = scope_status
         c["responsibility_owner"] = resp_owner
         c["delivery_owner"] = deliv_owner
         c["verification_status"] = verification_status
         c["work_item_eligible"] = work_item_eligible
+        c["umbrella"] = is_umbrella
         c["review_required"] = review_required
         c["manual_review_reason"] = "; ".join(review_reasons) if review_reasons else None
         c["recurrence"] = recurrence
@@ -316,7 +553,10 @@ class Step4Inspector:
         if logs_dir is None:
             backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             logs_dir = os.path.join(backend_root, "logs")
-        # os.makedirs(logs_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(logs_dir, exist_ok=True)
+        except Exception:
+            pass
 
         logger = Step4Logger(project_id, document_id, timestamp_str, log_dir=logs_dir)
         t_start = time.time()
@@ -513,7 +753,10 @@ class Step4Inspector:
         # 8. Contextual records incorrectly scheduled as work
         invalid_work = [
             c for c in structured_records
-            if c.get("work_item_eligible") and c.get("record_type") in {"Assumption", "Dependency", "Exclusion", "Client Responsibility"}
+            if c.get("work_item_eligible") and (
+                c.get("record_type") in {"Assumption", "Dependency", "Exclusion", "Client Responsibility", "Governance Obligation", "Contextual Contract Record", "Milestone", "General Obligation", "Acceptance Criteria"}
+                or c.get("record_category") != "PROJECT_WORK"
+            )
         ]
         qc_work_status = "PASS" if not invalid_work else "FAIL"
         qc_work_msg = f"0 contextual records scheduled as work ({work_eligible_count} work items, {contextual_count} non-work/contextual records)"
@@ -665,7 +908,7 @@ class Step4Inspector:
             "structured_records": structured_records,
         }
 
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(json_run_path, "w", encoding="utf-8") as f:
                 json.dump(step4_artifact, f, indent=2, default=str)
             with open(json_active_path, "w", encoding="utf-8") as f:

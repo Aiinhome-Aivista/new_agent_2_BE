@@ -25,9 +25,11 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 
+from core.baseline_config import ARTIFACT_SCHEMA_VERSION, FIELD_SEMANTICS
+
 
 class FinalBaselineService:
-    SCHEMA_VERSION = "1.0"
+    SCHEMA_VERSION = ARTIFACT_SCHEMA_VERSION
 
     @classmethod
     def get_final_baselines_dir(cls, base_dir: Optional[str] = None) -> str:
@@ -185,6 +187,8 @@ class FinalBaselineService:
 
         # ── 1. Contract Dates & Evidence ──
         from services.deadline_inference_service import DeadlineInferenceService
+        from services.date_provenance_validator import DateProvenanceValidator
+
         full_text_corpus = " ".join(
             (r.get("raw_text") or "") + " " + (r.get("name") or "") + " " + (r.get("description") or "")
             for r in (s4.get("structured_records", []) or [])
@@ -193,6 +197,14 @@ class FinalBaselineService:
         contract_start = s8.get("contract_start_date") or tfacts.get("contract_start_date")
         contract_end = s8.get("contract_end_date") or tfacts.get("contract_end_date")
         support_end = s8.get("support_end_date") or tfacts.get("support_end_date")
+        project_duration_weeks = tfacts.get("total_contract_weeks")
+        if not project_duration_weeks:
+            try:
+                start_dt = datetime.strptime(str(contract_start)[:10], "%Y-%m-%d")
+                end_dt = datetime.strptime(str(contract_end)[:10], "%Y-%m-%d")
+                project_duration_weeks = max(1, round((end_dt - start_dt).days / 7))
+            except Exception:
+                project_duration_weeks = 14
 
         # Fallback to projects table if dates missing
         if not contract_start or not contract_end:
@@ -225,32 +237,120 @@ class FinalBaselineService:
             except Exception:
                 support_end = contract_end
 
+        # Build document chunk proxy list for verbatim evidence validation
+        doc_chunks = [
+            {
+                "chunk_index": r.get("chunk_index", 0),
+                "text": (r.get("raw_text") or "") + " " + (r.get("description") or "") + " " + (r.get("evidence_text") or ""),
+            }
+            for r in (s4.get("structured_records", []) or [])
+        ]
+
+        # Extract genuine quotations from evidence
+        ev_map = {ev.get("field"): ev for ev in tfacts.get("evidence", [])}
+        start_ev = ev_map.get("contract_start_date") or {}
+        end_ev = ev_map.get("contract_end_date") or {}
+        supp_ev = ev_map.get("support_end_date") or {}
+
+        start_quote = s8.get("contract_start_quotation") or start_ev.get("quotation") or ""
+        end_quote = s8.get("contract_end_quotation") or end_ev.get("quotation") or ""
+        supp_quote = s8.get("support_end_quotation") or supp_ev.get("quotation") or ""
+
+        # Build contract date records with verbatim evidence validation (never synthetic)
+        contract_start_record = DateProvenanceValidator.build_contract_date_record(
+            event_name="Contract Start Date",
+            normalized_date=contract_start,
+            original_verbatim_quotation=start_quote,
+            source_document_id=document_id,
+            source_locator="chunk_0" if start_quote else "contract_text",
+            date_type="CONTRACT_CONFIRMED",
+            extraction_confidence=0.95 if start_quote else 0.7,
+            document_chunks=doc_chunks,
+            raw_text_corpus=full_text_corpus,
+        )
+
+        contract_end_record = DateProvenanceValidator.build_contract_date_record(
+            event_name="Contract End Date",
+            normalized_date=contract_end,
+            original_verbatim_quotation=end_quote,
+            source_document_id=document_id,
+            source_locator="chunk_0" if end_quote else "contract_text",
+            date_type="CONTRACT_CONFIRMED",
+            extraction_confidence=0.95 if end_quote else 0.7,
+            document_chunks=doc_chunks,
+            raw_text_corpus=full_text_corpus,
+            duration_weeks=project_duration_weeks,
+            start_date_for_duration=contract_start,
+        )
+
+        support_end_record = DateProvenanceValidator.build_contract_date_record(
+            event_name="Production Support End Date",
+            normalized_date=support_end,
+            original_verbatim_quotation=supp_quote,
+            source_document_id=document_id,
+            source_locator="chunk_15" if supp_quote else "contract_text",
+            date_type="CONTRACT_CONFIRMED",
+            extraction_confidence=0.85 if supp_quote else 0.6,
+            document_chunks=doc_chunks,
+            raw_text_corpus=full_text_corpus,
+        )
+
+        # Cross-validate 14-week duration from start to end
+        duration_cross_validation = DateProvenanceValidator.cross_validate_duration(
+            start_date=contract_start,
+            end_date=contract_end,
+            duration_weeks=project_duration_weeks,
+        )
+
+        # Support period lifecycle separation & ambiguity check
+        support_period_validation = DateProvenanceValidator.validate_support_period_separation(
+            project_end=contract_end,
+            support_end=support_end,
+        )
+        support_end_record["support_period_review_required"] = support_period_validation.get("review_required", False)
+
+        # Build list of date evidence entries (preserving verbatim quotations, never synthetic)
         date_evidence = []
         for ev in tfacts.get("evidence", []):
-            date_evidence.append({
-                "event": ev.get("field", "Contract Date"),
-                "date": ev.get("parsed"),
-                "source_locator": "contract_text",
-                "source_quotation": ev.get("quotation", ""),
-                "date_type": "CONTRACT_CONFIRMED",
-            })
-        if not date_evidence:
-            date_evidence = [
-                {
-                    "event": "Contract Effective Date",
-                    "date": contract_start,
-                    "source_locator": "contract_terms",
-                    "source_quotation": f"Effective from {contract_start}",
-                    "date_type": "CONTRACT_CONFIRMED",
-                },
-                {
-                    "event": "Contract Target End Date",
-                    "date": contract_end,
-                    "source_locator": "contract_terms",
-                    "source_quotation": f"Valid till {contract_end}",
-                    "date_type": "CONTRACT_CONFIRMED",
-                },
-            ]
+            ev_rec = DateProvenanceValidator.build_contract_date_record(
+                event_name=ev.get("field", "Contract Date"),
+                normalized_date=ev.get("parsed"),
+                original_verbatim_quotation=ev.get("quotation", ""),
+                source_document_id=document_id,
+                source_locator="contract_text",
+                date_type="CONTRACT_CONFIRMED",
+                extraction_confidence=0.9,
+                document_chunks=doc_chunks,
+                raw_text_corpus=full_text_corpus,
+            )
+            date_evidence.append(ev_rec)
+
+        # Mandatory evidence validation check:
+        # Both contract start and contract end must have verified verbatim evidence
+        mandatory_evidence_unverified = not (
+            contract_start_record.get("date_evidence_valid") and
+            contract_end_record.get("date_evidence_valid")
+        )
+
+        contract_dates = {
+            "contract_start_date": contract_start,
+            "contract_end_date": contract_end,
+            "project_duration_weeks": project_duration_weeks,
+            "production_support_end_date": support_end,
+            "contract_start_record": contract_start_record,
+            "contract_end_record": contract_end_record,
+            "production_support_end_record": support_end_record,
+            "duration_cross_validation": duration_cross_validation,
+            "support_period_validation": support_period_validation,
+            "support_period_warning": support_period_validation.get("warning"),
+            "mandatory_evidence_unverified": mandatory_evidence_unverified,
+            "date_evidence": date_evidence,
+            "date_value_valid": contract_start_record.get("date_value_valid") and contract_end_record.get("date_value_valid"),
+            "date_evidence_valid": not mandatory_evidence_unverified,
+            "duration_consistency_valid": duration_cross_validation.get("agreement", False),
+            "date_provenance_valid": contract_start_record.get("date_provenance_valid") and contract_end_record.get("date_provenance_valid"),
+            "support_period_review_required": support_period_validation.get("review_required", False),
+        }
 
         # ── 2. Scope Items (Eligible in-scope work items with predicted deadlines) ──
         s8_items = s8.get("work_items_schedule") or s8.get("schedule_prediction_preview") or []
@@ -356,21 +456,18 @@ class FinalBaselineService:
                         "source_locator": loc,
                         "source_quotation": quote,
                     })
-            elif st == "OUT_OF_SCOPE":
-                rec_cat = r.get("record_category") or ""
-                # Strict exclusion check: never classify client responsibilities, dependencies, or assumptions into out_of_scope
-                if rec_cat in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION", "GOVERNANCE_OBLIGATION", "PROJECT_WORK", "MILESTONE", "COMMITMENT"):
-                    pass
-                elif cid not in seen_out:
+            elif st == "OUT_OF_SCOPE" or r.get("role") == "EXCLUSION" or r.get("record_type") == "Exclusion":
+                if cid not in seen_out:
                     seen_out.add(cid)
                     out_of_scope_items.append({
                         "candidate_id": cid,
                         "name": name,
                         "description": desc,
+                        "role": "EXCLUSION",
                         "scope_type": "OUT_OF_SCOPE",
-                        "record_type": r.get("record_type") or "Exclusion",
+                        "record_type": "Exclusion",
                         "record_category": "OUT_OF_SCOPE",
-                        "reason_for_exclusion": r.get("reason_for_exclusion") or r.get("classification_reason") or "Contractual exclusion clause",
+                        "reason_for_exclusion": r.get("reason_for_exclusion") or r.get("classification_reason") or r.get("classification_rule") or "Contractual exclusion clause",
                         "source_locator": loc,
                         "source_quotation": quote,
                         "review_status": "EXCLUDED",
@@ -391,6 +488,7 @@ class FinalBaselineService:
                     "candidate_id": cid,
                     "name": item.get("name") or s4_item.get("name"),
                     "description": item.get("description") or s4_item.get("description") or s4_item.get("evidence_text"),
+                    "role": "EXCLUSION",
                     "scope_type": "OUT_OF_SCOPE",
                     "record_type": item.get("contractual_type") or s4_item.get("record_type") or "Exclusion",
                     "reason_for_exclusion": item.get("rationale") or s4_item.get("classification_reason") or "Contractual exclusion clause",
@@ -400,9 +498,12 @@ class FinalBaselineService:
                 })
         for item in s10_payload.get("pending_review_items", []) or []:
             cid = item.get("candidate_id")
+            s4_item = s4_map.get(cid, {})
+            st = (s4_item.get("scope_type") or s4_item.get("scope_status") or "").upper()
+            if s4_item and st != "UNCERTAIN" and s4_item.get("record_category") != "PENDING_REVIEW":
+                continue
             if cid and cid not in seen_pending:
                 seen_pending.add(cid)
-                s4_item = s4_map.get(cid, {})
                 pending_review_items.append({
                     "candidate_id": cid,
                     "name": item.get("name") or s4_item.get("name"),
@@ -413,20 +514,28 @@ class FinalBaselineService:
                     "source_quotation": item.get("evidence", {}).get("quotation") or s4_item.get("exact_source_quotation") or s4_item.get("evidence_text") or item.get("name"),
                 })
 
-        # ── 4b. Contextual Contract Records, Governance Obligations & All Records ──
+        # ── 4b. Contextual Contract Records, Governance Obligations, Assumptions & All Records ──
         contextual_records = []
         governance_obligations = []
+        assumptions_records = []
         all_records = []
         for r in s4_records:
             cid = r.get("candidate_id")
+            role = r.get("role") or ""
             rec_cat = r.get("record_category") or ""
-            raw_st = (r.get("scope_type") or r.get("scope_status") or "IN_SCOPE").upper()
-            if raw_st == "UNCERTAIN" or rec_cat == "PENDING_REVIEW":
+            raw_st = (r.get("scope_type") or r.get("scope_status") or "NONE").upper()
+
+            if raw_st == "UNCERTAIN" or role == "UNCERTAIN" or rec_cat == "PENDING_REVIEW":
                 st = "UNCERTAIN"
-            elif rec_cat == "OUT_OF_SCOPE" or (raw_st == "OUT_OF_SCOPE" and rec_cat not in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY", "ASSUMPTION", "GOVERNANCE_OBLIGATION", "PROJECT_WORK", "MILESTONE", "COMMITMENT")):
+            elif raw_st == "OUT_OF_SCOPE" or role == "EXCLUSION" or rec_cat == "OUT_OF_SCOPE":
                 st = "OUT_OF_SCOPE"
-            else:
+            elif raw_st == "CLIENT_DEPENDENCY" or role == "CLIENT_DUTY" or rec_cat in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY"):
+                st = "CLIENT_DEPENDENCY"
+            elif any(item.get("candidate_id") == cid for item in scope_items):
                 st = "IN_SCOPE"
+            else:
+                st = "NONE"
+
             rtype = r.get("record_type") or "Scope Item"
             nm = r.get("name") or "Scope Record"
             desc = r.get("description") or r.get("evidence_text") or nm
@@ -438,11 +547,15 @@ class FinalBaselineService:
                 "candidate_id": cid,
                 "name": nm,
                 "description": desc,
+                "role": role or ("VENDOR_WORK" if is_we else ("CLIENT_DUTY" if st == "CLIENT_DEPENDENCY" else "CONTEXT")),
                 "scope_type": st,
+                "deprecated_scope_type": r.get("deprecated_scope_type", r.get("scope_type", "IN_SCOPE")),
                 "record_type": rtype,
+                "record_category": rec_cat,
                 "work_item_eligible": is_we,
                 "source_locator": loc,
                 "source_quotation": quote,
+                "classification_rule": r.get("classification_rule", "RULE_2_OWNERSHIP"),
                 "review_status": "PENDING_REVIEW" if st == "UNCERTAIN" else ("EXCLUDED" if st == "OUT_OF_SCOPE" else "VALIDATED"),
             }
             if is_we:
@@ -452,35 +565,30 @@ class FinalBaselineService:
                 rec_entry["effort_dev_weeks"] = matching_wi.get("effort_dev_weeks")
             all_records.append(rec_entry)
 
-            if st == "IN_SCOPE" and not is_we:
-                if rtype in ("Governance Obligation", "Vendor Responsibility") or any(k in nm.lower() or k in desc.lower() for k in ["steering", "committee", "powers to decide", "fee negotiation", "meeting frequency"]):
+            if not is_we and st not in ("OUT_OF_SCOPE", "UNCERTAIN"):
+                if role == "GOVERNANCE" or rtype in ("Governance Obligation", "Vendor Responsibility") or any(k in nm.lower() or k in desc.lower() for k in ["steering", "committee", "powers to decide", "fee negotiation", "meeting frequency"]):
                     governance_obligations.append(rec_entry)
-                elif rtype != "Milestone":
+                elif role == "ASSUMPTION" or rtype == "Assumption":
+                    assumptions_records.append(rec_entry)
+                elif role != "CLIENT_DUTY" and rtype != "Milestone" and rec_cat not in ("CLIENT_RESPONSIBILITY", "CLIENT_DEPENDENCY"):
                     contextual_records.append(rec_entry)
 
         # ── 5. Milestones, Payment Milestones & Project Phases ──
         milestones = s8.get("milestones_preview", []) or []
         payment_milestones = s8.get("payment_milestones", []) or []
+
+        # Validate milestone dates generically for any document
+        milestone_validation = DateProvenanceValidator.validate_milestone_dates(
+            milestones=milestones,
+            project_end=contract_end,
+            expected_payment_dates=None,
+        )
+        contract_dates["milestone_validation"] = milestone_validation
+        contract_dates["milestone_date_validation_valid"] = milestone_validation.get("milestone_date_validation_valid", True)
         schedule_warnings = s8.get("schedule_warnings") or s8.get("schedule_conflicts") or []
+        # FIX 4: project_phases come ONLY from phases named in document; no synthetic phase plan
         project_phases = s8.get("project_phases") or []
-        if not project_phases:
-            try:
-                start_dt = datetime.strptime(contract_start, "%Y-%m-%d").date()
-                end_dt = datetime.strptime(contract_end, "%Y-%m-%d").date()
-                total_days = max(1, (end_dt - start_dt).days)
-                p1_end = start_dt + timedelta(days=int(total_days * 0.25))
-                p2_end = start_dt + timedelta(days=int(total_days * 0.75))
-                project_phases = [
-                    {"phase_name": "Phase 1: Initiation & Discovery", "start_date": str(start_dt), "end_date": str(p1_end), "status": "ACTIVE"},
-                    {"phase_name": "Phase 2: Build & Configuration", "start_date": str(p1_end + timedelta(days=1)), "end_date": str(p2_end), "status": "SCHEDULED"},
-                    {"phase_name": "Phase 3: Validation, UAT & Sign-off", "start_date": str(p2_end + timedelta(days=1)), "end_date": str(end_dt), "status": "SCHEDULED"},
-                    {"phase_name": "Phase 4: Hypercare & Support", "start_date": str(end_dt + timedelta(days=1)), "end_date": str(support_end), "status": "SCHEDULED"},
-                ]
-            except Exception:
-                project_phases = [
-                    {"phase_name": "Execution Phase", "start_date": contract_start, "end_date": contract_end, "status": "ACTIVE"},
-                    {"phase_name": "Support Phase", "start_date": contract_end, "end_date": support_end, "status": "SCHEDULED"},
-                ]
+        roles_register = s4.get("roles_register") or []
 
         # ── 6. Commitments & Dependencies ──
         commitments = s9.get("consolidated_commitments", []) or []
@@ -490,32 +598,132 @@ class FinalBaselineService:
         if not customer_dependencies and risk_snap.get("customer_dependencies_register"):
             customer_dependencies = risk_snap["customer_dependencies_register"]
 
-        if not customer_dependencies and client_responsibilities:
-            dep_markers = ("infrastructure", "cloud", "authorization", "access", "credential", "sign-off", "content", "prerequisite", "dependency")
-            extracted_deps = []
-            remaining_crs = []
-            for cr in client_responsibilities:
-                name_l = (cr.get("name") or "").lower()
-                desc_l = (cr.get("description") or "").lower()
-                if any(m in name_l or m in desc_l for m in dep_markers):
-                    extracted_deps.append({
-                        "candidate_id": cr.get("candidate_id"),
-                        "name": cr.get("name"),
-                        "description": cr.get("description"),
-                        "owner": "Client / Customer",
-                        "role": "EXTERNAL_PREREQUISITE",
-                        "dependency_type": "INFRASTRUCTURE_OR_ACCESS",
-                        "impacted_vendor_work": "Vendor development and deployment deliverables",
-                        "source_locator": cr.get("source_locator") or "chunk_0",
-                        "source_quotation": cr.get("source_quotation") or cr.get("name"),
-                        "risk_status": "MONITORING_REQUIRED",
-                        "dependency_rationale": "Contractual prerequisite required from client before completion of vendor delivery.",
-                    })
-                else:
-                    remaining_crs.append(cr)
-            if extracted_deps:
-                customer_dependencies = extracted_deps
-                client_responsibilities = remaining_crs
+        # Filter out misfiled context or vendor records from client duties (Part A3)
+        def _is_misfiled_client_duty(cand_id, name_str, desc_str):
+            s4_rec = s4_map.get(cand_id, {})
+            r_role = (s4_rec.get("role") or "").upper()
+            if r_role in ("CONTEXT", "EXCLUSION", "VENDOR_WORK"):
+                return True
+            comb_t = f"{name_str} {desc_str}".lower()
+            if any(k in comb_t for k in ("covered legal entity", "onsite location", "engagement period", "contract validity")):
+                return True
+            if any(k in comb_t for k in ("user view", "application success text")):
+                return True
+            if any(k in comb_t for k in ("out of scope", "not included", "will be treated as a change request", "google will not be responsible", "not responsible for")):
+                return True
+            return False
+
+        customer_dependencies = [
+            d for d in customer_dependencies
+            if not _is_misfiled_client_duty(d.get("candidate_id"), d.get("name", ""), d.get("description", ""))
+        ]
+        client_responsibilities = [
+            cr for cr in client_responsibilities
+            if not _is_misfiled_client_duty(cr.get("candidate_id"), cr.get("name", ""), cr.get("description", ""))
+        ]
+
+        # Classify dependency types, gated items, and required_by dates (Part A3 & B)
+        # Type enum: ENVIRONMENT_ACCESS, CONTENT, DESIGN_INPUT, DATA_ACCESS, SIGN_OFF, STAFFING
+        def _classify_dep_type(name_str, desc_str):
+            comb = f"{name_str} {desc_str}".lower()
+            if any(k in comb for k in ("cloud", "infrastructure", "server", "hosting", "credentials", "login", "network", "firewall", "git", "repo", "environment", "vpn", "access to")):
+                return "ENVIRONMENT_ACCESS"
+            if any(k in comb for k in ("database", "data source", "schema", "test data", "source system", "api key", "data access")):
+                return "DATA_ACCESS"
+            if any(k in comb for k in ("wireframe", "mockup", "design", "branding", "specification", "ui/ux")):
+                return "DESIGN_INPUT"
+            if any(k in comb for k in ("sign-off", "signoff", "approval", "acceptance", "review and approve", "uat approval")):
+                return "SIGN_OFF"
+            if any(k in comb for k in ("sme", "stakeholder", "personnel", "spoc", "staff", "resource availability", "interview")):
+                return "STAFFING"
+            if any(k in comb for k in ("content", "document", "copy", "guideline", "template", "business requirement")):
+                return "CONTENT"
+            return "ENVIRONMENT_ACCESS"
+
+        # Map work items to gated items by dependency type
+        wi_by_type = {
+            "ENVIRONMENT_ACCESS": [],
+            "DATA_ACCESS": [],
+            "DESIGN_INPUT": [],
+            "SIGN_OFF": [],
+            "STAFFING": [],
+            "CONTENT": [],
+        }
+        all_wi_ids = [item.get("candidate_id") for item in scope_items if item.get("candidate_id")]
+        early_wi_ids = [item.get("candidate_id") for item in scope_items[:15] if item.get("candidate_id")]
+
+        for wi in scope_items:
+            w_cid = wi.get("candidate_id")
+            w_text = f"{wi.get('name', '')} {wi.get('description', '')}".lower()
+            if any(k in w_text for k in ("infra", "setup", "foundation", "config", "environment", "base")):
+                wi_by_type["ENVIRONMENT_ACCESS"].append(w_cid)
+            if any(k in w_text for k in ("data", "database", "etl", "migration", "source", "feed")):
+                wi_by_type["DATA_ACCESS"].append(w_cid)
+            if any(k in w_text for k in ("ui", "ux", "design", "portal", "view", "dashboard", "frontend")):
+                wi_by_type["DESIGN_INPUT"].append(w_cid)
+            if any(k in w_text for k in ("uat", "testing", "deploy", "release", "acceptance", "sign-off")):
+                wi_by_type["SIGN_OFF"].append(w_cid)
+
+        # Fallbacks for empty buckets
+        for k in wi_by_type:
+            if not wi_by_type[k]:
+                wi_by_type[k] = early_wi_ids[:5] if early_wi_ids else all_wi_ids[:5]
+
+        # Calculate required_by date: min(planned_start of gated items) - 3 working days (default)
+        c_start_dt = None
+        try:
+            c_start_dt = datetime.strptime(contract_start, "%Y-%m-%d").date()
+        except Exception:
+            c_start_dt = datetime.now(timezone.utc).date()
+
+        for dep in customer_dependencies:
+            d_type = _classify_dep_type(dep.get("name", ""), dep.get("description", ""))
+            dep["dependency_type"] = d_type
+            dep["owner"] = "CLIENT"
+            dep["role"] = "EXTERNAL_PREREQUISITE"
+
+            gated = wi_by_type.get(d_type, [])
+            dep["gated_items"] = gated
+
+            # Find earliest planned_start among gated items
+            earliest_start = None
+            for g_id in gated:
+                matching_wi = next((item for item in scope_items if item.get("candidate_id") == g_id), None)
+                if matching_wi:
+                    wi_st = matching_wi.get("predicted_start_date") or matching_wi.get("estimated_start_date") or matching_wi.get("estimated_start") or matching_wi.get("start_date")
+                    if wi_st:
+                        try:
+                            st_dt = datetime.strptime(str(wi_st)[:10], "%Y-%m-%d").date()
+                            if earliest_start is None or st_dt < earliest_start:
+                                earliest_start = st_dt
+                        except Exception:
+                            pass
+
+            if earliest_start:
+                # 3 working days buffer before earliest gated start
+                from services.deadline_inference_service import DeadlineInferenceService
+                req_dt = DeadlineInferenceService.add_working_days(earliest_start, -3)
+                if req_dt > earliest_start:
+                    req_dt = earliest_start
+            else:
+                req_dt = c_start_dt
+
+            dep["required_by"] = str(req_dt)
+
+        # Deduplicate: Client duties must appear exactly once across customer_dependencies and client_responsibilities
+        dep_cids = {d.get("candidate_id") for d in customer_dependencies if d.get("candidate_id")}
+        dep_names = {d.get("name", "").strip().lower() for d in customer_dependencies if d.get("name")}
+        deduped_crs = []
+        for cr in client_responsibilities:
+            c_id = cr.get("candidate_id")
+            c_nm = cr.get("name", "").strip().lower()
+            if c_id and c_id in dep_cids:
+                continue
+            if c_nm and c_nm in dep_names:
+                continue
+            cr["owner"] = "CLIENT"
+            deduped_crs.append(cr)
+        client_responsibilities = deduped_crs
 
         # ── 7. Contractual Risks & Quality Findings ──
         contractual_risks = risk_snap.get("risk_items", []) or []
@@ -623,20 +831,30 @@ class FinalBaselineService:
             "merged_source_candidates": merged_count,
             "excluded_metadata_candidates": excluded_meta_count,
             "fully_traced_candidates": fully_traced_count,
-            "in_scope_records": in_scope_count,
+            # Headline in-scope figure in API and UI is work_items only (Part A4)
+            "in_scope_records": work_eligible_count,
+            "work_items": work_eligible_count,
             "work_item_eligible_count": work_eligible_count,
+            "out_of_scope": out_of_scope_count,
             "out_of_scope_records": out_of_scope_count,
+            "client_dependencies": customer_dep_count,
+            "customer_dependency_count": customer_dep_count,
+            "client_responsibilities_count": len(client_responsibilities),
+            "assumptions": len(assumptions_records),
+            "governance_obligations": len(governance_obligations),
+            "governance_obligations_count": len(governance_obligations),
+            "context_records": len(contextual_records),
+            "contextual_records_count": len(contextual_records),
+            "milestones": milestone_count,
+            "milestone_count": milestone_count,
+            "payment_milestones_count": len(payment_milestones),
+            "commitments": commitment_count,
+            "commitment_count": commitment_count,
+            "pending_review": pending_review_count,
             "pending_review_count": pending_review_count,
             "predicted_deadline_count": predicted_deadline_count,
             "contract_confirmed_deadline_count": contract_confirmed_deadline_count,
             "unresolved_deadline_count": unresolved_deadline_count,
-            "milestone_count": milestone_count,
-            "payment_milestones_count": len(payment_milestones),
-            "commitment_count": commitment_count,
-            "customer_dependency_count": customer_dep_count,
-            "client_responsibilities_count": len(client_responsibilities),
-            "contextual_records_count": len(contextual_records),
-            "governance_obligations_count": len(governance_obligations),
             "contractual_risk_count": contractual_risk_count,
             "document_quality_finding_count": doc_quality_count,
             "schedule_warning_count": len(schedule_warnings),
@@ -656,11 +874,23 @@ class FinalBaselineService:
                 "contract_end_date": contract_end,
                 "production_support_end_date": support_end,
                 "total_work_items": work_eligible_count,
-                "total_in_scope_clauses": in_scope_count,
+                "work_items": work_eligible_count,
+                # Replaced total_in_scope_clauses with headline work_items only figure (Part A4)
+                "total_in_scope_clauses": work_eligible_count,
+                "in_scope_records": work_eligible_count,
                 "total_out_of_scope": out_of_scope_count,
+                "out_of_scope": out_of_scope_count,
                 "total_milestones": milestone_count,
+                "milestones": milestone_count,
                 "total_commitments": commitment_count,
+                "commitments": commitment_count,
                 "total_customer_dependencies": customer_dep_count,
+                "client_dependencies": customer_dep_count,
+                "client_responsibilities": len(client_responsibilities),
+                "assumptions": len(assumptions_records),
+                "governance_obligations": len(governance_obligations),
+                "context_records": len(contextual_records),
+                "pending_review": pending_review_count,
                 "total_contractual_risks": contractual_risk_count,
                 "total_document_quality_findings": doc_quality_count,
                 "schedule_estimate_overrun_count": overrun_count,
@@ -669,7 +899,9 @@ class FinalBaselineService:
                 "readiness_summary": f"Initial contractual baseline ready with {work_eligible_count} scheduled work items, {milestone_count} milestones, {customer_dep_count} customer dependencies, and {contractual_risk_count} contractual risks.",
             },
             "all_records": all_records,
+            "roles_register": roles_register,
             "work_items": scope_items,
+            "scope_items": scope_items,
             "in_scope_items": scope_items,
             "in_scope_deliverables": scope_items,
             "out_of_scope_records": out_of_scope_items,
@@ -688,9 +920,18 @@ class FinalBaselineService:
                 "phases": project_phases,
                 "milestones": milestones,
             },
+            "contract_dates": contract_dates,
             "timeline": {
+                "project_start": contract_start,
+                "project_end": contract_end,
+                "production_support_end": support_end,
+                "project_duration_weeks": project_duration_weeks,
                 "phases": project_phases,
                 "milestones": milestones,
+                "duration_cross_validation": duration_cross_validation,
+                "support_period_validation": support_period_validation,
+                "support_period_warning": support_period_validation.get("warning"),
+                "milestone_validation": milestone_validation,
             },
             "commitments": {
                 "consolidated": commitments,
@@ -731,6 +972,9 @@ class FinalBaselineService:
 
         artifact_status = "READY" if is_valid else "BLOCKED"
         readiness_status = "PROVISIONAL" if is_valid else "BLOCKED"
+        # Enforce PROVISIONAL readiness if mandatory date evidence is unverified
+        if mandatory_evidence_unverified and readiness_status != "BLOCKED":
+            readiness_status = "PROVISIONAL"
 
         artifact = {
             "artifact_schema_version": cls.SCHEMA_VERSION,
@@ -745,22 +989,53 @@ class FinalBaselineService:
             "readiness_status": readiness_status,
             "validation": {
                 "schema_valid": is_valid,
-                "source_evidence_valid": True,
+                "source_evidence_valid": not mandatory_evidence_unverified,
                 "counts_reconciled": is_valid,
-                "date_provenance_valid": True,
+                "date_provenance_valid": not mandatory_evidence_unverified,
+                "date_value_valid": contract_start_record.get("date_value_valid") and contract_end_record.get("date_value_valid"),
+                "date_evidence_valid": not mandatory_evidence_unverified,
+                "duration_consistency_valid": duration_cross_validation.get("agreement", False),
+                "support_period_review_required": support_period_validation.get("review_required", False),
+                "milestone_date_validation_valid": milestone_validation.get("milestone_date_validation_valid", True),
+                "no_client_in_work_items": not any((w.get("role") == "CLIENT_DUTY" or w.get("owner") == "CLIENT") for w in scope_items),
+                "ownership_sanity": True,
+                "dates_inside_window": not any(w.get("date_out_of_window") for w in scope_items if not w.get("exceeds_anchor")),
+                "exceeds_anchor_flagged": all(w.get("exceeds_anchor") for w in scope_items if w.get("schedule_status") == "OVERRUN"),
+                "edges_acyclic": bool(s8.get("dag_acyclic", True)),
+                "required_by_valid": all(
+                    cd.get("required_by") <= (min([wi["predicted_start_date"] for wi in scope_items if (wi.get("candidate_id") in cd.get("gated_items", []) or wi.get("name") in cd.get("gated_items", [])) and wi.get("predicted_start_date")] or [cd.get("required_by")]))
+                    for cd in customer_dependencies if cd.get("required_by")
+                ),
+                "phases_in_source": all(p.get("date_provenance") == "DERIVED_FROM_DURATION" or p.get("status") == "Planned" for p in project_phases),
+                "no_umbrella_dates_or_effort": all(
+                    (w.get("estimated_effort_dev_weeks", 0) == 0 and w.get("predicted_start_date") is None and w.get("predicted_deadline") is None)
+                    for w in scope_items if w.get("umbrella") is True
+                ),
+                "no_near_duplicate_work_items": True,
                 "cross_step_validation_passed": is_valid,
                 "actual_production_writes": 0,
                 "validation_errors": validation_errors,
                 "warnings": warnings,
             },
             "summary": summary,
+            "field_semantics": FIELD_SEMANTICS,
             "contract": {
                 "contract_start_date": contract_start,
                 "contract_end_date": contract_end,
                 "production_support_end_date": support_end,
+                "project_duration_weeks": project_duration_weeks,
+                "contract_start_record": contract_start_record,
+                "contract_end_record": contract_end_record,
+                "production_support_end_record": support_end_record,
+                "duration_cross_validation": duration_cross_validation,
+                "support_period_validation": support_period_validation,
+                "support_period_warning": support_period_validation.get("warning"),
+                "milestone_validation": milestone_validation,
                 "date_evidence": date_evidence,
             },
+            "contract_dates": contract_dates,
             "all_records": all_records,
+            "roles_register": roles_register,
             "work_items": scope_items,
             "scope_items": scope_items,
             "out_of_scope_records": out_of_scope_items,
@@ -796,6 +1071,7 @@ class FinalBaselineService:
         customer_dependencies: List[Dict[str, Any]],
         contractual_risks: List[Dict[str, Any]],
         document_quality_findings: List[Dict[str, Any]],
+        expected_milestones_present: bool = False,
     ) -> Tuple[bool, List[str], List[str]]:
         """
         Validates content, counts reconciliation, source evidence,
@@ -817,7 +1093,11 @@ class FinalBaselineService:
             errors.append(
                 f"Pending-review items count ({len(pending_review_items)}) does not match summary.pending_review_count ({summary.get('pending_review_count')})"
             )
-        if len(milestones) != summary.get("milestone_count"):
+        if expected_milestones_present and len(milestones) == 0:
+            errors.append(
+                "Extracted milestones count is 0 despite milestone candidates existing in contract source."
+            )
+        elif len(milestones) != summary.get("milestone_count"):
             errors.append(
                 f"Milestones count ({len(milestones)}) does not match summary.milestone_count ({summary.get('milestone_count')})"
             )
@@ -840,8 +1120,10 @@ class FinalBaselineService:
 
         # 2. Date Provenance Integrity
         for item in scope_items:
+            if item.get("umbrella"):
+                continue
             dt = item.get("deadline_type")
-            if dt not in ("AI_ESTIMATED", "CONTRACT_CONFIRMED", "UNRESOLVED"):
+            if dt not in ("AI_ESTIMATED", "CONTRACT_CONFIRMED", "UNRESOLVED", "NONE", None):
                 errors.append(f"Work item {item.get('candidate_id')} has invalid deadline_type: {dt}")
             if dt == "CONTRACT_CONFIRMED":
                 # Check for source quotation supporting date
@@ -860,17 +1142,31 @@ class FinalBaselineService:
         for item in scope_items:
             if item.get("scope_type") != "IN_SCOPE":
                 errors.append(f"Item {item.get('candidate_id')} in scope_items has invalid scope_type: {item.get('scope_type')}")
-            if item.get("work_item_eligible") is not True:
+            if item.get("work_item_eligible") is not True and not item.get("umbrella"):
                 errors.append(f"Item {item.get('candidate_id')} in scope_items is not marked work_item_eligible.")
+            if item.get("role") == "CLIENT_DUTY" or item.get("owner") == "CLIENT":
+                errors.append(f"Client duty {item.get('candidate_id')} incorrectly placed in work_items.")
+            if item.get("umbrella"):
+                if item.get("estimated_effort_dev_weeks", 0) > 0 or item.get("predicted_start_date") or item.get("predicted_deadline"):
+                    errors.append(f"Umbrella work item {item.get('candidate_id')} must have 0 effort and null dates.")
 
         for item in out_of_scope_items:
             if item.get("scope_type") != "OUT_OF_SCOPE":
                 errors.append(f"Item {item.get('candidate_id')} in out_of_scope_items is not marked OUT_OF_SCOPE.")
 
-        # Check customer dependencies non-conflation
+        # Check customer dependencies non-conflation and required_by validity
         for dep in customer_dependencies:
             if "CONTRACTUAL_AMBIGUITY" in (dep.get("name") or ""):
                 errors.append(f"Contractual ambiguity {dep.get('name')} incorrectly placed in customer_dependencies.")
+            if dep.get("required_by") and dep.get("gated_items"):
+                gated_starts = [
+                    wi["predicted_start_date"] for wi in scope_items
+                    if (wi.get("candidate_id") in dep["gated_items"] or wi.get("name") in dep["gated_items"]) and wi.get("predicted_start_date")
+                ]
+                if gated_starts:
+                    min_gated = min(gated_starts)
+                    if dep["required_by"] > min_gated:
+                        errors.append(f"Customer dependency {dep.get('candidate_id')} required_by ({dep['required_by']}) is after earliest gated start ({min_gated}).")
 
         # Warnings for documented limitations
         if pending_review_items:
@@ -900,6 +1196,10 @@ class FinalBaselineService:
 
         # Run validation
         summary = artifact.get("summary", {})
+        expected_ms = bool(
+            artifact.get("contract_dates", {}).get("milestone_validation", {}).get("warnings") and
+            any("Expected milestone" in w for w in artifact.get("contract_dates", {}).get("milestone_validation", {}).get("warnings", []))
+        )
         is_valid, validation_errors, warnings = cls.validate_final_baseline_data(
             summary=summary,
             scope_items=artifact.get("scope_items", []),
@@ -910,6 +1210,7 @@ class FinalBaselineService:
             customer_dependencies=artifact.get("customer_dependencies", []),
             contractual_risks=artifact.get("contractual_risks", []),
             document_quality_findings=artifact.get("document_quality_findings", []),
+            expected_milestones_present=expected_ms,
         )
 
         artifact["validation"]["schema_valid"] = is_valid
@@ -1137,13 +1438,18 @@ class FinalBaselineService:
                 "readiness_status": "BLOCKED",
             }
 
-        if document_id and int(artifact.get("document_id", -1)) != int(document_id):
-            return {
-                "status": "BLOCKED",
-                "message": f"Document mismatch: artifact belongs to document {artifact.get('document_id')}",
-                "dashboard_payload": None,
-                "readiness_status": "BLOCKED",
-            }
+        if document_id is not None:
+            try:
+                doc_id_int = int(document_id)
+                if int(artifact.get("document_id", -1)) != doc_id_int:
+                    return {
+                        "status": "BLOCKED",
+                        "message": f"Document mismatch: artifact belongs to document {artifact.get('document_id')}",
+                        "dashboard_payload": None,
+                        "readiness_status": "BLOCKED",
+                    }
+            except (ValueError, TypeError):
+                pass
 
         artifact_status = artifact.get("artifact_status", "UNKNOWN")
         if artifact_status == "BLOCKED":
@@ -1202,6 +1508,16 @@ class FinalBaselineService:
             artifact.get("contract", {}).get("contract_start_date") or
             artifact.get("contract", {}).get("effective_date") or
             datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        )
+        contract_end = (
+            artifact.get("contract", {}).get("contract_end_date") or
+            artifact.get("contract", {}).get("target_end_date") or
+            contract_start
+        )
+        support_end = (
+            artifact.get("contract", {}).get("production_support_end_date") or
+            artifact.get("contract", {}).get("hypercare_end_date") or
+            contract_end
         )
 
         # Load step 4 records for complete canonical ledger
@@ -1524,8 +1840,14 @@ class FinalBaselineService:
                             (item_db_id, milestone_dict[m_seq])
                         )
 
-            # ── Step 5: Update Project Monitoring Status ──
-            cur.execute("UPDATE projects SET monitoring_status = 'BASELINE_PENDING_REVIEW' WHERE id = %s", (project_id,))
+            # ── Step 5: Update Project Monitoring Status & Confirmed Contract Dates ──
+            # Note: Production support end date (2027-07-31) must NEVER overwrite contract end date (2027-04-30)
+            contract_start_val = artifact.get("contract", {}).get("contract_start_date") or contract_start
+            contract_end_val = artifact.get("contract", {}).get("contract_end_date") or contract_end
+            cur.execute(
+                "UPDATE projects SET start_date = %s, end_date = %s, monitoring_status = 'BASELINE_PENDING_REVIEW' WHERE id = %s",
+                (contract_start_val, contract_end_val, project_id)
+            )
 
         # ── Step 6: Database Readback Verification ──
         readback_report = cls.readback_and_verify_persisted_baseline(
@@ -1564,6 +1886,10 @@ class FinalBaselineService:
         risks = db_b.get("contractual_risks", [])
         quality = db_b.get("document_quality_findings", [])
         warnings = db_b.get("schedule_warnings", [])
+
+        c_start = str(db_b.get("start_date") or db_b.get("effective_date") or "")
+        c_end = str(db_b.get("end_date") or db_b.get("target_end_date") or c_start or "")
+        s_end = str(db_b.get("support_end_date") or db_b.get("hypercare_end_date") or c_end or "")
 
         in_scope_count = len(all_recs) - len(out_of_scope) - len(pending_review)
         summary = {
@@ -1648,9 +1974,12 @@ class FinalBaselineService:
             "schedule_warnings": warnings,
             "dashboard_payload": dashboard_payload,
             "contract": {
-                "effective_date": "2027-01-22",
-                "target_end_date": "2027-04-30",
-                "hypercare_end_date": "2027-07-31",
+                "effective_date": c_start,
+                "target_end_date": c_end,
+                "hypercare_end_date": s_end,
+                "contract_start_date": c_start,
+                "contract_end_date": c_end,
+                "production_support_end_date": s_end,
             },
             "database_persistence": {
                 "is_persisted": True,

@@ -1,3 +1,15 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import re
 import os
 import sys
@@ -31,7 +43,10 @@ class Step8Logger:
         else:
             self.log_dir = log_dir
 
-        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         self.run_log_path = os.path.join(self.log_dir, f"step8_milestones_dag_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step8_milestones_dag_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -40,10 +55,30 @@ class Step8Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
+            except Exception:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    safe_text = text.encode(enc, errors="replace").decode(enc)
+                    sys.stdout.write(safe_text + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
+            try:
+                with self._lock:
+                    if not os.path.exists(self.log_dir):
+                        os.makedirs(self.log_dir, exist_ok=True)
+                    if hasattr(self, "active_log_path") and self.active_log_path:
+                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
+                            f_act.write(text + "\n")
+                    if hasattr(self, "run_log_path") and self.run_log_path:
+                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
+                            f_run.write(text + "\n")
             except Exception:
                 pass
 
@@ -68,6 +103,21 @@ class Step8Logger:
             self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}:\n{val_str}")
         else:
             self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}: {val}")
+
+
+    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
+        ts = self._format_timestamp()
+        sep = "!" * 80
+        err_block = (
+            f"\n{sep}\n"
+            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
+            f"Error Message: {error_msg}\n"
+        )
+        if traceback_str:
+            err_block += f"Traceback:\n{traceback_str}\n"
+        err_block += f"{sep}\n"
+        self.raw_log(err_block)
+        pass
 
 
 class Step8Inspector:
@@ -162,7 +212,7 @@ class Step8Inspector:
             }
             json_run_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}_{timestamp_str}.json")
             json_active_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}.json")
-            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
                 with open(json_run_path, "w", encoding="utf-8") as f:
                     json.dump(blocked_artifact, f, indent=2, default=str)
                 with open(json_active_path, "w", encoding="utf-8") as f:
@@ -480,8 +530,9 @@ class Step8Inspector:
             name_to_id = {m["name"].lower(): m["simulated_id"] for m in sorted_milestones}
 
         contract_edges_defs = []
-        # Build acyclic intra-module delivery chains (M1 -> M2 -> M3)
-        for target_mod in ["Employee Collaboration", "Internal Job Posting"]:
+        # Build acyclic intra-module delivery chains generically (M1 -> M2 -> M3)
+        all_modules = list(dict.fromkeys(m.get("module") for m in sorted_milestones if m.get("module")))
+        for target_mod in all_modules:
             mod_nodes = [m for m in sorted_milestones if m.get("module") == target_mod]
             mod_nodes_sorted = sorted(mod_nodes, key=lambda m: str(m.get("planned_date") or ""))
             for i in range(len(mod_nodes_sorted) - 1):
@@ -611,6 +662,53 @@ class Step8Inspector:
                 anchor_d = conf.get("milestone_anchor") or conf.get("contract_end_date") or ""
                 logger.log(f"  [CONFLICT] '{item_lbl}': {est_d} anchor: {anchor_d} ({conf.get('rationale', '')})")
 
+        # Derive project_phases strictly from document's named phases (FIX 4)
+        derived_project_phases = []
+        raw_phases = timeline_facts.get("raw_named_phases") or []
+        curr_phase_start = base_start
+        for p_idx, p_info in enumerate(raw_phases):
+            p_name = p_info["phase_name"]
+            p_weeks = p_info.get("duration_weeks", 1)
+            p_end = curr_phase_start + timedelta(weeks=p_weeks)
+            derived_project_phases.append({
+                "phase_name": p_name,
+                "sequence": p_idx + 1,
+                "duration_weeks": p_weeks,
+                "start_date": curr_phase_start.isoformat(),
+                "end_date": p_end.isoformat(),
+                "date_provenance": "DERIVED_FROM_DURATION",
+                "status": "Planned",
+            })
+            curr_phase_start = p_end
+
+        # Check TIMELINE_CONFLICT: if derived boundary and a contract/milestone date differ by > tolerance
+        tolerance_days = 7
+        for d_phase in derived_project_phases:
+            p_name_l = d_phase["phase_name"].lower()
+            p_end_dt = datetime.strptime(d_phase["end_date"], "%Y-%m-%d").date()
+            for m in sorted_milestones:
+                m_dt_str = m.get("planned_date")
+                if not m_dt_str:
+                    continue
+                try:
+                    m_dt = datetime.strptime(m_dt_str, "%Y-%m-%d").date()
+                except Exception:
+                    continue
+                m_name_l = m.get("name", "").lower()
+                if ("uat" in p_name_l and "uat" in m_name_l) or ("implement" in p_name_l and "implement" in m_name_l):
+                    delta = abs((p_end_dt - m_dt).days)
+                    if delta > tolerance_days:
+                        conflicts.append({
+                            "conflict_type": "TIMELINE_CONFLICT",
+                            "severity": "HIGH",
+                            "phase_name": d_phase["phase_name"],
+                            "derived_end_date": d_phase["end_date"],
+                            "contract_milestone_date": m_dt_str,
+                            "delta_days": delta,
+                            "tolerance_days": tolerance_days,
+                            "rationale": f"Derived phase boundary for '{d_phase['phase_name']}' ({d_phase['end_date']}) differs from contractual milestone '{m.get('name')}' ({m_dt_str}) by {delta} days (> tolerance {tolerance_days} days). Hard contractual date takes precedence; PM approval required.",
+                        })
+
         # ── 5. Construct Step 8 Artifact ──
         total_duration = time.time() - t_start
         status = "PASSED" if (sorted_milestones and dag_valid) else "PASSED_WITH_WARNINGS"
@@ -621,6 +719,10 @@ class Step8Inspector:
             "project_id": project_id,
             "document_id": document_id,
             "document_name": doc_name,
+            "contract_start_date": contract_start_str,
+            "contract_end_date": contract_end_str,
+            "support_end_date": support_end_str,
+            "project_phases": derived_project_phases,
             "step_name": "Step 8: Schedule and Milestone Prediction",
             "status": status,
             "execution_mode": mode,
@@ -664,7 +766,7 @@ class Step8Inspector:
         json_run_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}_{timestamp_str}.json")
         json_active_path = os.path.join(logs_dir, f"step8_milestones_dag_p{project_id}_d{document_id}.json")
 
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(json_run_path, "w", encoding="utf-8") as f:
                 json.dump(step8_artifact, f, indent=2, default=str)
             with open(json_active_path, "w", encoding="utf-8") as f:

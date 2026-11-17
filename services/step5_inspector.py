@@ -1,3 +1,15 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import os
 import sys
 import time
@@ -29,7 +41,10 @@ class Step5Logger:
         else:
             self.log_dir = log_dir
 
-        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         self.run_log_path = os.path.join(self.log_dir, f"step5_inspection_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step5_inspection_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -38,10 +53,30 @@ class Step5Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
+            except Exception:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    safe_text = text.encode(enc, errors="replace").decode(enc)
+                    sys.stdout.write(safe_text + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
+            try:
+                with self._lock:
+                    if not os.path.exists(self.log_dir):
+                        os.makedirs(self.log_dir, exist_ok=True)
+                    if hasattr(self, "active_log_path") and self.active_log_path:
+                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
+                            f_act.write(text + "\n")
+                    if hasattr(self, "run_log_path") and self.run_log_path:
+                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
+                            f_run.write(text + "\n")
             except Exception:
                 pass
 
@@ -81,6 +116,21 @@ class Step5Logger:
 
     def quality_check(self, check_name: str, status: str, details: str):
         self.raw_log(f"    [{status}] {check_name}: {details}")
+
+
+    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
+        ts = self._format_timestamp()
+        sep = "!" * 80
+        err_block = (
+            f"\n{sep}\n"
+            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
+            f"Error Message: {error_msg}\n"
+        )
+        if traceback_str:
+            err_block += f"Traceback:\n{traceback_str}\n"
+        err_block += f"{sep}\n"
+        self.raw_log(err_block)
+        pass
 
 
 class Step5Inspector:
@@ -631,7 +681,7 @@ class Step5Inspector:
             "quarantined_records": quarantined_records,
         }
 
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(json_run_path, "w", encoding="utf-8") as f:
                 json.dump(step5_artifact, f, indent=2, default=str)
             with open(json_active_path, "w", encoding="utf-8") as f:

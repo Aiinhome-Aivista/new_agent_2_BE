@@ -1,12 +1,28 @@
+import sys
+if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, 'reconfigure'):
+    try:
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import os
 import sys
 import time
 import json
 import threading
+import re
 from datetime import datetime, timezone, date, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from services.recurring_deliverable_service import RecurringDeliverableService
+from services.party_resolver import PartyResolver
+from services.deadline_inference_service import DeadlineInferenceService
+from core.baseline_config import TRIGGER_PATTERNS, GATING_RULES, WORKING_DAY_BUFFER
 
 
 class Step9Logger:
@@ -27,7 +43,10 @@ class Step9Logger:
         else:
             self.log_dir = log_dir
 
-        # os.makedirs(self.log_dir, exist_ok=True) disabled for deployment
+        try:
+            os.makedirs(self.log_dir, exist_ok=True)
+        except Exception:
+            pass
         self.run_log_path = os.path.join(self.log_dir, f"step9_recurring_p{project_id}_d{document_id}_{timestamp_str}.log")
         self.active_log_path = os.path.join(self.log_dir, f"step9_recurring_p{project_id}_d{document_id}.log")
         self._lock = threading.Lock()
@@ -36,10 +55,30 @@ class Step9Logger:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
             try:
                 sys.stdout.write(text + "\n")
                 sys.stdout.flush()
+            except Exception:
+                try:
+                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                    safe_text = text.encode(enc, errors="replace").decode(enc)
+                    sys.stdout.write(safe_text + "\n")
+                    sys.stdout.flush()
+                except Exception:
+                    pass
+
+        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
+            try:
+                with self._lock:
+                    if not os.path.exists(self.log_dir):
+                        os.makedirs(self.log_dir, exist_ok=True)
+                    if hasattr(self, "active_log_path") and self.active_log_path:
+                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
+                            f_act.write(text + "\n")
+                    if hasattr(self, "run_log_path") and self.run_log_path:
+                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
+                            f_run.write(text + "\n")
             except Exception:
                 pass
 
@@ -64,6 +103,21 @@ class Step9Logger:
             self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}:\n{val_str}")
         else:
             self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}: {val}")
+
+
+    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
+        ts = self._format_timestamp()
+        sep = "!" * 80
+        err_block = (
+            f"\n{sep}\n"
+            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
+            f"Error Message: {error_msg}\n"
+        )
+        if traceback_str:
+            err_block += f"Traceback:\n{traceback_str}\n"
+        err_block += f"{sep}\n"
+        self.raw_log(err_block)
+        pass
 
 
 class Step9Inspector:
@@ -167,7 +221,7 @@ class Step9Inspector:
             }
             json_run_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}_{timestamp_str}.json")
             json_active_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}.json")
-            if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+            if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
                 with open(json_run_path, "w", encoding="utf-8") as f:
                     json.dump(blocked_artifact, f, indent=2, default=str)
                 with open(json_active_path, "w", encoding="utf-8") as f:
@@ -201,13 +255,17 @@ class Step9Inspector:
         milestone_acceptance_obligations: List[Dict[str, Any]] = []
         seen_cand_ids = set()
 
-        # Contract dates
-        contract_start_str = "2027-01-22"
-        for r in structured_records + proposed_items:
-            combined_txt = ((r.get("raw_text") or "") + " " + (r.get("name") or "")).lower()
-            if "22nd day of january 2027" in combined_txt or "22 january 2027" in combined_txt:
-                contract_start_str = "2027-01-22"
-                break
+        # Contract dates (FIX 4 & FIX 6 generic extraction)
+        contract_start_str = step8_artifact.get("contract_start_date")
+        if not contract_start_str:
+            for r in structured_records + proposed_items:
+                combined_txt = ((r.get("raw_text") or "") + " " + (r.get("name") or "")).lower()
+                parsed_d = DeadlineInferenceService.parse_date_string(combined_txt)
+                if parsed_d:
+                    contract_start_str = parsed_d
+                    break
+        if not contract_start_str:
+            contract_start_str = date.today().isoformat()
 
         try:
             base_date = datetime.strptime(contract_start_str, "%Y-%m-%d").date()
@@ -306,9 +364,60 @@ class Step9Inspector:
                 logger.log(f"  [TRIGGER-BASED SLA] {cid}: '{name}' (3-working-day feedback SLA)")
                 continue
 
-            # ── Separation Rule: Customer Responsibilities vs Vendor Out-of-Scope ──
-            is_client_resp = any(k in rec_type for k in ("CLIENT", "CUSTOMER")) or any(k in comb for k in ("client responsibility", "customer responsibility", "client will provide", "customer will provide", "client to furnish", "client must", "customer must"))
-            is_out_of_scope = (scope_type == "OUT_OF_SCOPE") and not is_client_resp
+            # ── Separation Rule: Customer Responsibilities vs Vendor Out-of-Scope vs Context ──
+            item_role = (item.get("role") or "").upper()
+            is_exclusion = (
+                item_role == "EXCLUSION"
+                or scope_type == "OUT_OF_SCOPE"
+                or any(k in comb for k in ("out of scope", "not included", "will be treated as a change request", "google will not be responsible", "not responsible for", "exclusion"))
+            )
+            is_context = (
+                item_role == "CONTEXT"
+                or any(k in name.lower() for k in ("covered legal entity", "onsite location", "engagement period", "contract validity"))
+            )
+            is_vendor_feature = (
+                item_role == "VENDOR_WORK"
+                or item.get("work_item_eligible", False)
+                or any(k in name.lower() for k in ("application success text", "user view"))
+            )
+
+            if is_exclusion:
+                ve_record = {
+                    "candidate_id": cid,
+                    "name": name,
+                    "description": desc,
+                    "owner": "Vendor Excluded",
+                    "role": "EXCLUSION",
+                    "scope_type": "OUT_OF_SCOPE",
+                    "change_request_required": True,
+                    "source_locator": item.get("source_locator"),
+                    "source_quotation": item.get("raw_text") or desc,
+                }
+                vendor_exclusions.append(ve_record)
+                logger.log(f"  [VENDOR EXCLUSION] {cid}: '{name}' (Explicit contractual exclusion)")
+                continue
+
+            if is_context:
+                contract_period_records.append({
+                    "candidate_id": cid,
+                    "name": name,
+                    "record_type": "CONTEXT_METADATA",
+                    "description": desc,
+                    "source_locator": item.get("source_locator"),
+                    "source_quotation": item.get("raw_text") or desc,
+                })
+                logger.log(f"  [CONTEXT METADATA] {cid}: '{name}' (Descriptive context / metadata; not a client duty)")
+                continue
+
+            if is_vendor_feature:
+                logger.log(f"  [VENDOR FEATURE] {cid}: '{name}' (Vendor delivery feature; excluded from client responsibilities)")
+                continue
+
+            is_client_resp = (
+                item_role == "CLIENT_DUTY"
+                or any(k in rec_type for k in ("CLIENT", "CUSTOMER"))
+                or any(k in comb for k in ("client responsibility", "customer responsibility", "client will provide", "customer will provide", "client to furnish", "client must", "customer must"))
+            )
 
             if is_client_resp:
                 DEPENDENCY_EVIDENCE_MARKERS = (
@@ -323,13 +432,31 @@ class Step9Inspector:
                 is_dependency_rec_type = rec_type in ("CUSTOMER_DEPENDENCY", "CLIENT_DEPENDENCY", "CUSTOMER_PREREQUISITE", "CLIENT_PREREQUISITE", "DEPENDENCY")
                 has_dependency_evidence = is_dependency_rec_type or any(m in comb for m in DEPENDENCY_EVIDENCE_MARKERS)
 
+                # Classify dependency type per spec
+                comb_l = comb.lower()
+                if any(k in comb_l for k in ("cloud", "infrastructure", "server", "hosting", "credentials", "login", "network", "firewall", "git", "repo", "environment", "vpn", "access to")):
+                    dep_type = "ENVIRONMENT_ACCESS"
+                elif any(k in comb_l for k in ("database", "data source", "schema", "test data", "source system", "api key", "data access")):
+                    dep_type = "DATA_ACCESS"
+                elif any(k in comb_l for k in ("wireframe", "mockup", "design", "branding", "specification", "ui/ux")):
+                    dep_type = "DESIGN_INPUT"
+                elif any(k in comb_l for k in ("sign-off", "signoff", "approval", "acceptance", "review and approve", "uat approval")):
+                    dep_type = "SIGN_OFF"
+                elif any(k in comb_l for k in ("sme", "stakeholder", "personnel", "spoc", "staff", "resource availability", "interview")):
+                    dep_type = "STAFFING"
+                elif any(k in comb_l for k in ("content", "document", "copy", "guideline", "template", "business requirement")):
+                    dep_type = "CONTENT"
+                else:
+                    dep_type = "ENVIRONMENT_ACCESS"
+
                 if has_dependency_evidence:
                     cd_record = {
                         "candidate_id": cid,
                         "name": name,
                         "description": desc,
-                        "owner": "Client / Customer",
+                        "owner": "CLIENT",
                         "role": "EXTERNAL_PREREQUISITE",
+                        "dependency_type": dep_type,
                         "impacted_vendor_work": "Vendor project execution and milestone delivery",
                         "source_locator": item.get("source_locator"),
                         "source_quotation": item.get("raw_text") or desc,
@@ -337,13 +464,13 @@ class Step9Inspector:
                         "dependency_rationale": "Source text establishes client obligation as prerequisite/blocker for vendor activities.",
                     }
                     customer_dependencies.append(cd_record)
-                    logger.log(f"  [CUSTOMER DEPENDENCY] {cid}: '{name}' (Prerequisite for Vendor work)")
+                    logger.log(f"  [CUSTOMER DEPENDENCY] {cid}: '{name}' ({dep_type} - Prerequisite for Vendor work)")
                 else:
                     cr_record = {
                         "candidate_id": cid,
                         "name": name,
                         "description": desc,
-                        "owner": "Client / Customer",
+                        "owner": "CLIENT",
                         "role": "CLIENT_RESPONSIBILITY",
                         "source_locator": item.get("source_locator"),
                         "source_quotation": item.get("raw_text") or desc,
@@ -351,19 +478,6 @@ class Step9Inspector:
                     }
                     client_responsibilities.append(cr_record)
                     logger.log(f"  [CLIENT RESPONSIBILITY] {cid}: '{name}' (General client obligation)")
-                continue
-            elif is_out_of_scope:
-                ve_record = {
-                    "candidate_id": cid,
-                    "name": name,
-                    "description": desc,
-                    "owner": "Vendor Excluded",
-                    "role": "OUT_OF_SCOPE_ACTIVITY",
-                    "change_request_required": True,
-                    "source_locator": item.get("source_locator"),
-                    "source_quotation": item.get("raw_text") or desc,
-                }
-                vendor_exclusions.append(ve_record)
                 continue
 
             # ── Non-Commitment Exclusions: Period Metadata, Roles, Feature Descriptions ──
@@ -486,6 +600,98 @@ class Step9Inspector:
                 commitments.append(ms_comm)
                 milestone_acceptance_obligations.append(ms_comm)
 
+        # Scan full text corpus for trigger-based commercial terms (FIX 6)
+        full_text_corpus = " ".join(
+            (r.get("raw_text") or "") + " " + (r.get("description") or "")
+            for r in structured_records + proposed_items
+        )
+        for tp in TRIGGER_PATTERNS:
+            t_type = tp["term_type"]
+            t_pat = tp["pattern"]
+            m_term = re.search(t_pat, full_text_corpus, re.IGNORECASE)
+            if m_term:
+                days_or_weeks = m_term.group(1) if m_term.groups() else ""
+                t_title = t_type.replace("_", " ").title()
+                t_comm_id = f"comm_p{project_id}_d{document_id}_{len(commitments) + 1:03d}"
+                t_rec = {
+                    "commitment_id": t_comm_id,
+                    "candidate_id": f"trigger_{t_type.lower()}",
+                    "title": t_title,
+                    "name": t_title,
+                    "commitment_name": t_title,
+                    "description": m_term.group(0),
+                    "commitment_type": "TRIGGER_BASED",
+                    "term_type": t_type,
+                    "trigger_event": t_type.replace("_", " ").lower(),
+                    "frequency": "EVENT_DRIVEN",
+                    "deadline_grace_period": f"{days_or_weeks} days/weeks",
+                    "consequence": tp.get("stated_consequence"),
+                    "responsible_party": "Client / Customer" if tp.get("default_owner") == "CLIENT" else "Vendor Delivery Team",
+                    "owner": tp.get("default_owner", "CLIENT"),
+                    "proposed_next_occurrence": "ON_TRIGGER",
+                    "source_locator": "contract_terms",
+                    "source_quotation": m_term.group(0),
+                    "risk_status": "MONITORING_REQUIRED",
+                    "extraction_confidence": 0.95,
+                    "current_status": "ACTIVE",
+                }
+                if not any(c.get("commitment_name") == t_title for c in commitments):
+                    commitments.append(t_rec)
+                    trigger_commitments.append(t_rec)
+                    logger.log(f"  [COMMERCIAL TRIGGER COMMITMENT] {t_title}: '{m_term.group(0)}'")
+
+        # Deduplicate commitments by cadence and subject (FIX 6)
+        deduped_commitments = []
+        seen_comm_keys = set()
+        for c in commitments:
+            c_subj = re.sub(r'[^a-z0-9]', '', (c.get("commitment_name") or c.get("name") or "").lower())
+            key = (c.get("commitment_type"), c.get("frequency"), c_subj[:25])
+            if key not in seen_comm_keys:
+                seen_comm_keys.add(key)
+                deduped_commitments.append(c)
+        commitments = deduped_commitments
+
+        # Deduplicate customer dependencies (FIX 5)
+        deduped_deps = []
+        seen_dep_keys = set()
+        for d in customer_dependencies:
+            norm_name = re.sub(r'[^a-z0-9]', '', (d.get("name") or "").lower())
+            key = (d.get("dependency_type"), norm_name[:25])
+            if key not in seen_dep_keys:
+                seen_dep_keys.add(key)
+                deduped_deps.append(d)
+        customer_dependencies = deduped_deps
+
+        # Gated items and required_by calculation for customer dependencies (FIX 5)
+        scheduled_wis = step8_artifact.get("schedule_prediction_preview") or step8_artifact.get("work_items_schedule") or []
+        for cd in customer_dependencies:
+            dtype = cd.get("dependency_type", "ENVIRONMENT_ACCESS")
+            gating_kw = GATING_RULES.get(dtype, [])
+            gated = []
+            for wi in scheduled_wis:
+                wi_text = f"{wi.get('name', '')} {wi.get('description', '')}".lower()
+                if dtype in ("ENVIRONMENT_ACCESS", "DATA_ACCESS", "STAFFING"):
+                    gated.append(wi.get("candidate_id") or wi.get("name"))
+                elif any(kw in wi_text for kw in gating_kw):
+                    gated.append(wi.get("candidate_id") or wi.get("name"))
+            cd["gated_items"] = gated[:10]
+
+            gated_starts = []
+            for wi in scheduled_wis:
+                if (wi.get("candidate_id") in gated or wi.get("name") in gated) and wi.get("predicted_start_date"):
+                    try:
+                        gated_starts.append(datetime.strptime(wi["predicted_start_date"], "%Y-%m-%d").date())
+                    except Exception:
+                        pass
+            if gated_starts:
+                earliest_start = min(gated_starts)
+                req_by = DeadlineInferenceService.add_working_days(earliest_start, -WORKING_DAY_BUFFER)
+                cd["required_by"] = req_by.isoformat()
+                cd["required_by_rationale"] = f"Calculated as {WORKING_DAY_BUFFER} working days before earliest gated start {earliest_start.isoformat()}."
+            else:
+                cd["required_by"] = base_date.isoformat()
+                cd["required_by_rationale"] = "No gated work items resolved; defaulted to project start date."
+
         logger.output("Total Commitments Consolidated", len(commitments))
         logger.output("Scope Delivery Obligations", len(scope_delivery_obligations))
         logger.output("Explicit Recurring Commitments", len(recurring_commitments))
@@ -590,7 +796,7 @@ class Step9Inspector:
         json_run_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}_{timestamp_str}.json")
         json_active_path = os.path.join(logs_dir, f"step9_recurring_p{project_id}_d{document_id}.json")
 
-        if os.getenv("ENABLE_DISK_ARTIFACTS", "false").lower() in ("true", "1", "yes"):
+        if os.getenv("ENABLE_DISK_ARTIFACTS", "true").lower() in ("true", "1", "yes"):
             with open(json_run_path, "w", encoding="utf-8") as f:
                 json.dump(step9_artifact, f, indent=2, default=str)
             with open(json_active_path, "w", encoding="utf-8") as f:
