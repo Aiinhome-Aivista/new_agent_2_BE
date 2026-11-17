@@ -20,99 +20,16 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 
-class Step7Logger:
+from services.baseline_logger import BaseStepInspectorLogger
+
+
+class Step7Logger(BaseStepInspectorLogger):
     """
     Dedicated Logger for Step 7 (Ambiguity & Gap Analysis) Inspection Runs.
-    Guarantees independent logging to logs/step7_gap_analysis_p{project_id}_d{document_id}_{timestamp}.log
-    and active logs/step7_gap_analysis_p{project_id}_d{document_id}.log without polluting other logs.
+    Guarantees independent logging without polluting other logs.
     """
-
     def __init__(self, project_id: int, document_id: int, timestamp_str: str, log_dir: Optional[str] = None):
-        self.project_id = project_id
-        self.document_id = document_id
-        self.timestamp_str = timestamp_str
-
-        if log_dir is None:
-            backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            self.log_dir = os.path.join(backend_root, "logs")
-        else:
-            self.log_dir = log_dir
-
-        try:
-            os.makedirs(self.log_dir, exist_ok=True)
-        except Exception:
-            pass
-        self.run_log_path = os.path.join(self.log_dir, f"step7_gap_analysis_p{project_id}_d{document_id}_{timestamp_str}.log")
-        self.active_log_path = os.path.join(self.log_dir, f"step7_gap_analysis_p{project_id}_d{document_id}.log")
-        self._lock = threading.Lock()
-
-    def _format_timestamp(self) -> str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
-            try:
-                sys.stdout.write(text + "\n")
-                sys.stdout.flush()
-            except Exception:
-                try:
-                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-                    safe_text = text.encode(enc, errors="replace").decode(enc)
-                    sys.stdout.write(safe_text + "\n")
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-
-        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
-            try:
-                with self._lock:
-                    if not os.path.exists(self.log_dir):
-                        os.makedirs(self.log_dir, exist_ok=True)
-                    if hasattr(self, "active_log_path") and self.active_log_path:
-                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
-                            f_act.write(text + "\n")
-                    if hasattr(self, "run_log_path") and self.run_log_path:
-                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
-                            f_run.write(text + "\n")
-            except Exception:
-                pass
-
-    def banner(self, title: str):
-        bar = "=" * 80
-        self.raw_log(f"\n{bar}")
-        self.raw_log(f"[{self._format_timestamp()}] {title}")
-        self.raw_log(f"{bar}\n")
-
-    def section(self, title: str):
-        bar = "-" * 60
-        self.raw_log(f"\n{bar}")
-        self.raw_log(f"[{self._format_timestamp()}] >> {title}")
-        self.raw_log(f"{bar}")
-
-    def log(self, text: str):
-        self.raw_log(f"[{self._format_timestamp()}] {text}")
-
-    def output(self, key: str, val: Any):
-        if isinstance(val, (dict, list)):
-            val_str = json.dumps(val, indent=2, default=str)
-            self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}:\n{val_str}")
-        else:
-            self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}: {val}")
-
-
-    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
-        ts = self._format_timestamp()
-        sep = "!" * 80
-        err_block = (
-            f"\n{sep}\n"
-            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
-            f"Error Message: {error_msg}\n"
-        )
-        if traceback_str:
-            err_block += f"Traceback:\n{traceback_str}\n"
-        err_block += f"{sep}\n"
-        self.raw_log(err_block)
-        pass
+        super().__init__("step7_gap_analysis", project_id, document_id, timestamp_str, log_dir)
 
 
 class Step7Analyzer:
@@ -537,6 +454,69 @@ class Step7Analyzer:
                         })
                         logger.log(f"  [LOW] Source Document Typographical Anomaly detected: '{m}' (expected: '{expected_word}') in {cid}")
 
+        # ── 11. Timeline Contradiction Detection (HITL gate) ──
+        logger.section("11. Timeline Contradiction Detection (Phase Durations vs Billing Milestones)")
+        timeline_contradiction: Optional[dict] = None
+        try:
+            from services.timeline_contradiction_detector import detect as _detect_timeline
+            # Build a minimal artifact stub from available step data for the detector
+            _art_stub = {
+                "project_phases": step5_artifact.get("project_phases") or [],
+                "payment_milestones": step5_artifact.get("payment_milestones") or [],
+                "milestones": step5_artifact.get("milestones") or [],
+                "commitments": step5_artifact.get("commitments") or [],
+                "contextual_records": step5_artifact.get("contextual_records") or [],
+                "schedule_warnings": step5_artifact.get("schedule_warnings") or [],
+                "contract_start_date": (
+                    step5_artifact.get("contract_start_date")
+                    or step5_artifact.get("timeline", {}).get("contract_start_date")
+                    or step3_artifact.get("contract_start_date")
+                    or step3_artifact.get("timeline", {}).get("contract_start_date")
+                ),
+                "timeline": (
+                    step5_artifact.get("timeline")
+                    or step3_artifact.get("timeline")
+                    or {}
+                ),
+            }
+            tl_result = _detect_timeline(_art_stub)
+            if tl_result.get("has_contradiction"):
+                severity = tl_result.get("severity", "CRITICAL")
+                timeline_contradiction = tl_result
+                findings.append({
+                    "finding_id": next_finding_id(),
+                    "finding_type": "TIMELINE_CONTRADICTION",
+                    "severity": "HIGH" if severity == "CRITICAL" else "MEDIUM",
+                    "confidence": 1.0,
+                    "affected_candidate_ids": [],
+                    "source_chunk_indices": [],
+                    "source_quotation": (
+                        f"Phase total: {tl_result.get('phase_duration_days')} days | "
+                        f"Milestone window: {tl_result.get('available_days')} days | "
+                        f"Overrun: {tl_result.get('gap_days')} days"
+                    ),
+                    "explanation": tl_result.get("explanation", ""),
+                    "is_source_document_issue": True,
+                    "recommended_action": tl_result.get("recommended_action", ""),
+                    "review_status": "OPEN",
+                    "modifies_baseline": False,
+                    "requires_hitl": True,
+                    "hitl_payload": tl_result,
+                })
+                logger.log(
+                    f"  [{severity}] TIMELINE CONTRADICTION: phase durations "
+                    f"({tl_result.get('phase_duration_days')}d) exceed milestone window "
+                    f"'{tl_result.get('milestone_name')}' ({tl_result.get('available_days')}d) "
+                    f"by {tl_result.get('gap_days')}d — HITL gate will be raised."
+                )
+            elif tl_result.get("severity") == "WARNING":
+                logger.log(f"  [WARNING] Minor schedule tension detected: {tl_result.get('explanation','')[:120]}")
+            else:
+                logger.log(f"  [OK] No timeline contradiction detected. {tl_result.get('explanation','')[:120]}")
+        except Exception as _tl_exc:
+            logger.log(f"  [SKIP] Timeline contradiction check failed (non-blocking): {_tl_exc}")
+            timeline_contradiction = None
+
         # Compute severity statistics
         high_count = sum(1 for f in findings if f.get("severity") == "HIGH")
         med_count = sum(1 for f in findings if f.get("severity") == "MEDIUM")
@@ -558,6 +538,8 @@ class Step7Analyzer:
             "document_name": doc_name,
             "read_only": True,
             "modifies_baseline": False,
+            "timeline_contradiction": timeline_contradiction,
+            "requires_hitl": bool(timeline_contradiction and timeline_contradiction.get("has_contradiction")),
             "safety_confirmations": {
                 "production_baseline_mutation_disabled": True,
                 "vector_store_mutation_disabled": True,
@@ -616,4 +598,6 @@ class Step7Analyzer:
             "step7_log_path": logger.run_log_path,
             "step7_active_log_path": logger.active_log_path,
             "step7_artifact": step7_artifact,
+            "timeline_contradiction": timeline_contradiction,
+            "requires_hitl": bool(timeline_contradiction and timeline_contradiction.get("has_contradiction")),
         }

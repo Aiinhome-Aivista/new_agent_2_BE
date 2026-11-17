@@ -30,7 +30,16 @@ except ImportError:
     OTEL_AVAILABLE = False
 
 
-class TraceSpanRecord:
+class _BaseTraceRecord:
+    """Base class for timed trace entities."""
+    def finish(self, status: str = "OK", error: Optional[str] = None):
+        self.end_time = time.time()
+        self.duration_ms = round((self.end_time - self.start_time) * 1000, 2)
+        self.status = status
+        self.error = error
+
+
+class TraceSpanRecord(_BaseTraceRecord):
     """Represents a recorded span inside an execution trace."""
     def __init__(self, span_id: str, name: str, parent_id: Optional[str] = None):
         self.span_id = span_id
@@ -42,12 +51,6 @@ class TraceSpanRecord:
         self.status: str = "RUNNING"  # RUNNING, OK, ERROR
         self.attributes: Dict[str, Any] = {}
         self.error: Optional[str] = None
-
-    def finish(self, status: str = "OK", error: Optional[str] = None):
-        self.end_time = time.time()
-        self.duration_ms = round((self.end_time - self.start_time) * 1000, 2)
-        self.status = status
-        self.error = error
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -63,7 +66,7 @@ class TraceSpanRecord:
         }
 
 
-class ExecutionTrace:
+class ExecutionTrace(_BaseTraceRecord):
     """Represents a complete pipeline run (e.g. evaluate_document)."""
     def __init__(self, trace_id: str, project_id: Optional[int] = None, document_id: Optional[int] = None):
         self.trace_id = trace_id
@@ -87,12 +90,6 @@ class ExecutionTrace:
         self.tokens_prompt += prompt_tokens
         self.tokens_completion += completion_tokens
         self.total_tokens = self.tokens_prompt + self.tokens_completion
-
-    def finish(self, status: str = "OK", error: Optional[str] = None):
-        self.end_time = time.time()
-        self.duration_ms = round((self.end_time - self.start_time) * 1000, 2)
-        self.status = status
-        self.error = error
 
     def to_dict(self) -> Dict[str, Any]:
         return {

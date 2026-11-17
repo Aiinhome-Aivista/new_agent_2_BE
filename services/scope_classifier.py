@@ -20,6 +20,17 @@ class ScopeClassifier:
     OUT_OF_SCOPE_SECTIONS = {"Out of Scope", "Exclusions"}
     BAD_SECTIONS = OUT_OF_SCOPE_SECTIONS
 
+    @staticmethod
+    def _rank_chunk(chunk: dict, candidate_name_lower: str, candidate_idx: int) -> int:
+        text = chunk.get("text", "").lower()
+        chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
+        score = 0
+        if candidate_name_lower in text:
+            score += 1000
+        distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
+        score -= distance
+        return score
+
     @classmethod
     def _get_section_fallback_evidence(cls, candidate: dict) -> str:
         cand_section = candidate.get("section", "General")
@@ -153,17 +164,10 @@ class ScopeClassifier:
                     strictly_filtered_chunks.append(chunk)
                     continue
                     
-            def rank_score(chunk):
-                text = chunk.get("text", "").lower()
-                chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
-                score = 0
-                if candidate_name_lower in text:
-                    score += 1000
-                distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
-                score -= distance
-                return score
-                
-            strictly_filtered_chunks.sort(key=rank_score, reverse=True)
+            strictly_filtered_chunks.sort(
+                key=lambda c: cls._rank_chunk(c, candidate_name_lower, candidate_idx),
+                reverse=True
+            )
             
             evidence_texts = []
             seen_texts = []
@@ -346,19 +350,10 @@ class ScopeClassifier:
                 strictly_filtered_chunks.append(chunk)
                 continue
                 
-        def rank_score(chunk):
-            text = chunk.get("text", "").lower()
-            chunk_idx = chunk.get("metadata", {}).get("chunk_index", 0)
-            
-            score = 0
-            if candidate_name_lower in text:
-                score += 1000
-            
-            distance = abs(chunk_idx - candidate_idx) if chunk_idx is not None and candidate_idx is not None else 999
-            score -= distance
-            return score
-            
-        strictly_filtered_chunks.sort(key=rank_score, reverse=True)
+        strictly_filtered_chunks.sort(
+            key=lambda c: cls._rank_chunk(c, candidate_name_lower, candidate_idx),
+            reverse=True
+        )
         
         evidence_texts = []
         seen_texts = []

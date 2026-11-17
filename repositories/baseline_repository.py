@@ -5,11 +5,8 @@ from typing import List, Dict, Any, Optional
 class BaselineRepository:
     @staticmethod
     def get_document(db: mysql.connector.connection.MySQLConnection, document_id: int, project_id: int) -> Optional[Dict[str, Any]]:
-        cursor = db.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM documents WHERE id = %s AND project_id = %s", (document_id, project_id))
-        doc = cursor.fetchone()
-        cursor.close()
-        return doc
+        from repositories.document_repository import DocumentRepository
+        return DocumentRepository.get_document(db, document_id, project_id)
 
     @staticmethod
     def get_other_elifa_documents(db: mysql.connector.connection.MySQLConnection, project_id: int, exclude_document_id: int) -> List[Dict[str, Any]]:
@@ -342,7 +339,7 @@ class BaselineRepository:
         baseline["scope_items"] = top_level_items
         baseline["deliverables"] = deliverables
         baseline["milestones"] = milestones
-        
+
         # ── Unified Schema v2.0 fields ──
         baseline["schema_version"] = "2.0.0"
         baseline["field_semantics"] = {
@@ -469,6 +466,33 @@ class BaselineRepository:
                 or (it.get("estimated_deadline") and "2027-04-30" < str(it.get("estimated_deadline")))
             ]
 
+        # ── Parse hitl_conflict JSON column & fallback detection (evaluated after all enrichments) ──
+        hc_raw = baseline.get("hitl_conflict")
+        if hc_raw and isinstance(hc_raw, str):
+            try:
+                baseline["hitl_conflict"] = json.loads(hc_raw)
+            except Exception:
+                baseline["hitl_conflict"] = None
+        elif not isinstance(hc_raw, dict):
+            baseline["hitl_conflict"] = None
+
+        # Fallback to dynamic contradiction detection if not yet stored in DB
+        if not baseline.get("hitl_conflict"):
+            try:
+                from services.timeline_contradiction_detector import detect as _tl_detect
+                dyn_tl = _tl_detect(baseline)
+                if dyn_tl.get("has_contradiction"):
+                    baseline["hitl_conflict"] = dyn_tl
+            except Exception:
+                pass
+
+        baseline["requires_hitl"] = bool(
+            baseline.get("hitl_conflict") and
+            isinstance(baseline["hitl_conflict"], dict) and
+            baseline["hitl_conflict"].get("has_contradiction") and
+            not baseline["hitl_conflict"].get("resolution")
+        )
+
         return baseline
 
     @staticmethod
@@ -492,6 +516,20 @@ class BaselineRepository:
     @staticmethod
     def approve_baseline(db: mysql.connector.connection.MySQLConnection, baseline_id: int, user_id: int, allow_override: bool = False) -> None:
         cursor = db.cursor(dictionary=True)
+
+        # Check for unresolved HITL timeline contradiction
+        cursor.execute("SELECT hitl_conflict FROM scope_baselines WHERE id = %s", (baseline_id,))
+        b_row = cursor.fetchone()
+        if b_row and b_row.get("hitl_conflict"):
+            import json as _j
+            hc = _j.loads(b_row["hitl_conflict"]) if isinstance(b_row["hitl_conflict"], str) else b_row["hitl_conflict"]
+            if isinstance(hc, dict) and hc.get("has_contradiction") and not hc.get("resolution") and not allow_override:
+                cursor.close()
+                raise ValueError(
+                    "Baseline approval blocked: Unresolved timeline contradiction detected between stated phase durations "
+                    "and billing milestone dates. Human-in-the-loop resolution is required before baseline locking."
+                )
+
         cursor.execute("SELECT COUNT(*) as count FROM scope_items WHERE baseline_id = %s AND scope_type = 'UNCERTAIN'", (baseline_id,))
         row = cursor.fetchone()
         uncertain_count = row.get("count", 0) if row else 0
@@ -528,27 +566,6 @@ class BaselineRepository:
         item_id = cursor.lastrowid
         cursor.close()
         return item_id
-
-
-    @staticmethod
-    def create_project_milestone(db, project_id, baseline_id, name, sequence, status='Planned', planned_date=None):
-        cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO project_milestones (project_id, baseline_id, name, sequence, status, planned_date) VALUES (%s, %s, %s, %s, %s, %s)",
-            (project_id, baseline_id, name, sequence, status, planned_date)
-        )
-        milestone_id = cursor.lastrowid
-        cursor.close()
-        return milestone_id
-
-    @staticmethod
-    def create_scope_milestone_mapping(db, scope_item_id, milestone_id, weight=1.0):
-        cursor = db.cursor()
-        cursor.execute(
-            "INSERT INTO scope_milestone_mapping (scope_item_id, milestone_id, weight) VALUES (%s, %s, %s)",
-            (scope_item_id, milestone_id, weight)
-        )
-        cursor.close()
 
     @staticmethod
     def get_scope_item(db: mysql.connector.connection.MySQLConnection, item_id: int) -> Optional[Dict[str, Any]]:

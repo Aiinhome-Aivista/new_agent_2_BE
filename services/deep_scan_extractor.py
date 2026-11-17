@@ -3716,15 +3716,7 @@ class DeepScanExtractor:
             best_c = None
             best_sim = 0.0
             best_rationale = ""
-
-            def _stem_w(w):
-                w = w.lower()
-                for suff in ('ing', 'ed', 's', 'ion', 'ment', 'able', 'ive', 'ity', 'ies', 'al', 'ic', 'ly', 'e'):
-                    if len(w) > len(suff) + 2 and w.endswith(suff):
-                        w = w[:-len(suff)]
-                if w.endswith('ut') or w.endswith('v'):
-                    w = w[:-1]
-                return w
+            _stem_w = cls._stem_w
 
             it_for_merge = dict(it)
             if it_for_merge.get("section") == "Milestones" or it_for_merge.get("candidate_type") == "Pure Milestone":

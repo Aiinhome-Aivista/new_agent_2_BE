@@ -1800,24 +1800,7 @@ def delete_scope_item(
     return {"success": True, "message": "Scope item deleted successfully"}
 
 _is_title_match = is_title_match
-
-MONTH_MAP = {
-    'january': 1, 'february': 2, 'march': 3, 'april': 4,
-    'may': 5, 'june': 6, 'july': 7, 'august': 8,
-    'september': 9, 'october': 10, 'november': 11, 'december': 12,
-    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
-    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-}
-
-def _extract_months_from_text(text: str) -> set:
-    if not text:
-        return set()
-    t = text.lower()
-    found = set()
-    for m_name, m_num in MONTH_MAP.items():
-        if re.search(r'\b' + re.escape(m_name) + r'\b', t):
-            found.add(m_num)
-    return found
+from core.baseline_config import MONTH_MAP, extract_months_from_text as _extract_months_from_text
 
 def _is_scope_item_match_for_resolution(resolved_item: dict, si: dict) -> bool:
     res_name = resolved_item.get("name", "") if isinstance(resolved_item, dict) else str(resolved_item)
@@ -2214,3 +2197,134 @@ def get_final_baseline(
         "status": "READY",
         "data": artifact
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HITL: Resolve Timeline Contradiction
+# POST /api/projects/{project_id}/baseline/hitl-resolve
+# POST /api/projects/{project_id}/baseline/timeline-decision
+# Body: { "resolution": "CONTRACT_ANCHORED" | "DURATION_ANCHORED" | "PROVISIONAL_STRICT" }
+# ─────────────────────────────────────────────────────────────────────────────
+
+class HitlResolutionPayload(BaseModel):
+    resolution: str  # "CONTRACT_ANCHORED" | "DURATION_ANCHORED" | "PROVISIONAL_STRICT" (or legacy aliases)
+    notes: Optional[str] = None
+
+@router.post("/timeline-decision")
+@router.post("/hitl-resolve")
+def resolve_hitl_timeline_contradiction(
+    project_id: int,
+    payload: HitlResolutionPayload,
+    current_user: dict = Depends(require_roles(["ENGAGEMENT_MANAGER", "ADMIN"])),
+    db: mysql.connector.connection.MySQLConnection = Depends(get_db)
+):
+    """
+    Human-in-the-Loop: Engagement Manager resolves a detected timeline contradiction.
+
+    Option A — CONTRACT_ANCHORED (ENFORCE_MILESTONE_DATES):
+        Accept the billing dates as authoritative; phase durations are compressed to fit.
+        Warning: TIMELINE_COMPRESSED recorded. Capacity shortfall noted.
+
+    Option B — DURATION_ANCHORED (ENFORCE_PHASE_DURATIONS):
+        Accept the phase durations as authoritative. 5 developers fit comfortably.
+        Warning: CONTRACT_AMENDMENT_RECOMMENDED recorded.
+        Contract facts and billing dates in database remain strictly IMMUTABLE.
+        Planning assumption is recorded recommending a contract amendment.
+
+    Option C — PROVISIONAL_STRICT:
+        Proceed provisionally without altering planning baseline or contract dates.
+        Execution monitoring tracks progress against stricter milestone dates.
+
+    All options clear the HITL block and return the project to BASELINE_PENDING_REVIEW.
+    """
+    import json as _json
+    verify_project_access(project_id, current_user, db)
+
+    # Normalize aliases
+    norm_resolution = payload.resolution.upper()
+    if norm_resolution == "ENFORCE_MILESTONE_DATES":
+        norm_resolution = "CONTRACT_ANCHORED"
+    elif norm_resolution == "ENFORCE_PHASE_DURATIONS":
+        norm_resolution = "DURATION_ANCHORED"
+
+    allowed = {"CONTRACT_ANCHORED", "DURATION_ANCHORED", "PROVISIONAL_STRICT"}
+    if norm_resolution not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid resolution. Must be one of: {sorted(allowed)} (or legacy aliases)"
+        )
+
+    cur = db.cursor(dictionary=True)
+
+    # Load the latest draft baseline
+    cur.execute(
+        "SELECT id, hitl_conflict, status FROM scope_baselines "
+        "WHERE project_id = %s ORDER BY id DESC LIMIT 1",
+        (project_id,)
+    )
+    baseline = cur.fetchone()
+    if not baseline:
+        cur.close()
+        raise HTTPException(status_code=404, detail="No baseline found for this project.")
+    if baseline["status"] != "DRAFT":
+        cur.close()
+        raise HTTPException(status_code=409, detail="Only DRAFT baselines can be resolved via HITL.")
+
+    baseline_id = baseline["id"]
+
+    # Parse existing hitl_conflict
+    hc_raw = baseline.get("hitl_conflict")
+    hitl_conflict = {}
+    if hc_raw:
+        try:
+            hitl_conflict = _json.loads(hc_raw) if isinstance(hc_raw, str) else hc_raw
+        except Exception:
+            hitl_conflict = {}
+
+    # Record resolution in hitl_conflict
+    hitl_conflict["resolution"] = norm_resolution
+    hitl_conflict["resolved_by"] = current_user.get("id")
+    hitl_conflict["resolved_at"] = __import__("datetime").datetime.utcnow().isoformat()
+    hitl_conflict["resolution_notes"] = payload.notes or ""
+    hitl_conflict["has_contradiction"] = False  # Cleared by human decision
+
+    if norm_resolution == "CONTRACT_ANCHORED":
+        warning_tag = "TIMELINE_COMPRESSED"
+        resolution_label = "Contract-Anchored (milestone dates enforced; phases compressed to fit window)"
+        hitl_conflict["planning_assumption"] = "Milestone dates strictly enforced; developer capacity must be expanded or scope compressed."
+    elif norm_resolution == "DURATION_ANCHORED":
+        warning_tag = "CONTRACT_AMENDMENT_RECOMMENDED"
+        resolution_label = "Duration-Anchored (stated phase durations enforced; 5 developers fit; contract amendment recommended)"
+        hitl_conflict["planning_assumption"] = "Contract amendment recommended; contract billing terms unchanged."
+    else:  # PROVISIONAL_STRICT
+        warning_tag = "PROVISIONAL_STRICT_MONITORING"
+        resolution_label = "Proceed Provisionally (stricter milestone alerts active during execution)"
+        hitl_conflict["planning_assumption"] = "Proceeding provisionally; alerts track against stricter milestone dates."
+
+    hitl_conflict["warning_tag"] = warning_tag
+
+    # Persist resolution and clear HITL block
+    cur.execute(
+        "UPDATE scope_baselines SET hitl_conflict = %s WHERE id = %s",
+        (_json.dumps(hitl_conflict, default=str), baseline_id)
+    )
+    cur.execute(
+        "UPDATE projects SET monitoring_status = 'BASELINE_PENDING_REVIEW' WHERE id = %s",
+        (project_id,)
+    )
+    db.commit()
+    cur.close()
+
+    return {
+        "success": True,
+        "message": (
+            f"Timeline conflict resolved: {resolution_label}. "
+            f"Warning '{warning_tag}' recorded. "
+            f"Project is now BASELINE_PENDING_REVIEW — you may approve the baseline."
+        ),
+        "resolution": norm_resolution,
+        "warning_tag": warning_tag,
+        "planning_assumption": hitl_conflict.get("planning_assumption"),
+        "baseline_id": baseline_id,
+    }
+

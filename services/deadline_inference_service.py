@@ -27,6 +27,7 @@ from core.baseline_config import (
     WORKING_DAY_BUFFER,
     CAPACITY_UTILISATION,
     WORKING_DAYS_PER_WEEK,
+    MONTH_MAP,
 )
 
 
@@ -47,13 +48,7 @@ class DeadlineInferenceService:
         "timeline_tolerance_days": TIMELINE_TOLERANCE_DAYS,
     }
 
-    MONTH_MAP = {
-        "january": 1, "february": 2, "march": 3, "april": 4,
-        "may": 5, "june": 6, "july": 7, "august": 8,
-        "september": 9, "october": 10, "november": 11, "december": 12,
-        "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6,
-        "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12
-    }
+    MONTH_MAP = MONTH_MAP
 
     @classmethod
     def parse_date_string(cls, text: str) -> Optional[str]:

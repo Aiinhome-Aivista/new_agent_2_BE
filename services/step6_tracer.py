@@ -19,99 +19,16 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Set
 
 
-class Step6Logger:
+from services.baseline_logger import BaseStepInspectorLogger
+
+
+class Step6Logger(BaseStepInspectorLogger):
     """
     Dedicated Logger for Step 6 (Traceability & Coverage Audit) Inspection Runs.
-    Guarantees independent logging to logs/step6_traceability_p{project_id}_d{document_id}_{timestamp}.log
-    and active logs/step6_traceability_p{project_id}_d{document_id}.log without polluting other logs.
+    Guarantees independent logging without polluting other logs.
     """
-
     def __init__(self, project_id: int, document_id: int, timestamp_str: str, log_dir: Optional[str] = None):
-        self.project_id = project_id
-        self.document_id = document_id
-        self.timestamp_str = timestamp_str
-
-        if log_dir is None:
-            backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            self.log_dir = os.path.join(backend_root, "logs")
-        else:
-            self.log_dir = log_dir
-
-        try:
-            os.makedirs(self.log_dir, exist_ok=True)
-        except Exception:
-            pass
-        self.run_log_path = os.path.join(self.log_dir, f"step6_traceability_p{project_id}_d{document_id}_{timestamp_str}.log")
-        self.active_log_path = os.path.join(self.log_dir, f"step6_traceability_p{project_id}_d{document_id}.log")
-        self._lock = threading.Lock()
-
-    def _format_timestamp(self) -> str:
-        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    def raw_log(self, text: str):
-        if os.getenv("ENABLE_STEP_PRINTS", "true").lower() in ("true", "1", "yes"):
-            try:
-                sys.stdout.write(text + "\n")
-                sys.stdout.flush()
-            except Exception:
-                try:
-                    enc = getattr(sys.stdout, "encoding", None) or "utf-8"
-                    safe_text = text.encode(enc, errors="replace").decode(enc)
-                    sys.stdout.write(safe_text + "\n")
-                    sys.stdout.flush()
-                except Exception:
-                    pass
-
-        if os.getenv("ENABLE_DISK_LOGS", "true").lower() in ("true", "1", "yes"):
-            try:
-                with self._lock:
-                    if not os.path.exists(self.log_dir):
-                        os.makedirs(self.log_dir, exist_ok=True)
-                    if hasattr(self, "active_log_path") and self.active_log_path:
-                        with open(self.active_log_path, "a", encoding="utf-8") as f_act:
-                            f_act.write(text + "\n")
-                    if hasattr(self, "run_log_path") and self.run_log_path:
-                        with open(self.run_log_path, "a", encoding="utf-8") as f_run:
-                            f_run.write(text + "\n")
-            except Exception:
-                pass
-
-    def banner(self, title: str):
-        bar = "=" * 80
-        self.raw_log(f"\n{bar}")
-        self.raw_log(f"[{self._format_timestamp()}] {title}")
-        self.raw_log(f"{bar}\n")
-
-    def section(self, title: str):
-        bar = "-" * 60
-        self.raw_log(f"\n{bar}")
-        self.raw_log(f"[{self._format_timestamp()}] >> {title}")
-        self.raw_log(f"{bar}")
-
-    def log(self, text: str):
-        self.raw_log(f"[{self._format_timestamp()}] {text}")
-
-    def output(self, key: str, val: Any):
-        if isinstance(val, (dict, list)):
-            val_str = json.dumps(val, indent=2, default=str)
-            self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}:\n{val_str}")
-        else:
-            self.raw_log(f"[{self._format_timestamp()}] [OUTPUT] {key}: {val}")
-
-
-    def error(self, context: str, error_msg: str, traceback_str: Optional[str] = None):
-        ts = self._format_timestamp()
-        sep = "!" * 80
-        err_block = (
-            f"\n{sep}\n"
-            f"[{ts}] [ERROR] Problem in {self.__class__.__name__} at: {context}\n"
-            f"Error Message: {error_msg}\n"
-        )
-        if traceback_str:
-            err_block += f"Traceback:\n{traceback_str}\n"
-        err_block += f"{sep}\n"
-        self.raw_log(err_block)
-        pass
+        super().__init__("step6_traceability", project_id, document_id, timestamp_str, log_dir)
 
 
 class Step6Tracer:

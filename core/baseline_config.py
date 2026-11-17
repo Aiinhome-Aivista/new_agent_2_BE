@@ -5,7 +5,8 @@ gating rules, thresholds, tolerances, and field semantics for contract baseline 
 Strictly ensures zero hardcoded party names, abbreviations, item names, or dates.
 """
 
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Set, Any, Optional
+from datetime import date, datetime
 
 # ── 1. Party Pronoun and Role Mappings ─────────────────────────────────────────
 
@@ -201,3 +202,42 @@ FIELD_SEMANTICS: Dict[str, str] = {
     "summary": "Reconciled counts across all candidate categories and delivery dimensions.",
     "dashboard_payload": "Optimized payload for the frontend UI dashboard and timeline views."
 }
+
+# ── 12. Calendar Month Extraction Utilities ──────────────────────────────────
+
+MONTH_MAP: Dict[str, int] = {
+    'january': 1, 'february': 2, 'march': 3, 'april': 4,
+    'may': 5, 'june': 6, 'july': 7, 'august': 8,
+    'september': 9, 'october': 10, 'november': 11, 'december': 12,
+    'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
+    'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
+}
+
+def extract_months_from_text(text: str) -> Set[int]:
+    """Extract month numbers (1-12) mentioned in text string."""
+    if not text:
+        return set()
+    import re
+    t = text.lower()
+    found = set()
+    for m_name, m_num in MONTH_MAP.items():
+        if re.search(r'\b' + re.escape(m_name) + r'\b', t):
+            found.add(m_num)
+    return found
+
+
+def parse_date(val: Any) -> Optional[date]:
+    """Parse a date string in ISO or common formats; returns None on failure."""
+    if not val:
+        return None
+    if isinstance(val, date):
+        return val
+    s = str(val).split("T")[0].strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m/%d/%Y", "%B %d, %Y", "%b %d, %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+

@@ -1462,6 +1462,29 @@ class FinalBaselineService:
                 "artifact": artifact,
             }
 
+        # Attach timeline contradiction detection (HITL)
+        try:
+            from services.timeline_contradiction_detector import detect as _tl_detect
+            tl_res = _tl_detect(artifact)
+            if tl_res.get("has_contradiction"):
+                # Check if it was already resolved in the database
+                from core.database import get_db_connection
+                _cnx = get_db_connection()
+                if _cnx:
+                    with _cnx.cursor(dictionary=True) as _c:
+                        _c.execute("SELECT hitl_conflict FROM scope_baselines WHERE project_id = %s ORDER BY id DESC LIMIT 1", (project_id,))
+                        _row = _c.fetchone()
+                        if _row and _row.get("hitl_conflict"):
+                            import json as _j
+                            _hc = _j.loads(_row["hitl_conflict"]) if isinstance(_row["hitl_conflict"], str) else _row["hitl_conflict"]
+                            if _hc.get("resolution"):
+                                tl_res = _hc
+                    _cnx.close()
+            artifact["hitl_conflict"] = tl_res
+            artifact["requires_hitl"] = bool(tl_res.get("has_contradiction") and not tl_res.get("resolution"))
+        except Exception:
+            pass
+
         return {
             "status": "SUCCESS",
             "message": "Authoritative final baseline loaded successfully.",
@@ -1849,6 +1872,44 @@ class FinalBaselineService:
                 (contract_start_val, contract_end_val, project_id)
             )
 
+        # ── Step 5b: Timeline Contradiction Detection (HITL gate) ──
+        hitl_conflict = None
+        requires_hitl = False
+        try:
+            from services.timeline_contradiction_detector import detect as _tl_detect
+            tl_result = _tl_detect(artifact)
+            if tl_result.get("has_contradiction"):
+                hitl_conflict = tl_result
+                requires_hitl = True
+            # Persist hitl_conflict into scope_baselines.hitl_conflict column
+            with db_transaction(db_conn, dictionary=True) as _hcur:
+                _hitl_json = json.dumps(hitl_conflict, default=str) if hitl_conflict else None
+                _hcur.execute(
+                    "UPDATE scope_baselines SET hitl_conflict = %s WHERE id = %s",
+                    (_hitl_json, baseline_id)
+                )
+                # Set project status to AWAITING_TIMELINE_DECISION if contradiction found
+                if requires_hitl:
+                    _hcur.execute(
+                        "UPDATE projects SET monitoring_status = 'AWAITING_TIMELINE_DECISION' WHERE id = %s",
+                        (project_id,)
+                    )
+                    # Trigger notification email to Engagement Manager
+                    try:
+                        from services.alert_service import AlertService
+                        _subject = f"[ACSE ALERT] Critical Timeline Contradiction Detected - Project {project_id}"
+                        _body = (
+                            f"ACSE detected a critical timeline contradiction for Project {project_id}.\n\n"
+                            f"Finding: {tl_result.get('explanation')}\n\n"
+                            f"Parallel options computed (Contract-Anchored vs Duration-Anchored).\n"
+                            f"Human-in-the-Loop decision required in ACSE Baseline Review before baseline approval.\n"
+                        )
+                        AlertService.send_email("pm@example.com", _subject, _body)
+                    except Exception as _mail_exc:
+                        print(f"[PersistDraft] AlertService email notice skipped: {_mail_exc}")
+        except Exception as _hitl_exc:
+            print(f"[PersistDraft] HITL detection skipped (non-blocking): {_hitl_exc}")
+
         # ── Step 6: Database Readback Verification ──
         readback_report = cls.readback_and_verify_persisted_baseline(
             db_conn=db_conn,
@@ -1866,6 +1927,8 @@ class FinalBaselineService:
             "readiness_status": "PROVISIONAL",
             "total_records_persisted": len(s4_records),
             "readback_verification": readback_report,
+            "hitl_conflict": hitl_conflict,
+            "requires_hitl": requires_hitl,
         }
 
 

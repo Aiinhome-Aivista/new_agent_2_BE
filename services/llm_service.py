@@ -20,15 +20,6 @@ def _terminal_log(msg: str):
         print(msg, flush=True)
 
 
-def _terminal_log(msg: str):
-    """Prints directly to terminal with immediate flush and ASCII-safe characters."""
-    try:
-        sys.stdout.write(msg + "\n")
-        sys.stdout.flush()
-    except Exception:
-        print(msg, flush=True)
-
-
 class LLMService:
     @classmethod
     def _get_gemini_client(cls):

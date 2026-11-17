@@ -25,9 +25,8 @@ class StakeholderRepository:
 
     @staticmethod
     def assign_user_to_project(db: mysql.connector.connection.MySQLConnection, project_id: int, user_id: int) -> None:
-        cursor = db.cursor()
-        cursor.execute("INSERT INTO project_users (project_id, user_id) VALUES (%s, %s)", (project_id, user_id))
-        cursor.close()
+        from repositories.project_repository import ProjectRepository
+        return ProjectRepository.assign_user_to_project(db, project_id, user_id)
 
     @staticmethod
     def get_stakeholder_by_id(db: mysql.connector.connection.MySQLConnection, stakeholder_id: int) -> Optional[Dict[str, Any]]:

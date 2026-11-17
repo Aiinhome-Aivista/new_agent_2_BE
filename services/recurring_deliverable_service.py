@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional
 
 from services.llm_service import LLMService
 from core.prompts import get_recurrence_extraction_prompt, get_short_obligation_prompt
+from core.baseline_config import parse_date
 
 RECURRENCE_CONFIDENCE_THRESHOLD = 0.75
 PARTIAL_PERIOD_MIN_DAYS = 15
@@ -518,18 +519,7 @@ class RecurringDeliverableService:
         )
         cursor.close()
 
-    @staticmethod
-    def _parse_date(value):
-        if not value:
-            return None
-        if isinstance(value, date):
-            return value
-        try:
-            clean = str(value).split("T")[0].split(" ")[0]
-            parts = clean.split("-")
-            return date(int(parts[0]), int(parts[1]), int(parts[2]))
-        except Exception:
-            return None
+    _parse_date = staticmethod(parse_date)
 
     @classmethod
     def extend_occurrences_for_project(cls, db, baseline_id, project_id, parent_id, new_project_end, project_start):

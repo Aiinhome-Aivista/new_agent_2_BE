@@ -3103,23 +3103,7 @@ class RiskEvaluationAgent:
             import re
             from datetime import datetime, date as date_type
 
-            MONTH_MAP = {
-                'january': 1, 'february': 2, 'march': 3, 'april': 4,
-                'may': 5, 'june': 6, 'july': 7, 'august': 8,
-                'september': 9, 'october': 10, 'november': 11, 'december': 12,
-                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'jun': 6,
-                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12,
-            }
-
-            def _extract_months(text: str) -> set:
-                if not text:
-                    return set()
-                t = text.lower()
-                found = set()
-                for m_name, m_num in MONTH_MAP.items():
-                    if re.search(r'\b' + re.escape(m_name) + r'\b', t):
-                        found.add(m_num)
-                return found
+            from core.baseline_config import MONTH_MAP, extract_months_from_text as _extract_months
 
             def _match_resolution_to_scope_item(resolved_item: dict, si: dict) -> bool:
                 res_name = resolved_item.get("name", "")
